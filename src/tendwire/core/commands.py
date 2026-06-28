@@ -78,8 +78,11 @@ FORBIDDEN_REQUEST_FIELDS = frozenset(
         "message_id",
         "thread_id",
         "route",
+        "routes",
         "delivery",
+        "deliveries",
         "token",
+        "tokens",
         "bot_token",
         "pane_id",
         "terminal_id",
@@ -93,6 +96,8 @@ FORBIDDEN_REQUEST_FIELDS = frozenset(
         "argv",
         "command",
         "shell",
+        "connector",
+        "connectors",
     }
 )
 
@@ -410,6 +415,13 @@ def parse_command_request(payload: str) -> tuple[CommandRequest | None, dict[str
             STATUS_INVALID_REQUEST,
             "request must be a JSON object",
             details={"field": "request"},
+        )
+    forbidden = [f"$.{key}" for key in data if _is_forbidden_request_field(key)]
+    if forbidden:
+        return None, error_value(
+            STATUS_INVALID_REQUEST,
+            "request contains forbidden connector or terminal fields",
+            details={"fields": forbidden},
         )
     try:
         request = CommandRequest.from_dict(data)
