@@ -83,21 +83,50 @@ def test_store_migrates_v1_schema_and_persists_content_fingerprint(tmp_path: Pat
     assert restored.content_fingerprint == snapshot.content_fingerprint
 
 
-def test_store_save_latest_and_list_hosts(tmp_path: Path) -> None:
+def test_store_save_latest_host_scope_and_list_hosts(tmp_path: Path) -> None:
     db_path = tmp_path / "tendwire.db"
-    config = Config(host_id="host-a", db_path=db_path)
+    config_a = Config(host_id="host-a", db_path=db_path)
+    config_b = Config(host_id="host-b", db_path=db_path)
 
     init_store(db_path)
     assert latest_snapshot(db_path) is None
 
-    snapshot = project_empty(config)
-    save_snapshot(db_path, snapshot)
-    restored = latest_snapshot(db_path)
+    snapshot_a_old = project_from_raw(
+        config_a,
+        workers=[{"id": "worker-a-old", "name": "Host A Old", "status": "active"}],
+    )
+    snapshot_b = project_from_raw(
+        config_b,
+        workers=[{"id": "worker-b", "name": "Host B", "status": "idle"}],
+    )
+    snapshot_a_new = project_from_raw(
+        config_a,
+        workers=[{"id": "worker-a-new", "name": "Host A New", "status": "waiting"}],
+    )
 
-    assert restored is not None
-    assert restored.host_id == "host-a"
-    assert restored.content_fingerprint == snapshot.content_fingerprint
-    assert list_hosts(db_path) == ["host-a"]
+    save_snapshot(db_path, snapshot_a_old)
+    save_snapshot(db_path, snapshot_b)
+    save_snapshot(db_path, snapshot_a_new)
+
+    global_restored = latest_snapshot(db_path)
+    assert global_restored is not None
+    assert global_restored.host_id == "host-a"
+    assert global_restored.content_fingerprint == snapshot_a_new.content_fingerprint
+
+    restored_a = latest_snapshot(db_path, "host-a")
+    assert restored_a is not None
+    assert restored_a.host_id == "host-a"
+    assert restored_a.content_fingerprint == snapshot_a_new.content_fingerprint
+    assert restored_a.workers[0].id == "worker-a-new"
+
+    restored_b = latest_snapshot(db_path, "host-b")
+    assert restored_b is not None
+    assert restored_b.host_id == "host-b"
+    assert restored_b.content_fingerprint == snapshot_b.content_fingerprint
+    assert restored_b.workers[0].id == "worker-b"
+
+    assert latest_snapshot(db_path, "missing-host") is None
+    assert list_hosts(db_path) == ["host-a", "host-b"]
 
 
 def test_store_command_receipts_track_idempotency(tmp_path: Path) -> None:

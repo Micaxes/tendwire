@@ -221,15 +221,27 @@ def save_snapshot(db_path: Path, snapshot: Snapshot) -> None:
         )
 
 
-def latest_snapshot(db_path: Path) -> Snapshot | None:
-    """Return the most recently persisted snapshot, or None."""
+def latest_snapshot(db_path: Path, host_id: str | None = None) -> Snapshot | None:
+    """Return the latest snapshot globally, or scoped to host_id when provided."""
     if not db_path.exists():
         return None
     with sqlite3.connect(str(db_path)) as conn:
         _ensure_schema(conn)
-        row = conn.execute(
-            "SELECT payload FROM snapshots ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+        if host_id is None:
+            row = conn.execute(
+                "SELECT payload FROM snapshots ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT payload
+                FROM snapshots
+                WHERE host_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (host_id,),
+            ).fetchone()
     if row is None:
         return None
     return Snapshot.from_json(row[0])
