@@ -37,14 +37,13 @@ python -m tendwire.cli snapshot --json
 Both print a neutral JSON snapshot to stdout and exit successfully, even when no
 Herdr data is available. Stdout is JSON-only for snapshot output.
 
-When Herdr 0.7.0 is present, the adapter first tries `herdr workspace list --json`
-and `herdr agent list --json`, then falls back to the no-flag JSON envelopes
+When Herdr 0.7.0 is present, the adapter first tries the no-flag JSON envelopes
 (`herdr workspace list`, `herdr agent list`) that wrap records under
-`result.workspaces` and `result.agents`. If no agents are returned, it uses
-`herdr pane list` as a worker fallback, keeping only panes that describe an
-agent. Each attempt is independent and safe: a missing binary, timeout, or
-malformed response simply produces empty spaces or workers rather than failing
-the snapshot.
+`result.workspaces` and `result.agents`, then keeps `--json` list variants as a
+compatibility fallback. If no agents are returned, it uses `herdr pane list` as
+a worker fallback, keeping only panes that describe an agent. Each attempt is
+independent and safe: a missing binary, timeout, or malformed response simply
+produces empty spaces or workers rather than failing the snapshot.
 
 Optional local persistence uses the stdlib SQLite store and does not change
 stdout:

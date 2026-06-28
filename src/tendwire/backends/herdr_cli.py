@@ -440,15 +440,15 @@ def fetch_herdr_state(config: Config) -> tuple[list[Space], list[Worker]]:
 
     workspace_payload = _command_payload_variants(
         [
-            ["workspace", "list", "--json"],
             ["workspace", "list"],
+            ["workspace", "list", "--json"],
         ],
         config,
     )
     agent_payload = _command_payload_variants(
         [
-            ["agent", "list", "--json"],
             ["agent", "list"],
+            ["agent", "list", "--json"],
         ],
         config,
     )

@@ -246,11 +246,10 @@ def test_sample_herdr_projection_is_neutral_and_fingerprinted(monkeypatch) -> No
     _assert_no_forbidden_fields(payload)
 
 
-def test_no_flag_workspace_list_succeeds_after_json_failure(monkeypatch) -> None:
-    """Herdr 0.7.0 no-flag workspace list is used when --json fails."""
+def test_no_flag_workspace_and_agent_lists_preferred_without_json_calls(monkeypatch) -> None:
+    """Herdr 0.7.0 no-flag envelopes are used before compatibility --json fallbacks."""
     config = Config(host_id="testhost", herdr_bin="herdr")
     responses = {
-        ("workspace", "list", "--json"): _completed("not json", returncode=1),
         ("workspace", "list"): {
             "result": {
                 "workspaces": [
@@ -263,30 +262,6 @@ def test_no_flag_workspace_list_succeeds_after_json_failure(monkeypatch) -> None
                 ]
             }
         },
-        ("agent", "list", "--json"): _completed("", returncode=1),
-        ("agent", "list"): _completed("", returncode=1),
-    }
-    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
-    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
-
-    spaces, workers = fetch_herdr_state(config)
-
-    assert len(spaces) == 1
-    assert spaces[0].id == "ws-1"
-    assert spaces[0].name == "Build"
-    assert spaces[0].status == "active"
-    assert spaces[0].meta.get("active_tab_id") == "tab-1"
-    assert spaces[0].meta.get("raw_status") == "working"
-    assert workers == []
-
-
-def test_no_flag_agent_list_succeeds_after_json_failure(monkeypatch) -> None:
-    """Herdr 0.7.0 no-flag agent list is used when --json fails."""
-    config = Config(host_id="testhost", herdr_bin="herdr")
-    responses = {
-        ("workspace", "list", "--json"): _completed("", returncode=1),
-        ("workspace", "list"): _completed("", returncode=1),
-        ("agent", "list", "--json"): _completed("not json", returncode=1),
         ("agent", "list"): {
             "result": {
                 "agents": [
@@ -301,12 +276,26 @@ def test_no_flag_agent_list_succeeds_after_json_failure(monkeypatch) -> None:
             }
         },
     }
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(args: Sequence[str], cfg: Config) -> subprocess.CompletedProcess[str] | None:
+        calls.append(tuple(args))
+        if "--json" in args:
+            raise AssertionError("--json fallback should not be called after valid no-flag output")
+        return _respond(args, responses)
+
     monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
-    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+    monkeypatch.setattr(herdr_cli, "_run_herdr", fake_run)
 
     spaces, workers = fetch_herdr_state(config)
 
-    assert spaces == []
+    assert calls == [("workspace", "list"), ("agent", "list")]
+    assert len(spaces) == 1
+    assert spaces[0].id == "ws-1"
+    assert spaces[0].name == "Build"
+    assert spaces[0].status == "active"
+    assert spaces[0].meta.get("active_tab_id") == "tab-1"
+    assert spaces[0].meta.get("raw_status") == "working"
     assert len(workers) == 1
     assert workers[0].id == "sess-1"
     assert workers[0].name == "Coder"
@@ -314,6 +303,74 @@ def test_no_flag_agent_list_succeeds_after_json_failure(monkeypatch) -> None:
     assert workers[0].space_id == "ws-1"
     assert workers[0].meta.get("cwd") == "/home/dev"
     assert workers[0].meta.get("raw_status") == "done"
+
+
+def test_json_workspace_list_fallback_when_no_flag_fails(monkeypatch) -> None:
+    """Compatibility --json workspace list is tried when no-flag output fails."""
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list"): _completed("usage", returncode=2),
+        ("workspace", "list", "--json"): {
+            "result": {
+                "workspaces": [{"workspace_id": "ws-json", "label": "Compat", "agent_status": "idle"}]
+            }
+        },
+        ("agent", "list"): {"result": {"agents": []}},
+        ("pane", "list"): {"result": {"panes": []}},
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(args: Sequence[str], cfg: Config) -> subprocess.CompletedProcess[str] | None:
+        calls.append(tuple(args))
+        return _respond(args, responses)
+
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", fake_run)
+
+    spaces, workers = fetch_herdr_state(config)
+
+    assert calls[:2] == [("workspace", "list"), ("workspace", "list", "--json")]
+    assert len(spaces) == 1
+    assert spaces[0].id == "ws-json"
+    assert spaces[0].name == "Compat"
+    assert workers == []
+
+
+def test_json_agent_list_fallback_when_no_flag_is_malformed(monkeypatch) -> None:
+    """Compatibility --json agent list is tried when no-flag output is malformed."""
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list"): {"result": {"workspaces": []}},
+        ("agent", "list"): _completed("not json"),
+        ("agent", "list", "--json"): {
+            "result": {
+                "agents": [
+                    {
+                        "agent_session": {"value": "sess-json"},
+                        "agent": "CompatAgent",
+                        "workspace_id": "ws-1",
+                    }
+                ]
+            }
+        },
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(args: Sequence[str], cfg: Config) -> subprocess.CompletedProcess[str] | None:
+        calls.append(tuple(args))
+        return _respond(args, responses)
+
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", fake_run)
+
+    spaces, workers = fetch_herdr_state(config)
+
+    assert calls == [("workspace", "list"), ("agent", "list"), ("agent", "list", "--json")]
+    assert spaces == []
+    assert len(workers) == 1
+    assert workers[0].id == "sess-json"
+    assert workers[0].name == "CompatAgent"
+    assert workers[0].space_id == "ws-1"
 
 
 def test_result_envelopes_parse(monkeypatch) -> None:
