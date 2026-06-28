@@ -1,0 +1,12 @@
+{
+  "result": {
+    "workspaces": [
+      {
+        "workspace_id": "ws-fixture",
+        "label": "Fixture Space",
+        "agent_status": "working",
+        "safe_note": "sanitized"
+      }
+    ]
+  }
+}

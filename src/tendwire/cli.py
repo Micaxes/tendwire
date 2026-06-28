@@ -11,7 +11,7 @@ import json
 import sys
 from typing import Any
 
-from .backends.herdr_cli import fetch_herdr_state
+from .backends.herdr_cli import diagnose_herdr, fetch_herdr_state
 from .backends.herdr_command import send_instruction as herdr_send_instruction
 from .config import Config, load_config
 from .core.actions import CommandContext, execute_command
@@ -51,6 +51,12 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="herdr_bin",
         default=None,
         help="Path or name of the herdr binary (default: herdr).",
+    )
+    parser.add_argument(
+        "--herdr-timeout",
+        dest="herdr_timeout_seconds",
+        default=None,
+        help="Seconds to wait for each Herdr CLI probe (default: 5.0).",
     )
 
     subparsers = parser.add_subparsers(dest="command")
@@ -98,6 +104,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="SQLite database path for command receipts (default: config path).",
     )
 
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Print read-only Herdr diagnostics.",
+    )
+    doctor_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        default=True,
+        help="Print diagnostics as JSON (default).",
+    )
+
     return parser
 
 
@@ -130,6 +148,20 @@ def cmd_snapshot(
         return 2
 
     return 0
+
+
+def cmd_doctor(
+    config: Config,
+    *,
+    json_output: bool = True,
+) -> int:
+    """Run read-only backend diagnostics and print a JSON result."""
+    if not json_output:
+        print("error: only --json output is supported", file=sys.stderr)
+        return 2
+    payload = diagnose_herdr(config)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0 if payload.get("status") == "ok" else 1
 
 
 def _envelope_from_receipt(request: Any, receipt: dict[str, Any]) -> CommandEnvelope:
@@ -303,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
         host_id=args.host_id,
         herdr_bin=args.herdr_bin,
         db_path=getattr(args, "db_path", None),
+        herdr_timeout_seconds=args.herdr_timeout_seconds,
     )
 
     if args.command == "snapshot":
@@ -314,6 +347,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "command":
         return cmd_command(config, json_output=args.json_output)
+
+    if args.command == "doctor":
+        return cmd_doctor(config, json_output=args.json_output)
 
     parser.print_help()
     return 0

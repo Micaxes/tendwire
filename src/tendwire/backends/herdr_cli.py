@@ -85,7 +85,7 @@ def _run_herdr(args: Sequence[str], config: Config) -> subprocess.CompletedProce
             capture_output=True,
             text=True,
             check=False,
-            timeout=_HERDR_TIMEOUT_SECONDS,
+            timeout=config.herdr_timeout_seconds,
         )
     except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, ValueError, TypeError):
         return None
@@ -116,6 +116,178 @@ def _command_payload_variants(variants: Sequence[Sequence[str]], config: Config)
         if payload is not None:
             return payload
     return None
+
+
+def _safe_text_sample(value: str | None) -> str | None:
+    """Return a short diagnostic text sample with obvious sensitive markers redacted."""
+    if not value:
+        return None
+    sample = value.strip()
+    if not sample:
+        return None
+    lowered = sample.lower()
+    if any(field in lowered for field in _FORBIDDEN_CONNECTOR_FIELDS):
+        return None
+    redacted_words: list[str] = []
+    for word in sample.split():
+        word_lower = word.lower()
+        if "token" in word_lower or "secret" in word_lower or "password" in word_lower:
+            redacted_words.append("[redacted]")
+        else:
+            redacted_words.append(word)
+    sanitized = " ".join(redacted_words)
+    if len(sanitized) > 200:
+        sanitized = sanitized[:197] + "..."
+    return sanitized
+
+
+def _diagnostic_item_count(payload: Any, keys: Sequence[str]) -> int:
+    return len(_payload_items(payload, keys))
+
+
+def _diagnostic_check(name: str, args: Sequence[str], config: Config, keys: Sequence[str]) -> dict[str, Any]:
+    """Run one read-only Herdr command and return a sanitized diagnostic record."""
+    check: dict[str, Any] = {
+        "name": name,
+        "argv": [config.herdr_bin, *args],
+        "ok": False,
+        "outcome": "unknown",
+        "timeout_seconds": config.herdr_timeout_seconds,
+    }
+    try:
+        completed = subprocess.run(
+            [config.herdr_bin, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=config.herdr_timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        check["outcome"] = "timeout"
+        return check
+    except (OSError, UnicodeDecodeError, ValueError, TypeError):
+        check["outcome"] = "launch_error"
+        return check
+
+    check["exit_code"] = int(completed.returncode)
+    if completed.returncode != 0:
+        check["outcome"] = "nonzero"
+        stdout_sample = _safe_text_sample(completed.stdout)
+        stderr_sample = _safe_text_sample(completed.stderr)
+        if stdout_sample is not None:
+            check["stdout_sample"] = stdout_sample
+        if stderr_sample is not None:
+            check["stderr_sample"] = stderr_sample
+        return check
+
+    payload = _parse_json_output(completed.stdout)
+    if payload is None:
+        check["outcome"] = "malformed_json"
+        stdout_sample = _safe_text_sample(completed.stdout)
+        if stdout_sample is not None:
+            check["stdout_sample"] = stdout_sample
+        return check
+
+    item_count = _diagnostic_item_count(payload, keys)
+    check["ok"] = True
+    check["item_count"] = item_count
+    check["outcome"] = "healthy_non_empty" if item_count else "empty_healthy"
+    return check
+
+
+def diagnose_herdr(config: Config) -> dict[str, Any]:
+    """Return JSON-serializable read-only Herdr CLI diagnostics."""
+    groups = [
+        [
+            ("workspace_list", ["workspace", "list"], ("workspaces", "spaces", "data", "items", "results", "result")),
+            ("workspace_list_json", ["workspace", "list", "--json"], ("workspaces", "spaces", "data", "items", "results", "result")),
+        ],
+        [
+            ("agent_list", ["agent", "list"], ("agents", "workers", "data", "items", "results", "result")),
+            ("agent_list_json", ["agent", "list", "--json"], ("agents", "workers", "data", "items", "results", "result")),
+        ],
+        [
+            ("pane_list", ["pane", "list"], ("panes", "items", "data", "results", "result")),
+            ("pane_list_json", ["pane", "list", "--json"], ("panes", "items", "data", "results", "result")),
+        ],
+    ]
+    planned = [check for group in groups for check in group]
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "command": "doctor",
+        "herdr_bin": config.herdr_bin,
+        "timeout_seconds": config.herdr_timeout_seconds,
+        "status": "ok",
+        "checks": [],
+    }
+    try:
+        binary_path = shutil.which(config.herdr_bin)
+    except (TypeError, ValueError, OSError):
+        binary_path = None
+
+    if binary_path is None:
+        result["status"] = "unavailable"
+        result["checks"] = [
+            {
+                "name": name,
+                "argv": [config.herdr_bin, *args],
+                "ok": False,
+                "outcome": "missing_binary",
+                "timeout_seconds": config.herdr_timeout_seconds,
+            }
+            for name, args, _keys in planned
+        ]
+        return result
+
+    checks: list[dict[str, Any]] = []
+    stop_after_timeout = False
+    for group in groups:
+        if stop_after_timeout:
+            break
+        for index, (name, args, keys) in enumerate(group):
+            if index > 0 and checks[-1]["ok"]:
+                break
+            check = _diagnostic_check(name, args, config, keys)
+            checks.append(check)
+            if check["outcome"] == "timeout":
+                stop_after_timeout = True
+                break
+
+    names_seen = {str(check["name"]) for check in checks}
+    remaining_planned = [
+        (name, args, keys)
+        for name, args, keys in planned
+        if name not in names_seen
+    ]
+    if stop_after_timeout:
+        for name, args, _keys in remaining_planned:
+            checks.append(
+                {
+                    "name": name,
+                    "argv": [config.herdr_bin, *args],
+                    "ok": False,
+                    "outcome": "skipped_after_timeout",
+                    "timeout_seconds": config.herdr_timeout_seconds,
+                }
+            )
+    else:
+        for name, args, _keys in remaining_planned:
+            checks.append(
+                {
+                    "name": name,
+                    "argv": [config.herdr_bin, *args],
+                    "ok": True,
+                    "outcome": "skipped_not_needed",
+                    "timeout_seconds": config.herdr_timeout_seconds,
+                }
+            )
+
+    result["checks"] = checks
+    if any(check["outcome"] == "timeout" for check in checks):
+        result["status"] = "timeout"
+    elif any(not check["ok"] for check in checks):
+        result["status"] = "degraded"
+    return result
 
 
 def _strip_connector_fields(value: Any) -> Any:

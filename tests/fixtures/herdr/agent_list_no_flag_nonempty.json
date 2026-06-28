@@ -1,0 +1,12 @@
+{
+  "result": {
+    "agents": [
+      {
+        "agent": "Fixture Agent",
+        "workspace_id": "ws-fixture",
+        "agent_status": "done",
+        "cwd": "/tmp/tendwire-fixture"
+      }
+    ]
+  }
+}

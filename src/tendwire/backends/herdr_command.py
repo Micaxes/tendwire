@@ -38,7 +38,7 @@ def _run_agent_send(
         capture_output=True,
         text=True,
         check=False,
-        timeout=_HERDR_SEND_TIMEOUT_SECONDS,
+        timeout=config.herdr_timeout_seconds,
     )
 
 
@@ -97,7 +97,7 @@ def send_instruction(
         return _backend_error(
             STATUS_REQUEST_STATE_UNCERTAIN,
             "Herdr agent send timed out after starting",
-            details={"timeout_seconds": _HERDR_SEND_TIMEOUT_SECONDS},
+            details={"timeout_seconds": config.herdr_timeout_seconds},
         )
     except (OSError, UnicodeDecodeError, ValueError, TypeError):
         return _backend_error(
