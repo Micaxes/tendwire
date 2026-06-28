@@ -36,6 +36,7 @@ _FORBIDDEN_CONNECTOR_FIELDS = {
 }
 
 _STATUS_KEYS = (
+    "agent_status",
     "status",
     "state",
     "phase",
@@ -94,6 +95,15 @@ def _command_payload(args: Sequence[str], config: Config) -> Any:
     if result is None or result.returncode != 0:
         return None
     return _parse_json_output(result.stdout)
+
+
+def _command_payload_variants(variants: Sequence[Sequence[str]], config: Config) -> Any:
+    """Try a sequence of herdr arg lists in order; return first successful payload."""
+    for args in variants:
+        payload = _command_payload(args, config)
+        if payload is not None:
+            return payload
+    return None
 
 
 def _strip_connector_fields(value: Any) -> Any:
@@ -167,6 +177,22 @@ def _first_text(item: Mapping[str, Any], keys: Sequence[str]) -> str | None:
     return None
 
 
+def _nested_text(item: Mapping[str, Any], *path: str) -> str | None:
+    """Return the first scalar string value reachable via a dotted key path."""
+    current: Any = item
+    for key in path:
+        if not isinstance(current, Mapping):
+            return None
+        current = _value_for_key(current, key)
+    if current is None:
+        return None
+    if isinstance(current, (str, int, float, bool)):
+        return str(current)
+    if isinstance(current, Mapping):
+        return _first_text(current, ("id", "value", "name", "label"))
+    return None
+
+
 def _related_id(value: Any) -> str | None:
     """Return a neutral related-object id from a scalar or mapping."""
     if value is None:
@@ -231,12 +257,45 @@ def _meta_from_item(item: Mapping[str, Any], excluded_keys: set[str], raw_status
     return meta
 
 
+def _space_id_from_item(item: Mapping[str, Any]) -> str:
+    """Resolve a stable space id, preferring explicit Herdr workspace_id."""
+    return _first_text(item, ("workspace_id", "space_id", "id", "slug", "name")) or "unknown"
+
+
+def _space_name_from_item(item: Mapping[str, Any], space_id: str) -> str:
+    """Resolve a space name, preferring label then workspace_id."""
+    return _first_text(item, ("label", "name", "title", "workspace_id", "space_id")) or space_id
+
+
+def _worker_id_from_item(item: Mapping[str, Any]) -> str:
+    """Resolve a stable worker id, preferring session value then pane/terminal ids."""
+    return (
+        _nested_text(item, "agent_session", "value")
+        or _first_text(item, ("pane_id", "terminal_id", "agent_id", "worker_id", "id", "slug", "name"))
+        or "unknown"
+    )
+
+
+def _worker_name_from_item(item: Mapping[str, Any], worker_id: str) -> str:
+    """Resolve a worker display name, preferring agent then label."""
+    return _first_text(item, ("agent", "label", "name", "title")) or worker_id
+
+
+def _worker_space_id_from_item(item: Mapping[str, Any]) -> str | None:
+    """Resolve a worker's parent space id, preferring workspace_id."""
+    return (
+        _first_text(item, ("workspace_id", "space_id", "spaceId", "workspaceId"))
+        or _related_id(_value_for_key(item, "space"))
+        or _related_id(_value_for_key(item, "workspace"))
+    )
+
+
 def _spaces_from_payload(payload: Any) -> list[Space]:
     """Extract neutral Space objects from a herdr workspace-list payload."""
     spaces: list[Space] = []
-    for item in _payload_items(payload, ("workspaces", "spaces", "data", "items", "results")):
-        space_id = _first_text(item, ("id", "workspace_id", "space_id", "slug", "name")) or "unknown"
-        name = _first_text(item, ("name", "title", "label", "slug", "id", "workspace_id", "space_id")) or space_id
+    for item in _payload_items(payload, ("workspaces", "spaces", "data", "items", "results", "result")):
+        space_id = _space_id_from_item(item)
+        name = _space_name_from_item(item, space_id)
         status, raw_status = _status_from_item(item)
         updated_at = _first_text(item, ("updated_at", "last_seen_at", "observed_at", "timestamp"))
         status_line = _first_text(item, ("status_line", "summary", "description"))
@@ -259,6 +318,7 @@ def _spaces_from_payload(payload: Any) -> list[Space]:
                 "summary",
                 "description",
                 "fingerprint",
+                "agent_status",
             },
             raw_status,
         )
@@ -275,60 +335,99 @@ def _spaces_from_payload(payload: Any) -> list[Space]:
     return spaces
 
 
+def _worker_from_item(item: Mapping[str, Any]) -> Worker:
+    """Build a neutral Worker from a single herdr agent/pane record."""
+    worker_id = _worker_id_from_item(item)
+    name = _worker_name_from_item(item, worker_id)
+    status, raw_status = _status_from_item(item)
+    last_seen_at = _first_text(item, ("last_seen_at", "updated_at", "observed_at", "timestamp"))
+    summary = _first_text(item, ("summary", "status_line", "description"))
+    space_id = _worker_space_id_from_item(item)
+    meta = _meta_from_item(
+        item,
+        {
+            "id",
+            "agent_id",
+            "worker_id",
+            "slug",
+            "name",
+            "title",
+            "label",
+            "agent",
+            "meta",
+            "space_id",
+            "workspace_id",
+            "spaceId",
+            "workspaceId",
+            "space",
+            "workspace",
+            "last_seen_at",
+            "updated_at",
+            "observed_at",
+            "timestamp",
+            "summary",
+            "status_line",
+            "description",
+            "fingerprint",
+            "agent_status",
+        },
+        raw_status,
+    )
+    return Worker(
+        id=worker_id,
+        name=name,
+        status=status,
+        space_id=space_id,
+        meta=meta,
+        last_seen_at=last_seen_at,
+        summary=summary,
+    )
+
+
+def _deduplicate_workers(workers: list[Worker]) -> list[Worker]:
+    """Drop duplicate workers by stable identity; keep deterministic order by id."""
+    seen: set[str] = set()
+    unique: list[Worker] = []
+    for worker in workers:
+        if worker.id in seen:
+            continue
+        seen.add(worker.id)
+        unique.append(worker)
+    return sorted(unique, key=lambda w: w.id)
+
+
 def _workers_from_payload(payload: Any) -> list[Worker]:
     """Extract neutral Worker objects from a herdr agent-list payload."""
     workers: list[Worker] = []
-    for item in _payload_items(payload, ("agents", "workers", "data", "items", "results")):
-        worker_id = _first_text(item, ("id", "agent_id", "worker_id", "slug", "name")) or "unknown"
-        name = _first_text(item, ("name", "title", "label", "slug", "id", "agent_id", "worker_id")) or worker_id
-        status, raw_status = _status_from_item(item)
-        last_seen_at = _first_text(item, ("last_seen_at", "updated_at", "observed_at", "timestamp"))
-        summary = _first_text(item, ("summary", "status_line", "description"))
-        space_id = (
-            _first_text(item, ("space_id", "workspace_id", "spaceId", "workspaceId"))
-            or _related_id(_value_for_key(item, "space"))
-            or _related_id(_value_for_key(item, "workspace"))
-        )
-        meta = _meta_from_item(
-            item,
-            {
-                "id",
-                "agent_id",
-                "worker_id",
-                "slug",
-                "name",
-                "title",
-                "label",
-                "meta",
-                "space_id",
-                "workspace_id",
-                "spaceId",
-                "workspaceId",
-                "space",
-                "workspace",
-                "last_seen_at",
-                "updated_at",
-                "observed_at",
-                "timestamp",
-                "summary",
-                "status_line",
-                "description",
-                "fingerprint",
-            },
-            raw_status,
-        )
-        workers.append(
-            Worker(
-                id=worker_id,
-                name=name,
-                status=status,
-                space_id=space_id,
-                meta=meta,
-                last_seen_at=last_seen_at,
-                summary=summary,
-            )
-        )
-    return workers
+    for item in _payload_items(payload, ("agents", "workers", "data", "items", "results", "result")):
+        workers.append(_worker_from_item(item))
+    return _deduplicate_workers(workers)
+
+
+def _pane_has_agent(item: Mapping[str, Any]) -> bool:
+    """Return True when a pane record carries an agent or explicit agent marker."""
+    if _value_for_key(item, "agent") is not None:
+        return True
+    if _value_for_key(item, "agent_session") is not None:
+        return True
+    if _nested_text(item, "agent_session", "value"):
+        return True
+    markers = _value_for_key(item, "state_labels") or _value_for_key(item, "labels") or []
+    if isinstance(markers, list):
+        for marker in markers:
+            if isinstance(marker, str) and "agent" in marker.lower():
+                return True
+    return False
+
+
+def _workers_from_pane_payload(payload: Any) -> list[Worker]:
+    """Extract worker objects from herdr pane list, only for agent-bearing panes."""
+    workers: list[Worker] = []
+    for item in _payload_items(payload, ("panes", "items", "data", "results", "result")):
+        if not _pane_has_agent(item):
+            continue
+        workers.append(_worker_from_item(item))
+    return _deduplicate_workers(workers)
 
 
 def fetch_herdr_state(config: Config) -> tuple[list[Space], list[Worker]]:
@@ -339,6 +438,25 @@ def fetch_herdr_state(config: Config) -> tuple[list[Space], list[Worker]]:
     except (TypeError, ValueError, OSError):
         return [], []
 
-    workspace_payload = _command_payload(["workspace", "list", "--json"], config)
-    agent_payload = _command_payload(["agent", "list", "--json"], config)
-    return _spaces_from_payload(workspace_payload), _workers_from_payload(agent_payload)
+    workspace_payload = _command_payload_variants(
+        [
+            ["workspace", "list", "--json"],
+            ["workspace", "list"],
+        ],
+        config,
+    )
+    agent_payload = _command_payload_variants(
+        [
+            ["agent", "list", "--json"],
+            ["agent", "list"],
+        ],
+        config,
+    )
+
+    spaces = _spaces_from_payload(workspace_payload)
+    workers = _workers_from_payload(agent_payload)
+    if not workers:
+        pane_payload = _command_payload(["pane", "list"], config)
+        workers = _workers_from_pane_payload(pane_payload)
+
+    return spaces, workers

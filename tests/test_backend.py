@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Sequence
 from typing import Any
 
 from tendwire.backends import herdr_cli
@@ -33,6 +34,19 @@ def _completed(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess[
         stdout=stdout,
         stderr="",
     )
+
+
+def _respond(args: Sequence[str], responses: dict[tuple[str, ...], Any]) -> subprocess.CompletedProcess[str] | None:
+    """Return a canned response for a herdr command tuple."""
+    key = tuple(args)
+    if key not in responses:
+        return _completed("", returncode=1)
+    response = responses[key]
+    if isinstance(response, subprocess.CompletedProcess):
+        return response
+    if isinstance(response, str):
+        return _completed(response)
+    return _completed(json.dumps(response))
 
 
 def _assert_no_forbidden_fields(value: Any, path: str = "$") -> None:
@@ -130,3 +144,277 @@ def test_sample_herdr_projection_is_neutral_and_fingerprinted(monkeypatch) -> No
     assert payload["attention"][0]["source"] == "worker:worker-1"
     assert payload["attention"][0]["fingerprint"]
     _assert_no_forbidden_fields(payload)
+
+
+def test_no_flag_workspace_list_succeeds_after_json_failure(monkeypatch) -> None:
+    """Herdr 0.7.0 no-flag workspace list is used when --json fails."""
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list", "--json"): _completed("not json", returncode=1),
+        ("workspace", "list"): {
+            "result": {
+                "workspaces": [
+                    {
+                        "workspace_id": "ws-1",
+                        "label": "Build",
+                        "agent_status": "working",
+                        "active_tab_id": "tab-1",
+                    }
+                ]
+            }
+        },
+        ("agent", "list", "--json"): _completed("", returncode=1),
+        ("agent", "list"): _completed("", returncode=1),
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    spaces, workers = fetch_herdr_state(config)
+
+    assert len(spaces) == 1
+    assert spaces[0].id == "ws-1"
+    assert spaces[0].name == "Build"
+    assert spaces[0].status == "active"
+    assert spaces[0].meta.get("active_tab_id") == "tab-1"
+    assert spaces[0].meta.get("raw_status") == "working"
+    assert workers == []
+
+
+def test_no_flag_agent_list_succeeds_after_json_failure(monkeypatch) -> None:
+    """Herdr 0.7.0 no-flag agent list is used when --json fails."""
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list", "--json"): _completed("", returncode=1),
+        ("workspace", "list"): _completed("", returncode=1),
+        ("agent", "list", "--json"): _completed("not json", returncode=1),
+        ("agent", "list"): {
+            "result": {
+                "agents": [
+                    {
+                        "agent_session": {"value": "sess-1"},
+                        "agent": "Coder",
+                        "workspace_id": "ws-1",
+                        "agent_status": "done",
+                        "cwd": "/home/dev",
+                    }
+                ]
+            }
+        },
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    spaces, workers = fetch_herdr_state(config)
+
+    assert spaces == []
+    assert len(workers) == 1
+    assert workers[0].id == "sess-1"
+    assert workers[0].name == "Coder"
+    assert workers[0].status == "closed"
+    assert workers[0].space_id == "ws-1"
+    assert workers[0].meta.get("cwd") == "/home/dev"
+    assert workers[0].meta.get("raw_status") == "done"
+
+
+def test_result_envelopes_parse(monkeypatch) -> None:
+    """result.workspaces, result.agents, and result.panes envelopes parse."""
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list", "--json"): {
+            "result": {
+                "workspaces": [{"workspace_id": "ws-result", "label": "ResultSpace", "agent_status": "idle"}]
+            }
+        },
+        ("agent", "list", "--json"): {
+            "result": {"agents": [{"agent_session": {"value": "sess-result"}, "agent": "Agent"}]}
+        },
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    spaces, workers = fetch_herdr_state(config)
+
+    assert len(spaces) == 1
+    assert spaces[0].id == "ws-result"
+    assert len(workers) == 1
+    assert workers[0].id == "sess-result"
+
+
+def test_pane_fallback_only_when_agent_list_yields_none(monkeypatch) -> None:
+    """Pane list fallback runs only when agents are empty and only for agent-bearing panes."""
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list", "--json"): _completed("", returncode=1),
+        ("workspace", "list"): _completed("", returncode=1),
+        ("agent", "list", "--json"): _completed("", returncode=1),
+        ("agent", "list"): {"result": {"agents": []}},
+        ("pane", "list"): {
+            "result": {
+                "panes": [
+                    {"pane_id": "pane-agent", "agent": "Runner", "workspace_id": "ws-1"},
+                    {"pane_id": "pane-plain", "workspace_id": "ws-1"},
+                ]
+            }
+        },
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    spaces, workers = fetch_herdr_state(config)
+
+    assert len(workers) == 1
+    assert workers[0].id == "pane-agent"
+    assert workers[0].name == "Runner"
+
+
+def test_pane_fallback_skipped_when_agents_present(monkeypatch) -> None:
+    """Pane list is not used as a fallback when agent list already produced workers."""
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list", "--json"): _completed("", returncode=1),
+        ("workspace", "list"): _completed("", returncode=1),
+        ("agent", "list", "--json"): {
+            "result": {"agents": [{"agent_session": {"value": "sess-1"}, "agent": "Agent"}]}
+        },
+        ("pane", "list"): {"result": {"panes": [{"pane_id": "sess-1", "agent": "Agent"}]}},
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    spaces, workers = fetch_herdr_state(config)
+
+    assert len(workers) == 1
+    assert workers[0].id == "sess-1"
+
+
+def test_agent_and_pane_duplicates_emit_one_worker(monkeypatch) -> None:
+    """A worker described by both agent and pane payloads is deduplicated."""
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list", "--json"): _completed("", returncode=1),
+        ("workspace", "list"): _completed("", returncode=1),
+        ("agent", "list", "--json"): _completed("", returncode=1),
+        ("agent", "list"): {"result": {"agents": []}},
+        ("pane", "list"): {
+            "result": {
+                "panes": [
+                    {"pane_id": "pane-1", "agent": "Runner", "workspace_id": "ws-1"},
+                    {"pane_id": "pane-1", "agent": "Runner", "workspace_id": "ws-1"},
+                ]
+            }
+        },
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    spaces, workers = fetch_herdr_state(config)
+
+    assert len(workers) == 1
+    assert workers[0].id == "pane-1"
+
+
+def test_repeated_agent_names_with_distinct_ids_remain_distinct(monkeypatch) -> None:
+    """Workers with the same display name but different session ids are kept."""
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list", "--json"): _completed("", returncode=1),
+        ("workspace", "list"): _completed("", returncode=1),
+        ("agent", "list", "--json"): {
+            "result": {
+                "agents": [
+                    {"agent_session": {"value": "sess-a"}, "agent": "Coder", "workspace_id": "ws-1"},
+                    {"agent_session": {"value": "sess-b"}, "agent": "Coder", "workspace_id": "ws-1"},
+                ]
+            }
+        },
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    spaces, workers = fetch_herdr_state(config)
+
+    assert len(workers) == 2
+    assert {w.id for w in workers} == {"sess-a", "sess-b"}
+    assert workers[0].id < workers[1].id
+
+
+def test_status_aliases_for_live_herdr(monkeypatch) -> None:
+    """Working maps to active, done maps to closed, and raw_status is preserved."""
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list", "--json"): {
+            "result": {
+                "workspaces": [
+                    {"workspace_id": "ws-1", "label": "Space", "agent_status": "working"},
+                    {"workspace_id": "ws-2", "label": "Space2", "agent_status": "responding"},
+                ]
+            }
+        },
+        ("agent", "list", "--json"): {
+            "result": {
+                "agents": [
+                    {"agent_session": {"value": "sess-1"}, "agent": "Agent", "workspace_id": "ws-1", "agent_status": "done"},
+                    {"agent_session": {"value": "sess-2"}, "agent": "Agent", "workspace_id": "ws-2", "agent_status": "awaiting-input"},
+                ]
+            }
+        },
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    spaces, workers = fetch_herdr_state(config)
+
+    assert spaces[0].status == "active"
+    assert spaces[0].meta.get("raw_status") == "working"
+    assert spaces[1].status == "waiting"
+    assert spaces[1].meta.get("raw_status") == "responding"
+    by_id = {w.id: w for w in workers}
+    assert by_id["sess-1"].status == "closed"
+    assert by_id["sess-1"].meta.get("raw_status") == "done"
+    assert by_id["sess-2"].status == "waiting"
+    assert by_id["sess-2"].meta.get("raw_status") == "awaiting-input"
+
+
+def test_forbidden_connector_fields_stripped_in_herdr_070(monkeypatch) -> None:
+    """Connector/delivery fields are stripped from live Herdr 0.7.0 payloads."""
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list", "--json"): {
+            "result": {
+                "workspaces": [
+                    {
+                        "workspace_id": "ws-1",
+                        "label": "Space",
+                        "agent_status": "idle",
+                        "telegram": "leaked",
+                        "chat_id": 123,
+                    }
+                ]
+            }
+        },
+        ("agent", "list", "--json"): {
+            "result": {
+                "agents": [
+                    {
+                        "agent_session": {"value": "sess-1"},
+                        "agent": "Agent",
+                        "workspace_id": "ws-1",
+                        "agent_status": "active",
+                        "route": "telegram",
+                        "delivery": {"topic_id": 456},
+                        "herdres_delivery": {"message_id": 789},
+                    }
+                ]
+            }
+        },
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    spaces, workers = fetch_herdr_state(config)
+    snapshot = project_from_observations(config, spaces=spaces, workers=workers)
+    payload = json.loads(snapshot.to_json())
+
+    _assert_no_forbidden_fields(payload)
+    assert "telegram" not in payload["spaces"][0]["meta"]
+    assert "route" not in payload["workers"][0]["meta"]
