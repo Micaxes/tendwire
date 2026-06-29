@@ -285,7 +285,7 @@ def test_suggested_action_from_dict_does_not_promote_forbidden_command_alias() -
         assert action.tendwire_action == ""
         assert not action.has_public_tendwire_action
         assert payload["label"] == raw_action["label"]
-        assert payload["tendwire_action"] == ""
+        assert "tendwire_action" not in payload
         assert "safe" in payload["params"]
         assert "sentinel-" not in encoded
         _assert_no_forbidden_fields(payload)
@@ -609,8 +609,38 @@ def test_attention_signal_direct_identity_and_dataclass_actions_are_neutral() ->
         "worker_id": "worker-1",
         "safe": "kept",
     }
-    assert payload["suggested_actions"][0]["tendwire_action"] == "tendwire snapshot --json"
+    assert action.command == "tendwire snapshot --json"
+    assert "tendwire_action" not in payload["suggested_actions"][0]
     assert "command" not in payload["suggested_actions"][0]
+    _assert_no_forbidden_fields(payload)
+
+
+def test_attention_signal_preserves_explicit_safe_tendwire_action_publicly() -> None:
+    action = SuggestedAction(
+        action_id="approve-worker",
+        label="Approve",
+        tendwire_action="approve_interaction",
+        params={"safe": "kept", "telegram_message_id": "sentinel-message"},
+    )
+    signal = AttentionSignal(
+        kind="worker_status",
+        severity="warning",
+        status="waiting",
+        reason="Worker needs approval",
+        source="worker:worker-1",
+        updated_at="2026-01-01T00:00:00+00:00",
+        suggested_actions=[action],
+        host_id="attention-host",
+    )
+
+    payload = signal.to_dict()
+
+    assert payload["suggested_actions"][0] == {
+        "action_id": "approve-worker",
+        "label": "Approve",
+        "tendwire_action": "approve_interaction",
+        "params": {"safe": "kept"},
+    }
     _assert_no_forbidden_fields(payload)
 
 

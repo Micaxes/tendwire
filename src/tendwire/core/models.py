@@ -611,12 +611,14 @@ class SuggestedAction:
         return bool(getattr(self, "_explicit_tendwire_action", False))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "action_id": self.action_id,
             "label": self.label,
-            "tendwire_action": self.tendwire_action,
             "params": sanitize_forbidden_fields(self.params),
         }
+        if self.has_public_tendwire_action:
+            payload["tendwire_action"] = self.tendwire_action
+        return payload
 
     @classmethod
     def from_dict(cls, data: "SuggestedAction | Mapping[str, Any]") -> "SuggestedAction":
