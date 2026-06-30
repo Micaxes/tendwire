@@ -1,0 +1,6 @@
+{
+  "status": "ok",
+  "event_count": 1,
+  "changed_count": 1,
+  "status_buckets": ["blocked"]
+}

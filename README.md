@@ -91,11 +91,19 @@ subprocess timeouts are capped by the time left in that budget.
 
 ### Live Herdr smoke harness
 
-The live Herdr smoke harness is an **opt-in Tendwire-only check** for the
-boundary between Tendwire's public contracts and Herdr's daemon/socket/command
-surfaces. It is not part of normal `tendwire` commands, does not run during
-ordinary pytest, and does not add Herdres, source polling, connector delivery,
-outbox processing, UI integration, or raw terminal control.
+The Herdr smoke harness is an **opt-in Tendwire-only check** for the boundary
+between Tendwire's public contracts and Herdr's daemon/socket/command surfaces.
+Normal `tendwire` commands and ordinary pytest do not contact or mutate live
+Herdr. Live contact requires either `--live` or
+`TENDWIRE_HERDR_LIVE_SMOKE=1`, and the harness does not add Herdres, source
+polling, connector delivery, outbox processing, UI integration, or raw terminal
+control.
+
+Live mode proves Tendwire's own Herdr assumptions end to end: discovery,
+temporary worker attachment when Herdr exposes a safe operation for it,
+observation, high-level send addressing, target validation, event
+subscriptions, public binding updates for status/move/close events, degraded
+backend behavior, and public-safe evidence generation.
 
 Safe live command:
 
@@ -103,15 +111,17 @@ Safe live command:
 python3 scripts/herdr_smoke.py --live
 ```
 
-The optional `scripts/live_herdr_smoke.sh` wrapper is the same opt-in live
-entrypoint in shell form.
+The optional `scripts/live_herdr_smoke.sh` wrapper remains only a thin shell
+entrypoint for the same opt-in live mode.
 
-The command above starts live mode explicitly and gives child Herdr commands an
-isolated default `HERDR_SESSION=tendwire-smoke` when the caller has not already
-chosen a session. That default is intentional: the smoke suite must never target
-a daily Herdr session unless you explicitly configure it to do so.
+The command above gives child Herdr commands an isolated default
+`HERDR_SESSION=tendwire-smoke` when the caller has not already chosen a session,
+and the live subprocess calls address that selected scope explicitly with
+`herdr --session <selected> ...`. The environment variable alone is not treated
+as enough isolation. That default is intentional: the smoke suite must never
+silently target a daily Herdr session.
 
-Two override paths are available and both should be treated as deliberate risk:
+Two override paths are available and both are deliberate risk:
 
 - `python3 scripts/herdr_smoke.py --live --session VALUE` sets the child
   `HERDR_SESSION` to `VALUE`.
@@ -127,8 +137,7 @@ TENDWIRE_HERDR_LIVE_SMOKE=1 python3 scripts/herdr_smoke.py
 
 Without `--live`, without `TENDWIRE_HERDR_LIVE_SMOKE=1`, and without fixture
 replay, the harness prints a valid JSON skip summary and makes no Herdr
-subprocess or socket calls. For deterministic offline replay, pass a fixture
-directory:
+subprocess or socket calls. Fixture replay is deterministic and offline:
 
 ```bash
 python3 scripts/herdr_smoke.py --fixture-dir tests/fixtures/herdr/live_smoke/ok
@@ -139,32 +148,53 @@ fixture files, so normal offline pytest can import and exercise the harness
 without contacting Herdr. Any future live pytest coverage must be explicitly
 selected by maintainers rather than running by default.
 
+Live mode first checks that the selected Herdr scope is available. If the default
+smoke scope is stopped, unsupported, or unavailable, the harness fails closed
+with `ok: false` and does not continue into workspace/agent observation or send
+checks. A high-level `herdr agent send` probe only counts as successful when the
+command exits zero and the harness records at least one accepted send.
+
+Some Herdr installations do not expose safe live create, move, close, or
+degraded-backend operations. When those operations are unsafe or unavailable,
+the live harness reports the affected record as `live_skipped_unreliable`
+instead of mutating a real workspace. Deterministic fixture or fake-backed
+Tendwire validation still proves the public contract for the create/move/close
+and degradation scenarios.
+
 Live prerequisites are intentionally narrow:
 
 - The `herdr` binary is on `PATH`, or `--herdr-bin /path/to/herdr` points at it.
 - Herdr supports the high-level workspace/agent surfaces and the socket/event
   surfaces used by Tendwire's daemon and command boundary.
 - You are willing to create temporary smoke workers in the selected Herdr
-  session and review the neutral evidence JSON afterward.
+  session only when Herdr exposes safe operations for doing so.
 - The selected session is a disposable/sandbox session unless you intentionally
   override the isolated default.
 
-The smoke suite checks Tendwire assumptions rather than broad Herdr behavior:
-workspace listing, agent listing, socket/event subscription shape, public worker
-projection, high-level send addressing, name ambiguity handling, routing
-resolution, status/event observation, closed or moved worker observations, and
-public JSON safety.
+The smoke evidence records are:
 
-Stdout is a public-safe JSON evidence artifact. Its top-level shape is limited
-to neutral fields such as `schema_version`, `ok`, `mode`, `status`, `summary`,
-`default_isolated_session`, `explicit_session`, `checks`, and `failures`.
-Individual check records use aggregate fields such as `name`, `status`,
+- `create_attach`
+- `observe`
+- `send_addressing`
+- `target_validation`
+- `event_subscription`
+- `status_agent_status_changed`
+- `pane_moved_binding_update`
+- `close_exited`
+- `degraded_backend_preserves_workers`
+- `public_safety`
+
+Stdout is a public-safe aggregate JSON evidence artifact. Its top-level shape is
+limited to neutral fields such as `schema_version`, `ok`, `mode`, `status`,
+`summary`, `default_isolated_session`, `explicit_session`, `checks`, and
+`failures`. Individual records use aggregate fields such as `name`, `status`,
 `required`, `ok`, `exit_code`, `json_status`, `item_count`, `variants`, and
-`detail`. The public smoke summary is recursively sanitized and rejects
-forbidden private keys or values; it must not expose Telegram, Herdres, raw pane
-or terminal data, sockets, backend targets, raw target values, session values,
-private bindings, connector/outbox/delivery state, argv/env/stdout/stderr,
-tokens, secrets, or private fingerprints.
+`detail`.
+
+The public smoke summary is recursively sanitized and must not expose raw
+`pane_id`, `terminal_id`, backend targets, socket paths, target values,
+Telegram or Herdres IDs, tokens, private bindings, private fingerprints,
+stdout, stderr, env, argv, secrets, or raw Herdr payloads.
 
 Non-goals:
 

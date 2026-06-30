@@ -14,30 +14,36 @@ OK_FIXTURES = FIXTURE_ROOT / "ok"
 NEGATIVE_FIXTURES = FIXTURE_ROOT / "negative_private"
 
 REQUIRED_CHECKS = {
-    "workspace_list",
-    "agent_list",
-    "worker_surface",
+    "create_attach",
+    "observe",
     "send_addressing",
-    "name_ambiguity",
-    "routing_resolution",
-    "status_event",
+    "target_validation",
     "event_subscription",
-    "closed_moved_observations",
+    "status_agent_status_changed",
+    "pane_moved_binding_update",
+    "close_exited",
+    "degraded_backend_preserves_workers",
     "public_safety",
 }
 
-# The public schema deliberately contains boolean fields named
-# default_isolated_session and explicit_session; concrete session values are
-# asserted separately instead of banning that substring wholesale.
+# The public schema deliberately contains scenario names such as
+# target_validation and pane_moved_binding_update. The banned list therefore
+# names concrete private surfaces rather than the neutral words "target" or
+# "binding" by themselves.
 FORBIDDEN_PUBLIC_TERMS = (
     "telegram",
     "herdres",
     "raw pane",
+    "pane_id",
+    "pane-id",
+    "terminal_id",
     "terminal",
     "socket",
-    "target",
-    "private",
-    "binding",
+    "backend_target",
+    "target_kind",
+    "target_value",
+    "private_binding",
+    "private_fingerprint",
     "connector",
     "outbox",
     "delivery",
@@ -59,6 +65,8 @@ PRIVATE_MARKERS = (
     "actual-private-session",
     "socket:///tmp/forbidden.sock",
     "private fingerprint abc123",
+    "pane-secret",
+    "agent-secret",
 )
 
 
@@ -93,6 +101,7 @@ def _run_main(module, argv, capsys, *, env=None, runner=None):
     assert public_text, "smoke harness must print one JSON summary"
     data = json.loads(public_text)
     assert isinstance(data, dict)
+    module.validate_public_summary(data)
     return return_code, public_text, data
 
 
@@ -187,23 +196,55 @@ class RecordingRunner:
 
     def _stdout_for(self, argv):
         joined = " ".join(part.lower() for part in argv)
+        if "status" in joined and "server" in joined:
+            return "status: running\n"
         if "workspace" in joined and "list" in joined:
-            return (OK_FIXTURES / "workspace_list.json").read_text()
+            return json.dumps({"status": "ok", "items": [{"label": "smoke-space"}], "count": 1})
         if "agent" in joined and "list" in joined:
-            return (OK_FIXTURES / "agent_list.json").read_text()
+            return json.dumps({"status": "ok", "items": [{"name": "smoke-worker"}], "count": 1})
+        if "status" in joined or "event" in joined:
+            return (OK_FIXTURES / "status_agent_status_changed.json").read_text()
         if "send" in joined or "address" in joined:
             return (OK_FIXTURES / "send_addressing.json").read_text()
-        if "ambig" in joined:
-            return (OK_FIXTURES / "name_ambiguity.json").read_text()
-        if "route" in joined or "resolve" in joined:
-            return (OK_FIXTURES / "routing_resolution.json").read_text()
-        if "status" in joined or "event" in joined:
-            return (OK_FIXTURES / "status_event.json").read_text()
-        if "closed" in joined or "moved" in joined:
-            return (OK_FIXTURES / "closed_moved_observations.json").read_text()
-        if "surface" in joined or "pane" in joined or "worker" in joined:
-            return (OK_FIXTURES / "worker_surface.json").read_text()
         return json.dumps({"status": "ok", "items": [{"name": "generic-worker"}], "count": 1})
+
+
+class StoppedSessionRunner(RecordingRunner):
+    def _stdout_for(self, argv):
+        joined = " ".join(part.lower() for part in argv)
+        if "status" in joined and "server" in joined:
+            return "status: not running\nsocket: /private/path\n"
+        raise AssertionError("stopped smoke scope must fail before observe/send commands")
+
+
+class StoppedUnderscoreSessionRunner(RecordingRunner):
+    def _stdout_for(self, argv):
+        joined = " ".join(part.lower() for part in argv)
+        if "status" in joined and "server" in joined:
+            return json.dumps({"status": "not_running"})
+        raise AssertionError("stopped smoke scope must fail before observe/send commands")
+
+
+class NonzeroSendRunner(RecordingRunner):
+    def __call__(self, *args, **kwargs):
+        result = super().__call__(*args, **kwargs)
+        argv = self.calls[-1]["argv"]
+        if argv[3:5] == ["agent", "send"]:
+            result.returncode = 1
+            result.stdout = ""
+            result.stderr = "private send failure"
+        return result
+
+
+class ZeroAcceptedSendRunner(RecordingRunner):
+    def __call__(self, *args, **kwargs):
+        result = super().__call__(*args, **kwargs)
+        argv = self.calls[-1]["argv"]
+        if argv[3:5] == ["agent", "send"]:
+            result.returncode = 0
+            result.stdout = json.dumps({"status": "ok", "accepted_count": 0})
+            result.stderr = ""
+        return result
 
 
 def test_no_live_opt_in_skips_without_subprocess_calls(smoke_module, monkeypatch, capsys):
@@ -216,15 +257,17 @@ def test_no_live_opt_in_skips_without_subprocess_calls(smoke_module, monkeypatch
     assert runner.calls == []
     assert _is_skip(data)
     assert data.get("mode") != "live"
+    assert REQUIRED_CHECKS <= _check_names(data)
     _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
 
 
 @pytest.mark.parametrize(
-    ("argv", "env", "expected_session", "expected_default", "expected_explicit"),
+    ("argv", "env", "expected_session", "expected_default", "expected_explicit", "expect_send"),
     [
-        (["--live"], {}, "tendwire-smoke", True, False),
-        (["--live", "--session", "explicit-smoke"], {}, "explicit-smoke", False, True),
-        (["--live"], {"HERDR_SESSION": "caller-smoke"}, "caller-smoke", False, True),
+        (["--live"], {}, "tendwire-smoke", True, False, True),
+        (["--live"], {"HERDR_SESSION": "tendwire-smoke"}, "tendwire-smoke", False, True, True),
+        (["--live", "--session", "explicit-smoke"], {}, "explicit-smoke", False, True, False),
+        (["--live"], {"HERDR_SESSION": "caller-smoke"}, "caller-smoke", False, True, False),
     ],
 )
 def test_live_session_selection_and_argv_construction(
@@ -236,6 +279,7 @@ def test_live_session_selection_and_argv_construction(
     expected_session,
     expected_default,
     expected_explicit,
+    expect_send,
 ):
     runner = RecordingRunner()
     _patch_which(monkeypatch, smoke_module, "/fake/bin/herdr")
@@ -248,9 +292,16 @@ def test_live_session_selection_and_argv_construction(
         assert call["env"].get("HERDR_SESSION") == expected_session
         assert isinstance(call["argv"], list)
         assert call["kwargs"].get("shell") is not True
-    assert not any(call["argv"][1:3] == ["pane", "list"] for call in runner.calls)
+        assert call["argv"][1:3] == ["--session", expected_session]
+    assert not any(call["argv"][3:4] == ["pane"] for call in runner.calls)
+    send_calls = [call for call in runner.calls if call["argv"][3:5] == ["agent", "send"]]
+    assert bool(send_calls) is expect_send
     assert data.get("default_isolated_session") is expected_default
     assert data.get("explicit_session") is expected_explicit
+    assert REQUIRED_CHECKS <= _check_names(data)
+    assert _check_by_name(data, "observe")["observed"] is True
+    assert _check_by_name(data, "create_attach")["limitation"] == "live_skipped_unreliable"
+    assert _check_by_name(data, "pane_moved_binding_update")["limitation"] == "live_skipped_unreliable"
     _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
 
 
@@ -270,7 +321,91 @@ def test_environment_variable_opts_into_live_mode(smoke_module, monkeypatch, cap
     assert runner.calls
     for call in runner.calls:
         assert call["env"].get("HERDR_SESSION") == "tendwire-smoke"
+        assert call["argv"][1:3] == ["--session", "tendwire-smoke"]
     assert data.get("mode") == "live"
+    assert _check_by_name(data, "send_addressing")["send_attempts"] == 1
+    _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
+
+
+def test_live_stopped_selected_scope_fails_before_observe_or_send(smoke_module, monkeypatch, capsys):
+    runner = StoppedSessionRunner()
+    _patch_which(monkeypatch, smoke_module, "/fake/bin/herdr")
+
+    return_code, public_text, data = _run_main(smoke_module, ["--live"], capsys, env={}, runner=runner)
+
+    assert return_code not in (0, None)
+    assert data.get("ok") is False
+    assert data.get("status") == "unavailable"
+    assert len(runner.calls) == 1
+    assert runner.calls[0]["argv"][1:5] == ["--session", "tendwire-smoke", "status", "server"]
+    observe = _check_by_name(data, "observe")
+    assert observe["ok"] is False
+    assert observe["workspace_count"] == 0
+    assert observe["worker_count"] == 0
+    send = _check_by_name(data, "send_addressing")
+    assert send["status"] == "skipped"
+    assert send["send_attempts"] == 0
+    _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
+
+
+def test_live_not_running_machine_status_fails_before_observe_or_send(smoke_module, monkeypatch, capsys):
+    runner = StoppedUnderscoreSessionRunner()
+    _patch_which(monkeypatch, smoke_module, "/fake/bin/herdr")
+
+    return_code, public_text, data = _run_main(smoke_module, ["--live"], capsys, env={}, runner=runner)
+
+    assert return_code not in (0, None)
+    assert data.get("ok") is False
+    assert data.get("status") == "unavailable"
+    assert len(runner.calls) == 1
+    assert runner.calls[0]["argv"][1:5] == ["--session", "tendwire-smoke", "status", "server"]
+    observe = _check_by_name(data, "observe")
+    assert observe["ok"] is False
+    assert observe["status"] == "unavailable"
+    send = _check_by_name(data, "send_addressing")
+    assert send["status"] == "skipped"
+    assert send["send_attempts"] == 0
+    _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
+
+
+def test_live_nonzero_send_is_not_ok(smoke_module, monkeypatch, capsys):
+    runner = NonzeroSendRunner()
+    _patch_which(monkeypatch, smoke_module, "/fake/bin/herdr")
+
+    return_code, public_text, data = _run_main(smoke_module, ["--live"], capsys, env={}, runner=runner)
+
+    assert return_code not in (0, None)
+    assert data.get("ok") is False
+    assert data.get("status") == "failed"
+    send = _check_by_name(data, "send_addressing")
+    assert send["ok"] is False
+    assert send["status"] == "nonzero"
+    assert send["exit_code"] == 1
+    assert send["accepted_count"] == 0
+    send_calls = [call for call in runner.calls if call["argv"][3:5] == ["agent", "send"]]
+    assert len(send_calls) == 1
+    assert send_calls[0]["argv"][1:3] == ["--session", "tendwire-smoke"]
+    _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
+
+
+def test_live_zero_accepted_send_is_not_ok(smoke_module, monkeypatch, capsys):
+    runner = ZeroAcceptedSendRunner()
+    _patch_which(monkeypatch, smoke_module, "/fake/bin/herdr")
+
+    return_code, public_text, data = _run_main(smoke_module, ["--live"], capsys, env={}, runner=runner)
+
+    assert return_code not in (0, None)
+    assert data.get("ok") is False
+    assert data.get("status") == "failed"
+    send = _check_by_name(data, "send_addressing")
+    assert send["ok"] is False
+    assert send["status"] == "zero_accepted"
+    assert send["exit_code"] == 0
+    assert send["json_status"] == "valid"
+    assert send["accepted_count"] == 0
+    send_calls = [call for call in runner.calls if call["argv"][3:5] == ["agent", "send"]]
+    assert len(send_calls) == 1
+    assert send_calls[0]["argv"][1:3] == ["--session", "tendwire-smoke"]
     _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
 
 
@@ -292,6 +427,14 @@ def test_fixture_replay_is_deterministic_and_public_safe(smoke_module, monkeypat
     assert data.get("mode") == "fixture"
     assert REQUIRED_CHECKS <= _check_names(data)
     _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
+    assert _check_by_name(data, "create_attach")["created_count"] == 1
+    assert _check_by_name(data, "observe")["worker_count"] == 2
+    assert _check_by_name(data, "send_addressing")["send_attempts"] == 1
+    assert _check_by_name(data, "target_validation")["rejected_send_attempts"] == 0
+    assert _check_by_name(data, "status_agent_status_changed")["changed_count"] == 1
+    assert _check_by_name(data, "pane_moved_binding_update")["preserved"] is True
+    assert _check_by_name(data, "close_exited")["exited_count"] == 1
+    assert _check_by_name(data, "degraded_backend_preserves_workers")["preserved"] is True
     event_check = _check_by_name(data, "event_subscription")
     assert event_check.get("method") == "events.subscribe"
     assert event_check.get("official_event_count") == len(smoke_module.OFFICIAL_EVENT_TYPES)
@@ -308,6 +451,32 @@ def test_fixture_replay_is_deterministic_and_public_safe(smoke_module, monkeypat
         "worktree.updated",
     ):
         assert raw_name not in public_text
+
+
+def test_deterministic_target_validation_sends_only_valid_case(smoke_module):
+    calls = []
+
+    check = smoke_module._deterministic_target_validation_check(calls.append)
+
+    assert check["ok"] is True
+    assert check["valid_cases"] == 1
+    assert check["invalid_cases"] == 2
+    assert check["ambiguous_cases"] == 1
+    assert check["send_attempts"] == 1
+    assert check["rejected_send_attempts"] == 0
+    assert calls == ["valid"]
+
+
+def test_deterministic_event_backend_covers_move_close_exited_and_degraded(smoke_module):
+    checks = smoke_module._deterministic_event_backend_checks()
+
+    assert checks["status_agent_status_changed"]["changed_count"] == 1
+    assert checks["pane_moved_binding_update"]["preserved"] is True
+    assert checks["pane_moved_binding_update"]["worker_count_before"] == checks["pane_moved_binding_update"]["worker_count_after"]
+    assert checks["close_exited"]["closed_count"] == 1
+    assert checks["close_exited"]["exited_count"] == 1
+    assert checks["degraded_backend_preserves_workers"]["preserved"] is True
+    assert checks["degraded_backend_preserves_workers"]["worker_count_before"] == checks["degraded_backend_preserves_workers"]["worker_count_after"]
 
 
 def test_event_subscription_builder_rejects_unknown_and_legacy_names(smoke_module):
@@ -350,6 +519,28 @@ def test_negative_fixture_rejects_recursive_forbidden_data(smoke_module, monkeyp
     _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
 
 
+def test_public_safety_rejects_forbidden_keys_values_and_allows_neutral_record_names(smoke_module):
+    for value in (
+        {"pane_id": "hidden"},
+        {"nested": [{"backend_target": "hidden"}]},
+        {"detail": "socket:///tmp/forbidden.sock"},
+        {"detail": "actual target value"},
+        {"detail": "private fingerprint abc123"},
+        {"stdout": "hidden"},
+    ):
+        with pytest.raises(smoke_module.PublicSafetyError):
+            smoke_module.validate_public_summary(value)
+
+    smoke_module.validate_public_summary(
+        {
+            "checks": [
+                {"name": "target_validation", "status": "ok", "required": True, "ok": True},
+                {"name": "pane_moved_binding_update", "status": "ok", "required": True, "ok": True},
+            ]
+        }
+    )
+
+
 def test_missing_herdr_binary_reports_clear_skip_without_runner(smoke_module, monkeypatch, capsys):
     _patch_which(monkeypatch, smoke_module, None)
 
@@ -358,4 +549,7 @@ def test_missing_herdr_binary_reports_clear_skip_without_runner(smoke_module, mo
     assert return_code not in (0, None) or data.get("ok") is False
     assert _is_failure_or_skip(data)
     assert any(word in _summary_text(data) for word in ("missing", "not found", "unavailable", "requires"))
+    assert REQUIRED_CHECKS <= _check_names(data)
+    assert _check_by_name(data, "observe")["ok"] is False
+    assert _check_by_name(data, "target_validation")["ok"] is True
     _assert_public_json_safe(public_text, *PRIVATE_MARKERS)

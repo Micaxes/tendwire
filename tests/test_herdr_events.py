@@ -759,6 +759,25 @@ def test_pane_closed_closes_worker_and_expires_matching_binding(tmp_path: Path) 
     assert expired[0].sendable is False
     assert expired[0].reason == "pane_closed"
 
+def test_pane_exited_closes_worker_and_expires_matching_binding(tmp_path: Path) -> None:
+    backend = _backend(tmp_path, "pane-exited")
+    backend.reconcile_once(client=_initial_pane_client())
+
+    backend.queue_event_envelope({"event": "pane.exited", "payload": {"pane_id": "pane-1"}})
+
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert snapshot is not None
+    assert snapshot.workers[0].status == "closed"
+    assert list_worker_bindings(backend.db_path, backend.config.host_id, backend="herdr") == []
+    expired = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+        include_expired=True,
+    )
+    assert expired[0].sendable is False
+    assert expired[0].reason == "pane_exited"
+
 
 def test_disconnect_degraded_state_preserves_workers_and_bindings(tmp_path: Path) -> None:
     backend = _backend(tmp_path, "degraded")

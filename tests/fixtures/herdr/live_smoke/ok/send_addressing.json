@@ -1,12 +1,6 @@
 {
   "status": "ok",
-  "addressing": {
-    "direct": true,
-    "named": true,
-    "broadcast": false
-  },
-  "variants": [
-    "direct",
-    "by_name"
-  ]
+  "attempted": true,
+  "send_attempts": 1,
+  "accepted_count": 1
 }
