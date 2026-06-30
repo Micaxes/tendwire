@@ -21,6 +21,7 @@ REQUIRED_CHECKS = {
     "name_ambiguity",
     "routing_resolution",
     "status_event",
+    "event_subscription",
     "closed_moved_observations",
     "public_safety",
 }
@@ -145,6 +146,13 @@ def _check_records(data):
 
 def _check_names(data):
     return {record.get("name") for record in _check_records(data)}
+
+
+def _check_by_name(data, name):
+    for record in _check_records(data):
+        if record.get("name") == name:
+            return record
+    raise AssertionError(f"missing check {name}")
 
 
 class ExplodingRunner:
@@ -284,6 +292,43 @@ def test_fixture_replay_is_deterministic_and_public_safe(smoke_module, monkeypat
     assert data.get("mode") == "fixture"
     assert REQUIRED_CHECKS <= _check_names(data)
     _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
+    event_check = _check_by_name(data, "event_subscription")
+    assert event_check.get("method") == "events.subscribe"
+    assert event_check.get("official_event_count") == len(smoke_module.OFFICIAL_EVENT_TYPES)
+    assert event_check.get("params_shape_ok") is True
+    assert event_check.get("legacy_event_count") == 0
+    assert "subscriptions" not in event_check
+    assert "subscriptions" not in public_text
+    for raw_name in (
+        "workspace.created",
+        "pane.created",
+        "pane.observed",
+        "workspace.observed",
+        "agent.status_changed",
+        "worktree.updated",
+    ):
+        assert raw_name not in public_text
+
+
+def test_event_subscription_builder_rejects_unknown_and_legacy_names(smoke_module):
+    params = smoke_module._event_subscription_params()
+    assert list(params) == ["subscriptions"]
+    assert len(params["subscriptions"]) == len(smoke_module.OFFICIAL_EVENT_TYPES)
+    assert smoke_module._event_subscription_params_shape_ok(params) is True
+
+    for bad_name in (
+        "",
+        " workspace.created ",
+        "pane.observed",
+        "workspace.observed",
+        "agent.status_changed",
+        "worktree.updated",
+        123,
+    ):
+        names = list(smoke_module.OFFICIAL_EVENT_TYPES)
+        names[0] = bad_name
+        with pytest.raises(ValueError):
+            smoke_module._event_subscription_params(names)
 
 
 def test_negative_fixture_rejects_recursive_forbidden_data(smoke_module, monkeypatch, capsys):

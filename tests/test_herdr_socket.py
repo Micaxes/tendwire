@@ -20,6 +20,9 @@ from tendwire.backends.herdr_protocol import (
     HerdrErrorResponse,
     HerdrMalformedLineError,
     HerdrRequestIdMismatchError,
+    HERDR_EVENTS_SUBSCRIBE_METHOD,
+    HERDR_OFFICIAL_EVENT_NAMES,
+    build_events_subscribe_params,
 )
 from tendwire.backends.herdr_socket import (
     HerdrSocketClient,
@@ -254,6 +257,42 @@ def test_subscription_ack_events_and_stream_termination(tmp_path: Path) -> None:
             {"id": server.requests[0]["id"], **events[1]},
         ]
         client.close()
+
+
+def test_events_subscribe_wrapper_sends_official_method_and_params(tmp_path: Path) -> None:
+    event_names = ("workspace.created", "pane.agent_status_changed")
+
+    def handler(conn: _Connection) -> None:
+        request = conn.read_request()
+        conn.send_json({"id": request["id"], "result": {"subscribed": True}})
+
+    with _FakeHerdrServer(tmp_path, handler) as server:
+        client = HerdrSocketClient(str(server.path), timeout=1)
+        stream = client.events_subscribe(event_names)
+        client.close()
+
+    assert stream.ack == {"subscribed": True}
+    assert server.requests[0]["method"] == HERDR_EVENTS_SUBSCRIBE_METHOD
+    assert server.requests[0]["params"] == build_events_subscribe_params(event_names)
+
+
+@pytest.mark.parametrize("event_name", HERDR_OFFICIAL_EVENT_NAMES)
+def test_events_subscribe_wrapper_accepts_each_official_event_name(
+    tmp_path: Path,
+    event_name: str,
+) -> None:
+    def handler(conn: _Connection) -> None:
+        request = conn.read_request()
+        conn.send_json({"id": request["id"], "result": {"subscribed": event_name}})
+
+    with _FakeHerdrServer(tmp_path, handler) as server:
+        client = HerdrSocketClient(str(server.path), timeout=1)
+        stream = client.events_subscribe([event_name])
+        client.close()
+
+    assert stream.ack == {"subscribed": event_name}
+    assert server.requests[0]["method"] == HERDR_EVENTS_SUBSCRIBE_METHOD
+    assert server.requests[0]["params"] == {"subscriptions": [{"type": event_name}]}
 
 
 def test_context_manager_and_close_are_idempotent(tmp_path: Path) -> None:

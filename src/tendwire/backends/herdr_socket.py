@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import socket
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
 
 from .herdr_protocol import (
@@ -17,6 +17,8 @@ from .herdr_protocol import (
     HerdrErrorResponse,
     HerdrProtocolError,
     HerdrRequestIdMismatchError,
+    HERDR_EVENTS_SUBSCRIBE_METHOD,
+    build_events_subscribe_params,
     build_request,
     ensure_response_id,
     error_payload,
@@ -172,6 +174,21 @@ class HerdrSocketClient:
             request_id,
             result_payload(response),
             timeout=self.timeout if event_timeout is None else event_timeout,
+        )
+
+    def events_subscribe(
+        self,
+        event_names: Iterable[str] | str | None = None,
+        *,
+        timeout: float | None = None,
+        event_timeout: float | None = None,
+    ) -> HerdrEventStream:
+        """Subscribe to the official Herdr event stream."""
+        return self.subscribe(
+            HERDR_EVENTS_SUBSCRIBE_METHOD,
+            build_events_subscribe_params(event_names),
+            timeout=timeout,
+            event_timeout=event_timeout,
         )
 
     def read_event(self, subscription_id: str, *, timeout: float | None = None) -> dict[str, Any]:

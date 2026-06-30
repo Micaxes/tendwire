@@ -12,6 +12,11 @@ from tendwire.backends.herdr_protocol import (
     HerdrMalformedLineError,
     HerdrRequestIdMismatchError,
     HerdrSocketPathError,
+    HERDR_EVENTS_SUBSCRIBE_METHOD,
+    HERDR_OFFICIAL_EVENT_NAME_SET,
+    HERDR_OFFICIAL_EVENT_NAMES,
+    build_events_subscribe_params,
+    build_events_subscribe_request,
     build_request,
     ensure_response_id,
     error_payload,
@@ -117,6 +122,57 @@ def test_build_request_uses_unique_string_ids_and_newline_framing() -> None:
     assert line.endswith(b"\n")
     assert json.loads(line.decode("utf-8")) == first
 
+
+
+def test_build_events_subscribe_request_uses_official_method_params_and_default_order() -> None:
+    params = build_events_subscribe_params()
+
+    assert params == {"subscriptions": [{"type": name} for name in HERDR_OFFICIAL_EVENT_NAMES]}
+    assert build_events_subscribe_request(request_id="sub-1") == {
+        "id": "sub-1",
+        "method": HERDR_EVENTS_SUBSCRIBE_METHOD,
+        "params": params,
+    }
+    assert HERDR_OFFICIAL_EVENT_NAME_SET == frozenset(HERDR_OFFICIAL_EVENT_NAMES)
+
+
+@pytest.mark.parametrize("event_name", HERDR_OFFICIAL_EVENT_NAMES)
+def test_build_events_subscribe_params_accepts_each_official_event_name(event_name: str) -> None:
+    assert build_events_subscribe_params([event_name]) == {"subscriptions": [{"type": event_name}]}
+
+
+def test_official_event_subscription_names_exclude_legacy_aliases() -> None:
+    legacy = {
+        "pane.observed",
+        "workspace.observed",
+        "agent.status_changed",
+        "agent.detected",
+        "worktree.updated",
+    }
+
+    assert legacy.isdisjoint(HERDR_OFFICIAL_EVENT_NAME_SET)
+
+
+@pytest.mark.parametrize(
+    "event_names",
+    [
+        ["pane.observed"],
+        ["workspace.observed"],
+        ["agent.status_changed"],
+        ["worktree.updated"],
+        [""],
+        ["   "],
+        [" pane.created "],
+        [123],
+        [None],
+        object(),
+    ],
+)
+def test_build_events_subscribe_params_rejects_unknown_non_string_and_empty_names(
+    event_names: object,
+) -> None:
+    with pytest.raises(HerdrEnvelopeError):
+        build_events_subscribe_params(event_names)  # type: ignore[arg-type]
 
 def test_parse_valid_result_error_and_event_envelopes() -> None:
     result = validate_response(

@@ -749,6 +749,36 @@ def _command_exit_code(envelope: CommandEnvelope) -> int:
     return 0 if envelope.ok else 1
 
 
+def _requires_daemon_for_mutating_command(config: Config, payload: str) -> Any | None:
+    """Return the validated mutating request that must not fall back to Herdr CLI."""
+    if config.socket_path is None and config.herdr_backend != "socket":
+        return None
+    request, parse_error = parse_command_request(payload)
+    if parse_error is not None or request is None:
+        return None
+    validation_error = validate_request(request)
+    if validation_error is not None:
+        return None
+    if request.action == "send_instruction" and not request.dry_run:
+        return request
+    return None
+
+
+def _daemon_backend_unavailable_envelope(config: Config, request: Any) -> CommandEnvelope:
+    receipt_envelope = _reserve_command_receipt(config, request)
+    if receipt_envelope is not None:
+        return receipt_envelope
+    envelope = CommandEnvelope.error(
+        request,
+        error_value(
+            STATUS_BACKEND_UNAVAILABLE,
+            "Tendwire daemon backend is unavailable",
+        ),
+    )
+    _save_command_receipt(config, request, envelope)
+    return envelope
+
+
 def cmd_command(
     config: Config,
     *,
@@ -761,12 +791,16 @@ def cmd_command(
             request_payload = json.loads(payload)
         except (json.JSONDecodeError, TypeError, ValueError):
             request_payload = None
+        daemon_required_request = _requires_daemon_for_mutating_command(config, payload)
         if isinstance(request_payload, dict):
             daemon_result = _try_daemon_result(config, "command.submit", request_payload)
             if daemon_result is not None:
                 print(stable_json_dumps(daemon_result, indent=2))
                 return 0 if bool(daemon_result.get("ok")) else 1
-
+            if daemon_required_request is not None:
+                envelope = _daemon_backend_unavailable_envelope(config, daemon_required_request)
+                print(envelope.to_json(indent=2))
+                return _command_exit_code(envelope)
     envelope = command_envelope_from_payload(config, payload)
     print(envelope.to_json(indent=2))
     return _command_exit_code(envelope)

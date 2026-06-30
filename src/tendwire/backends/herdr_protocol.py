@@ -1,8 +1,7 @@
-"""Pure helpers for the inactive Herdr socket JSON-line protocol.
+"""Pure helpers for the Herdr socket JSON-line protocol.
 
-The helpers in this module are intentionally not wired into Tendwire's
-production observation path. They provide a small, stdlib-only foundation for
-direct tests and later socket-client work.
+The helpers in this module provide a small, stdlib-only foundation for
+Tendwire's opt-in socket backend and for direct protocol tests.
 """
 
 from __future__ import annotations
@@ -10,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +21,27 @@ _SESSION_ENV_ORDER = (
     "TENDWIRE_HERDR_SESSION",
     "HERDR_SESSION",
 )
+
+HERDR_EVENTS_SUBSCRIBE_METHOD = "events.subscribe"
+HERDR_OFFICIAL_EVENT_NAMES = (
+    "workspace.created",
+    "workspace.updated",
+    "workspace.renamed",
+    "workspace.closed",
+    "workspace.focused",
+    "pane.created",
+    "pane.closed",
+    "pane.focused",
+    "pane.moved",
+    "pane.exited",
+    "pane.agent_detected",
+    "pane.output_matched",
+    "pane.agent_status_changed",
+    "worktree.created",
+    "worktree.opened",
+    "worktree.removed",
+)
+HERDR_OFFICIAL_EVENT_NAME_SET = frozenset(HERDR_OFFICIAL_EVENT_NAMES)
 
 
 class HerdrProtocolError(Exception):
@@ -139,6 +159,43 @@ def build_request(
     if not isinstance(params, Mapping):
         raise HerdrEnvelopeError("request params must be an object")
     return {"id": request_id, "method": method, "params": dict(params)}
+
+
+def _validate_event_subscription_name(name: Any) -> str:
+    if not isinstance(name, str):
+        raise HerdrEnvelopeError("Herdr event subscription names must be strings")
+    if not name:
+        raise HerdrEnvelopeError("Herdr event subscription names must not be empty")
+    if name.strip() != name or name not in HERDR_OFFICIAL_EVENT_NAME_SET:
+        raise HerdrEnvelopeError(f"unsupported Herdr event subscription {name!r}")
+    return name
+
+
+def build_events_subscribe_params(event_names: Iterable[str] | str | None = None) -> dict[str, Any]:
+    """Return official events.subscribe params for validated Herdr event names."""
+    if event_names is None:
+        names = HERDR_OFFICIAL_EVENT_NAMES
+    elif isinstance(event_names, str):
+        names = (event_names,)
+    else:
+        try:
+            names = tuple(event_names)
+        except TypeError as exc:
+            raise HerdrEnvelopeError("Herdr event subscriptions must be iterable") from exc
+    return {"subscriptions": [{"type": _validate_event_subscription_name(name)} for name in names]}
+
+
+def build_events_subscribe_request(
+    event_names: Iterable[str] | str | None = None,
+    *,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    """Build an official Herdr event subscription request envelope."""
+    return build_request(
+        HERDR_EVENTS_SUBSCRIBE_METHOD,
+        build_events_subscribe_params(event_names),
+        request_id=request_id,
+    )
 
 
 def frame_request(request: Mapping[str, Any]) -> bytes:

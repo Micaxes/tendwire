@@ -24,6 +24,35 @@ LIVE_ENV_FLAG = "TENDWIRE_HERDR_LIVE_SMOKE"
 SMOKE_TEXT = "tendwire smoke probe: no action required"
 SMOKE_ADDRESS = "tendwire-smoke-address-probe"
 
+EVENT_SUBSCRIBE_METHOD = "events.subscribe"
+OFFICIAL_EVENT_TYPES = (
+    "workspace.created",
+    "workspace.updated",
+    "workspace.renamed",
+    "workspace.closed",
+    "workspace.focused",
+    "pane.created",
+    "pane.closed",
+    "pane.focused",
+    "pane.moved",
+    "pane.exited",
+    "pane.agent_detected",
+    "pane.output_matched",
+    "pane.agent_status_changed",
+    "worktree.created",
+    "worktree.opened",
+    "worktree.removed",
+)
+OFFICIAL_EVENT_TYPE_SET = frozenset(OFFICIAL_EVENT_TYPES)
+LEGACY_EVENT_TYPES = frozenset(
+    (
+        "pane.observed",
+        "workspace.observed",
+        "agent.status_changed",
+        "worktree.updated",
+    )
+)
+
 CHECK_NAMES = (
     "workspace_list",
     "agent_list",
@@ -31,6 +60,7 @@ CHECK_NAMES = (
     "send_addressing",
     "name_ambiguity",
     "routing_resolution",
+    "event_subscription",
     "status_event",
     "closed_moved_observations",
     "public_safety",
@@ -46,6 +76,10 @@ CHECK_KEYS = {
     "item_count",
     "variants",
     "detail",
+    "method",
+    "official_event_count",
+    "params_shape_ok",
+    "legacy_event_count",
 }
 
 TOP_LEVEL_KEYS = {
@@ -296,6 +330,10 @@ def _check(
     item_count: int | None = None,
     variants: int | None = None,
     detail: str | None = None,
+    method: str | None = None,
+    official_event_count: int | None = None,
+    params_shape_ok: bool | None = None,
+    legacy_event_count: int | None = None,
 ) -> dict[str, Any]:
     if name not in CHECK_NAMES:
         raise ValueError("unknown check name")
@@ -315,7 +353,82 @@ def _check(
         record["variants"] = int(variants)
     if detail is not None:
         record["detail"] = detail
+    if method is not None:
+        record["method"] = method
+    if official_event_count is not None:
+        record["official_event_count"] = int(official_event_count)
+    if params_shape_ok is not None:
+        record["params_shape_ok"] = bool(params_shape_ok)
+    if legacy_event_count is not None:
+        record["legacy_event_count"] = int(legacy_event_count)
     return record
+
+
+def _event_subscription_params(event_types: Sequence[object] = OFFICIAL_EVENT_TYPES) -> dict[str, Any]:
+    subscriptions: list[dict[str, str]] = []
+    for raw_name in event_types:
+        if not isinstance(raw_name, str) or not raw_name:
+            raise ValueError("subscription event names must be non-empty strings")
+        if raw_name.strip() != raw_name:
+            raise ValueError("unknown subscription event name")
+        event_name = raw_name
+        if event_name not in OFFICIAL_EVENT_TYPE_SET or event_name in LEGACY_EVENT_TYPES:
+            raise ValueError("unknown subscription event name")
+        subscriptions.append({"type": event_name})
+
+    ordered_names = tuple(item["type"] for item in subscriptions)
+    if ordered_names != OFFICIAL_EVENT_TYPES:
+        raise ValueError("subscription event names must match the official ordered set")
+    return {"subscriptions": subscriptions}
+
+
+def _event_subscription_params_shape_ok(params: Any) -> bool:
+    if not isinstance(params, Mapping) or set(params) != {"subscriptions"}:
+        return False
+    subscriptions = params.get("subscriptions")
+    if not isinstance(subscriptions, list) or len(subscriptions) != len(OFFICIAL_EVENT_TYPES):
+        return False
+    for item in subscriptions:
+        if not isinstance(item, Mapping) or set(item) != {"type"}:
+            return False
+        event_name = item.get("type")
+        if not isinstance(event_name, str) or not event_name:
+            return False
+    return True
+
+
+def _event_subscription_aggregate_check() -> dict[str, Any]:
+    try:
+        params = _event_subscription_params()
+    except ValueError:
+        return _check(
+            "event_subscription",
+            "failed",
+            required=True,
+            ok=False,
+            method=EVENT_SUBSCRIBE_METHOD,
+            official_event_count=0,
+            params_shape_ok=False,
+            legacy_event_count=0,
+            detail="invalid_contract",
+        )
+
+    subscriptions = params["subscriptions"]
+    count = len(subscriptions)
+    shape_ok = _event_subscription_params_shape_ok(params)
+    legacy_count = sum(1 for item in subscriptions if item["type"] in LEGACY_EVENT_TYPES)
+    ok = count == len(OFFICIAL_EVENT_TYPES) and shape_ok and legacy_count == 0
+    return _check(
+        "event_subscription",
+        "ok" if ok else "failed",
+        required=True,
+        ok=ok,
+        method=EVENT_SUBSCRIBE_METHOD,
+        official_event_count=count,
+        params_shape_ok=shape_ok,
+        legacy_event_count=legacy_count,
+        detail="official_contract" if ok else "invalid_contract",
+    )
 
 
 def _summary_for(checks: Sequence[Mapping[str, Any]]) -> dict[str, int]:
@@ -401,6 +514,7 @@ def _missing_binary_payload(options: SmokeOptions, env: Mapping[str, str]) -> di
         _check("send_addressing", "skipped", required=False, ok=True, detail="binary_unavailable"),
         _check("name_ambiguity", "skipped", required=False, ok=True, detail="binary_unavailable"),
         _check("routing_resolution", "skipped", required=True, ok=False, detail="binary_unavailable"),
+        _event_subscription_aggregate_check(),
         _check("status_event", "skipped", required=False, ok=True, detail="binary_unavailable"),
         _check("closed_moved_observations", "skipped", required=False, ok=True, detail="binary_unavailable"),
     ]
@@ -746,6 +860,7 @@ def _live_payload(options: SmokeOptions, env: Mapping[str, str], runner: Runner 
         _run_send_probe(options, session_plan, runner),
         _name_ambiguity_check(agent.payload),
         _routing_resolution_check(session_plan, agent.payload),
+        _event_subscription_aggregate_check(),
         _status_event_check(options, session_plan, runner).check,
         _closed_moved_check(workspace.payload, agent.payload),
     ]
@@ -825,6 +940,85 @@ def _fixture_probe(
     )
 
 
+def _fixture_event_subscription_check(fixtures: Mapping[str, tuple[str, Any | None]]) -> dict[str, Any]:
+    found = _fixture_for(fixtures, ("event_subscription", "events_subscribe", "subscription_contract"))
+    if found is None:
+        return _check(
+            "event_subscription",
+            "missing_fixture",
+            required=True,
+            ok=False,
+            method=EVENT_SUBSCRIBE_METHOD,
+            official_event_count=0,
+            params_shape_ok=False,
+            legacy_event_count=0,
+            detail="fixture_absent",
+        )
+
+    _, payload = found
+    if not isinstance(payload, Mapping):
+        return _check(
+            "event_subscription",
+            "invalid_json",
+            required=True,
+            ok=False,
+            method=EVENT_SUBSCRIBE_METHOD,
+            official_event_count=0,
+            params_shape_ok=False,
+            legacy_event_count=0,
+            detail="fixture_invalid",
+        )
+
+    def int_field(*keys: str, default: int = 0) -> int:
+        for key in keys:
+            if key not in payload:
+                continue
+            try:
+                return int(payload[key])
+            except (TypeError, ValueError):
+                return default
+        return default
+
+    params = payload.get("params")
+    inferred_types: list[str] = []
+    if isinstance(params, Mapping):
+        subscriptions = params.get("subscriptions")
+        if isinstance(subscriptions, list):
+            for item in subscriptions:
+                if isinstance(item, Mapping) and isinstance(item.get("type"), str):
+                    inferred_types.append(item["type"])
+
+    count = int_field("official_event_count", "subscription_count", "event_count")
+    if not count and inferred_types:
+        count = len(inferred_types)
+    shape_ok = payload.get("params_shape_ok") is True or _event_subscription_params_shape_ok(params)
+    legacy_count = int_field("legacy_event_count", "legacy_count")
+    if inferred_types:
+        legacy_count = sum(1 for event_name in inferred_types if event_name in LEGACY_EVENT_TYPES)
+    if inferred_types:
+        try:
+            _event_subscription_params(inferred_types)
+            official_names_ok = True
+        except ValueError:
+            official_names_ok = False
+    else:
+        official_names_ok = count == len(OFFICIAL_EVENT_TYPES)
+
+    method_ok = payload.get("method") == EVENT_SUBSCRIBE_METHOD
+    ok = method_ok and count == len(OFFICIAL_EVENT_TYPES) and shape_ok and legacy_count == 0 and official_names_ok
+    return _check(
+        "event_subscription",
+        "ok" if ok else "failed",
+        required=True,
+        ok=ok,
+        method=EVENT_SUBSCRIBE_METHOD,
+        official_event_count=count,
+        params_shape_ok=shape_ok,
+        legacy_event_count=legacy_count,
+        detail="fixture_replayed" if ok else "fixture_mismatch",
+    )
+
+
 def _fixture_payload(options: SmokeOptions, env: Mapping[str, str]) -> dict[str, Any]:
     session_plan = _session_plan(options, env)
     try:
@@ -837,6 +1031,17 @@ def _fixture_payload(options: SmokeOptions, env: Mapping[str, str]) -> dict[str,
             _check("send_addressing", "skipped", required=False, ok=True, detail="fixture_absent"),
             _check("name_ambiguity", "skipped", required=False, ok=True, detail="fixture_absent"),
             _check("routing_resolution", "skipped", required=True, ok=False, detail="fixture_absent"),
+            _check(
+                "event_subscription",
+                "missing_fixture",
+                required=True,
+                ok=False,
+                method=EVENT_SUBSCRIBE_METHOD,
+                official_event_count=0,
+                params_shape_ok=False,
+                legacy_event_count=0,
+                detail="fixture_absent",
+            ),
             _check("status_event", "skipped", required=False, ok=True, detail="fixture_absent"),
             _check("closed_moved_observations", "skipped", required=False, ok=True, detail="fixture_absent"),
         ]
@@ -885,6 +1090,7 @@ def _fixture_payload(options: SmokeOptions, env: Mapping[str, str]) -> dict[str,
             _check("status_event", "not_available", required=False, ok=True, detail="fixture_absent")
         )
 
+    event_subscription = _fixture_event_subscription_check(fixtures)
     send_found = _fixture_for(fixtures, ("send_addressing",))
     send_check = (
         _check("send_addressing", "observed", required=False, ok=True, exit_code=0, json_status="valid", variants=1, detail="fixture_replayed")
@@ -899,6 +1105,7 @@ def _fixture_payload(options: SmokeOptions, env: Mapping[str, str]) -> dict[str,
         send_check,
         _name_ambiguity_check(agent.payload),
         _routing_resolution_check(session_plan, agent.payload),
+        event_subscription,
         status_event.check,
         _closed_moved_check(workspace.payload, agent.payload, worker.payload),
     ]

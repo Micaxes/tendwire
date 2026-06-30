@@ -1,31 +1,40 @@
 # Tendwire
 
-Tendwire is a **local-first control plane for terminal-based agents**. It watches
-spaces and workers managed by tools such as Herdr, summarizes their state,
-identifies items that may need human attention, and exposes a neutral,
-device-independent API that clients like Telegram, Hermes, iOS, Siri, macOS,
-Vision Pro, and AR glasses can consume.
+Tendwire is a **local-first control plane for Herdr-managed terminal agents**.
+It observes a local Herdr session, stores neutral snapshots and command receipts,
+and exposes a public-safe Tendwire API for local clients. The public contract is
+intentionally narrow: Tendwire JSON does not contain connector delivery state,
+raw terminal controls, socket paths, or private Herdr identifiers.
 
-## Relationship to Herdr and Herdres
+## Relationship to Herdr, Herdres, and connectors
 
-[Herdres](https://github.com/plotarmordev/herdres) remains the Telegram connector
-and UI. Herdr/Herdres state is an input boundary for Tendwire: Tendwire may read
-local Herdr observations and reconcile them into a neutral snapshot, but core
-models and snapshot JSON do not contain Telegram, Herdres delivery, or
-connector-specific routing state. Tendwire keeps its output free of bot tokens,
-chat IDs, topic IDs, message IDs, delivery state, routes, and connector tokens.
+Herdr is the only concrete runtime backend documented here. Tendwire can observe
+Herdr through the conservative CLI one-shot path or, when explicitly enabled,
+through the Herdr socket/event backend. Both paths normalize Herdr state into
+neutral Tendwire spaces, workers, attention, turns, pending interactions,
+command results, connector jobs, and backend health.
 
-Plugin ingestion is a future optional trigger only. A plugin may eventually ask
-Tendwire to refresh or persist a snapshot, but plugins must not become required
-for `tendwire snapshot --json` and must not inject connector delivery state into
-the neutral contract.
+Herdres, Telegram, Hermes, MCP, iOS, AR, UI surfaces, local LLMs, source-mode
+polling, and concrete connector implementations remain outside this README's
+active scope. The connector outbox is only a neutral Tendwire boundary for a
+separate process to poll, acknowledge, fail, or defer jobs; it is not a Herdres,
+Telegram, UI, or delivery bridge.
+
+Public Tendwire JSON must not expose raw `pane_id`, `terminal_id`,
+`backend_target`, Telegram/chat/topic/message IDs, socket paths, raw target
+values, private fingerprints, argv/env/stdout/stderr, tokens, or secrets. Herdr
+pane and terminal identifiers may exist only inside private
+`WorkerBinding`/store internals used by Tendwire itself.
 
 ## Running Tendwire
 
-Tendwire installs a console script named `tendwire`:
+Tendwire installs a console script named `tendwire`. The primary public entry
+points are JSON-only:
 
 ```bash
 tendwire snapshot --json
+echo '{"schema_version":1,"action":"noop"}' | tendwire command --json
+tendwire daemon --db-path /path/to/tendwire.db
 ```
 
 You can also run the CLI module directly:
@@ -34,8 +43,10 @@ You can also run the CLI module directly:
 python -m tendwire.cli snapshot --json
 ```
 
-Both print a neutral JSON snapshot to stdout and exit successfully, even when no
-Herdr data is available. Stdout is JSON-only for snapshot output.
+`snapshot --json` prints one neutral JSON snapshot to stdout and exits
+successfully, even when no Herdr data is available. `command --json` reads
+exactly one JSON request from stdin and prints exactly one JSON envelope to
+stdout. Stdout is JSON-only for these public machine-readable commands.
 
 Snapshot-adjacent public turn and pending-interaction views are also available:
 
@@ -81,10 +92,10 @@ subprocess timeouts are capped by the time left in that budget.
 ### Live Herdr smoke harness
 
 The live Herdr smoke harness is an **opt-in Tendwire-only check** for the
-boundary between Tendwire's public contracts and Herdr's high-level CLI. It is
-not part of normal `tendwire` commands, does not run during ordinary pytest, and
-does not add Herdres, source polling, connector delivery, outbox processing, or
-low-level terminal integration.
+boundary between Tendwire's public contracts and Herdr's daemon/socket/command
+surfaces. It is not part of normal `tendwire` commands, does not run during
+ordinary pytest, and does not add Herdres, source polling, connector delivery,
+outbox processing, UI integration, or raw terminal control.
 
 Safe live command:
 
@@ -131,17 +142,18 @@ selected by maintainers rather than running by default.
 Live prerequisites are intentionally narrow:
 
 - The `herdr` binary is on `PATH`, or `--herdr-bin /path/to/herdr` points at it.
-- Herdr supports the high-level workspace, agent, and agent-send surfaces used by
-  Tendwire's command boundary.
+- Herdr supports the high-level workspace/agent surfaces and the socket/event
+  surfaces used by Tendwire's daemon and command boundary.
 - You are willing to create temporary smoke workers in the selected Herdr
   session and review the neutral evidence JSON afterward.
 - The selected session is a disposable/sandbox session unless you intentionally
   override the isolated default.
 
 The smoke suite checks Tendwire assumptions rather than broad Herdr behavior:
-workspace listing, agent listing, the public worker surface, high-level send
-addressing, name ambiguity handling, routing resolution, status/event
-observation, closed or moved worker observations, and public JSON safety.
+workspace listing, agent listing, socket/event subscription shape, public worker
+projection, high-level send addressing, name ambiguity handling, routing
+resolution, status/event observation, closed or moved worker observations, and
+public JSON safety.
 
 Stdout is a public-safe JSON evidence artifact. Its top-level shape is limited
 to neutral fields such as `schema_version`, `ok`, `mode`, `status`, `summary`,
@@ -150,49 +162,94 @@ Individual check records use aggregate fields such as `name`, `status`,
 `required`, `ok`, `exit_code`, `json_status`, `item_count`, `variants`, and
 `detail`. The public smoke summary is recursively sanitized and rejects
 forbidden private keys or values; it must not expose Telegram, Herdres, raw pane
-or terminal data, sockets, backend targets, session values, private bindings,
-connector/outbox/delivery state, argv/env/stdout/stderr, tokens, secrets, or
-private fingerprints.
+or terminal data, sockets, backend targets, raw target values, session values,
+private bindings, connector/outbox/delivery state, argv/env/stdout/stderr,
+tokens, secrets, or private fingerprints.
 
 Non-goals:
 
 - No Herdres import, mutation, connector bridge, or delivery integration.
-- No Tendwire source-mode or connector/outbox processing.
-- No raw Herdr pane, socket, terminal, PTY, shell, or low-level command control.
+- No Tendwire source-mode, UI, local LLM, MCP, Hermes, iOS, or AR integration.
+- No raw Herdr pane, socket-path, terminal, PTY, shell, or low-level command
+  control exposure.
 - No default contact with live Herdr from ordinary CLI usage or normal pytest.
 
-### Daemon skeleton
+### Daemon, socket backend, and Herdr event subscriptions
 
-Tendwire also exposes a stdlib-only local daemon skeleton:
+Tendwire exposes a stdlib-only local daemon:
 
 ```bash
-tendwire daemon
-tendwire daemon --socket-path /tmp/tendwire.sock --db-path /tmp/tendwire.db
+tendwire daemon --db-path /path/to/tendwire.db
+tendwire daemon --db-path /path/to/tendwire.db --socket-path /tmp/tendwire.sock
 ```
 
 On POSIX systems the daemon serves a local Unix domain socket JSON
 request/response API. Startup loads the normal Tendwire config, initializes the
-SQLite store, performs one initial one-shot observation, persists the resulting
-snapshot/projections through the existing store APIs, and then serves these
-methods: `ping`, `health.get`, `snapshot.get`, `attention.list`, `turn.list`,
-`pending.list`, and `command.submit`.
-
-`attention.list` returns the current public attention inbox from the SQLite
-store when lifecycle rows are available, including neutral lifecycle fields
-such as first seen, last seen, changed, resolved, and signal count. Without a
-store-backed row it falls back to deterministic snapshot attention.
+SQLite store, performs one authoritative initial reconcile, persists the
+resulting snapshot/projections through the existing store APIs, and then serves
+these public methods: `ping`, `health.get`, `snapshot.get`, `attention.list`,
+`turn.list`, `pending.list`, `command.submit`, `connector.poll`,
+`connector.ack`, `connector.fail`, `connector.defer`, and `connector.reclaim`.
 
 Existing CLI commands remain one-shot by default. When `--socket-path` or
-`TENDWIRE_SOCKET_PATH` explicitly points a CLI command at a daemon, unreachable,
-stale, or timed-out sockets fall back to the existing one-shot path with the
-same public JSON output and exit behavior. `command.submit` uses the same
-command parser, validator, receipt/idempotency store, and backend sender as
-`tendwire command --json`.
+`TENDWIRE_SOCKET_PATH` explicitly points a read-only CLI command at a Tendwire
+daemon, unreachable, stale, or timed-out daemon sockets still fall back to the
+existing one-shot path. Mutating `command --json` requests (`send_instruction`
+with `dry_run: false`) do **not** fall back in explicit daemon/socket mode; they
+return `backend_unavailable` before any one-shot Herdr send is attempted. The
+daemon API never returns raw Herdr pane IDs, terminal IDs, backend targets,
+socket paths, target values, private fingerprints, argv/env/stdout/stderr,
+tokens, or secrets.
 
-The daemon skeleton is lifecycle/store/API scaffolding only. It does not add
-Herdr socket subscriptions, connector polling, source mode, Herdres integration,
-raw terminal control, or a daemonized replacement for the existing one-shot
-backend observation path.
+The Herdr socket/event backend is opt-in:
+
+```bash
+TENDWIRE_HERDR_BACKEND=socket tendwire daemon --db-path /path/to/tendwire.db
+```
+
+With `TENDWIRE_HERDR_BACKEND=socket`, the daemon connects to Herdr's socket,
+performs the initial reconcile, writes the authoritative public snapshot, and
+then maintains projections from Herdr events. The official Herdr subscription
+method is exactly `events.subscribe`; the params object is exactly a
+`subscriptions` array of objects with a string `type`:
+
+```json
+{
+  "subscriptions": [
+    {"type": "workspace.created"},
+    {"type": "workspace.updated"},
+    {"type": "workspace.renamed"},
+    {"type": "workspace.closed"},
+    {"type": "workspace.focused"},
+    {"type": "pane.created"},
+    {"type": "pane.closed"},
+    {"type": "pane.focused"},
+    {"type": "pane.moved"},
+    {"type": "pane.exited"},
+    {"type": "pane.agent_detected"},
+    {"type": "pane.output_matched"},
+    {"type": "pane.agent_status_changed"},
+    {"type": "worktree.created"},
+    {"type": "worktree.opened"},
+    {"type": "worktree.removed"}
+  ]
+}
+```
+
+Subscription builders reject unknown names, non-string names, and empty names.
+Tendwire may tolerate legacy inbound aliases only after receiving an event, so
+older Herdr payloads can still be harmlessly normalized. Tendwire must never
+subscribe to legacy names such as `pane.observed`, `workspace.observed`,
+`agent.status_changed`, or `worktree.updated`.
+
+Unknown and malformed events are safe no-ops. Initial reconcile remains
+authoritative; event updates are incremental hints applied on top of that
+snapshot. Idle event-read timeouts are normal and do not mark Herdr failed.
+Disconnects and protocol failures degrade backend health but do not prune
+private worker bindings or pretend Herdr is authoritatively empty. Reconnects
+resubscribe to the same official event set. Daemon start/stop are idempotent and
+bounded: stopping closes the event backend and local Tendwire socket without
+adding connector, UI, source-mode, or raw terminal integration.
 
 Optional local persistence uses the stdlib SQLite store and does not change
 stdout:
@@ -255,8 +312,9 @@ Top-level keys:
 Canonical statuses are `unknown`, `active`, `idle`, `waiting`, `blocked`,
 `warning`, `done`, `failed`, and `closed`. `done`, `complete`, `completed`, and
 `success` canonicalize to `done`, which remains eligible for follow-up
-instructions. Raw adapter status strings may appear only as `meta.raw_status`
-after connector-specific fields have been stripped.
+instructions. Raw adapter status strings may appear only as sanitized
+`meta.raw_status`; connector-specific fields and private backend fields are
+stripped before public JSON is emitted.
 
 Snapshot hashing uses the Python standard library only:
 `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)`, then
@@ -302,8 +360,9 @@ worker source time exists, the attention item serializes `updated_at` as `null`.
 The `turns --json` and `pending --json` outputs are public snapshot-adjacent
 views, not routing or private binding surfaces. They must not expose Telegram
 IDs, chat IDs, topic IDs, message IDs, raw pane IDs, terminal IDs, backend
-targets, private bindings, session IDs, private fingerprints, raw command
-payloads, raw terminal controls, or secrets.
+targets, socket paths, raw target values, private bindings, session IDs, private
+fingerprints, raw command payloads, argv/env/stdout/stderr, raw terminal
+controls, tokens, or secrets.
 
 `turns --json` prints a schema-v1 wrapper with `host_id`, `updated_at`,
 `content_fingerprint`, public-safe `backend_health`, and `turns`. Each turn has
@@ -330,19 +389,28 @@ pending interaction.
 ## SQLite store
 
 The optional SQLite store keeps canonical snapshot JSON blobs in the `snapshots`
-table. Schema initialization and migration are idempotent, set
-`PRAGMA user_version = 3`, add `content_fingerprint` storage when migrating an
-existing milestone-1 table, and index `host_id`, `created_at`, and
-`content_fingerprint`. The existing `latest_snapshot` and `list_hosts` behavior
-is preserved.
+table and maintains Tendwire-local operational tables for attention lifecycle,
+command receipts, connector outbox/deliveries, backend health, and private
+worker bindings. Schema initialization and migration are idempotent and preserve
+the existing `latest_snapshot` and `list_hosts` behavior. The store is an
+implementation detail behind public JSON, not a broad public schema expansion.
 
 Private Herdr worker bindings are stored separately in the local
 `worker_bindings` table. These rows associate a stable public Tendwire
 `worker_id` with private backend target material such as Herdr agent, terminal,
 or pane identifiers. Bindings are local SQLite records only; they are not public
-snapshot fields, command request fields, command response fields, or stored
-snapshot payload fields. Expired bindings are retained for local history and
-debugging but ignored by command routing.
+snapshot fields, command request fields, command response fields, connector
+payload fields, or stored snapshot payload fields. Expired bindings are retained
+for local history and debugging but ignored by command routing.
+
+Every store connection applies a 30-second SQLite `busy_timeout`; file-backed
+databases use WAL journaling, foreign keys are enabled, and synchronous mode is
+`NORMAL`. The current safety stance is a single local Tendwire writer: the
+daemon/socket backend writes projections through the existing store APIs, and
+one-shot CLI persistence writes only when explicitly requested. The store is not
+a multi-service event bus and does not persist raw Herdr event payloads, socket
+paths, terminal streams, argv/env/stdout/stderr, or connector-specific routing
+state.
 
 ## Neutral connector outbox boundary
 
@@ -352,18 +420,20 @@ store. The public daemon methods are `connector.poll`, `connector.ack`,
 `connector.reclaim`. The matching JSON-only CLI hook is:
 
 ```bash
-tendwire connector poll --name attention --db-path /path/to/tendwire.db
-tendwire connector ack --name attention --ref '<opaque-ref>' --db-path /path/to/tendwire.db
-tendwire connector fail --name attention --ref '<opaque-ref>' --delay-seconds 60 --db-path /path/to/tendwire.db
-tendwire connector defer --name attention --ref '<opaque-ref>' --available-at 2026-01-01T00:10:00+00:00 --db-path /path/to/tendwire.db
+tendwire connector poll --name attention --limit 10 --lease-seconds 60 --db-path /path/to/tendwire.db
+tendwire connector ack --name attention --ref '<opaque-ref>' --response-json '{"delivered":true}' --db-path /path/to/tendwire.db
+tendwire connector fail --name attention --ref '<opaque-ref>' --reason temporary --delay-seconds 60 --db-path /path/to/tendwire.db
+tendwire connector defer --name attention --ref '<opaque-ref>' --reason scheduled --available-at 2026-01-01T00:10:00+00:00 --db-path /path/to/tendwire.db
 ```
 
-The boundary is neutral. Public requests use `name`, `ref`, `limit`,
-`lease_seconds`, `available_at`, `delay_seconds`, `reason`, and optional
-sanitized `response`. Public responses use `schema_version`, `ok`, `status`,
-`host_id`, `name`, `items`, `ref`, `key`, `attempt`, `leased_until`,
-`available_at`, and sanitized `payload`. It does not expose `private_state_json`
-or connector/backend routing fields.
+The boundary is neutral and separate from concrete connector integrations.
+Public requests use `name`, `ref`, `limit`, `lease_seconds`, `available_at`,
+`delay_seconds`, `reason`, and optional sanitized `response`. Public responses
+use `schema_version`, `ok`, `status`, `host_id`, `name`, `items`, `ref`, `key`,
+`attempt`, `leased_until`, `available_at`, and sanitized `payload`. They do not
+expose `private_state_json`, backend routing, pane/session/terminal identifiers,
+socket paths, target values, Telegram/chat/topic/message IDs, tokens, or
+connector-specific delivery internals.
 
 `connector.poll` atomically leases due `connector_outbox` rows for one `name`
 and returns opaque per-attempt refs. A live lease prevents duplicate polling.
@@ -375,12 +445,12 @@ availability. `connector.defer` records sanitized defer data and schedules futur
 availability without treating the item as delivered. Stale, expired,
 wrong-host, wrong-name, and superseded refs fail closed with neutral errors.
 
-Connector payloads are generic jobs such as `attention_created` and
+Connector payloads are generic Tendwire jobs such as `attention_created` and
 `attention_escalated`; the existing attention lifecycle writer continues to
 enqueue them in `connector_outbox`. This boundary does not add Telegram
 delivery, Herdres integration, bot tokens, chat/topic/message IDs, backend
-targets, pane/session/terminal routing, shell control, argv handling, or private
-connector routing fields to public models or public JSON.
+targets, pane/session/terminal routing, shell control, argv handling, UI
+delivery, or private connector routing fields to public models or public JSON.
 
 ## Milestone 3 neutral command contract
 
@@ -392,8 +462,9 @@ echo '{"schema_version": 1, "action": "noop"}' | tendwire command --json
 
 The `command --json` subcommand reads exactly one JSON request from stdin and
 prints exactly one JSON result/envelope to stdout. Stdout remains JSON-only.
-Human argparse errors may use stderr, but the normal command output is machine
-readable.
+Human argparse errors may use stderr, but normal command output is machine
+readable. `command.submit` is the daemon method for the same contract; mutating
+Herdr sends require the socket backend and a healthy authoritative snapshot.
 
 ### Command request shape v1
 
@@ -456,9 +527,11 @@ any backend call. Rejected fields include `telegram`, `chat_id`, `topic_id`,
 Status values include `noop`, `snapshot`, `resolved`, `dry_run`, `accepted`,
 `rejected`, `not_found`, `ambiguous_target`, `stale_target`,
 `backend_unavailable`, `ambiguous_backend_target`, `backend_unsupported`,
-`backend_failed`,
-`duplicate_request`, `request_state_uncertain`, `invalid_request`, and
-`pending` for internal receipt reservation.
+`backend_failed`, `duplicate_request`, `request_state_uncertain`,
+`invalid_request`, and `pending` for internal receipt reservation. A backend
+that is not enabled, not reachable before send start, or not healthy reports
+`backend_unavailable`; a disconnect, timeout, protocol failure, or OS error
+after send start reports `request_state_uncertain`.
 
 Errors use a neutral shape: `code`, `message`, and sanitized `details`. Public
 results must never include connector delivery state, Herdr routing objects, bot
@@ -473,36 +546,43 @@ backend argv, or route/delivery fields.
   target (`resolved`) or a list of sanitized candidates (`not_found`,
   `ambiguous_target`, `stale_target`).
 - `send_instruction` — validates target/instruction/idempotency. Dry runs return
-  status `dry_run` without creating receipts or calling the Herdr send adapter.
-  Non-dry runs resolve a neutral public worker selector. The backend adapter
-  then uses Tendwire backend-owned private bindings captured from Herdr
-  observation to call the narrow Herdr 0.7 high-level API
-  `herdr agent send <private-target> <text>`.
+  status `dry_run` without creating receipts or calling Herdr. Non-dry runs
+  resolve a neutral public worker selector against the authoritative Tendwire
+  snapshot, load Tendwire-owned private bindings from the local store, and send
+  through Herdr's socket `agent.send` method. The private target value is chosen
+  by Tendwire from `WorkerBinding` internals and is never accepted from or
+  returned to public clients.
 
 ### Safety rules
 
 - Dry-run by default. A request must explicitly set `dry_run: false` to request
   mutation.
 - Non-dry-run `send_instruction` requires a `request_id`, at least one explicit
-  target selector, and exact single target resolution.
+  target selector, an available command receipt store, and exact single target
+  resolution.
 - Targets with status `closed`, `failed`, or `unknown` are rejected for
   `send_instruction`.
 - The send adapter never treats public selectors as raw Herdr send targets.
   Clients may use `worker_id` only as a neutral Tendwire selector, never as a
   backend target value. Clients must never provide `terminal_id`, `pane_id`,
-  `backend_target`, `argv`, `shell`, `worker_id`, or backend parameters as raw
+  `backend_target`, `target_value`, argv, shell, or backend parameters as raw
   Herdr send targets; low-level backend fields are rejected before mutation.
-- Backend-owned Herdr targets are private. Tendwire computes the final
-  `herdr agent send <target> <text>` target token for every observed worker; if
-  two public workers would send to the same token, even from different private
-  target kinds, all affected targets are non-sendable and mutation fails closed
-  with `ambiguous_backend_target`. Missing, empty, unsupported, or otherwise
+- Backend-owned Herdr targets are private. Tendwire computes the final socket
+  `agent.send` target parameters from private `WorkerBinding` rows for every
+  observed worker; if two public workers would send to the same private target,
+  all affected targets are non-sendable and mutation fails closed with
+  `ambiguous_backend_target`. Missing, empty, unsupported, or otherwise
   non-sendable private targets fail closed with `backend_unsupported`.
-- For non-dry-run `send_instruction`, missing Herdr, launch failures, timeouts,
-  nonzero/malformed observation output, and exhausted fallback/deadline state are
-  not projected into fake empty worker lists. They return `backend_unavailable`
-  or `request_state_uncertain` and do not execute send. Only a healthy empty
-  Herdr observation may produce final `not_found`.
+- For non-dry-run `send_instruction`, `TENDWIRE_HERDR_BACKEND` must be `socket`
+  and the current Herdr backend health must be `healthy`. A disabled socket
+  backend, missing Herdr socket, launch/connect failure, unhealthy backend
+  health, or unavailable receipt store returns `backend_unavailable` and does
+  not execute send. Only a healthy empty socket observation may produce a
+  final `not_found`.
+- Once Tendwire has reserved a receipt and started Herdr socket `agent.send`,
+  disconnects, timeouts, protocol failures, and OS errors return
+  `request_state_uncertain`. Tendwire records that uncertainty and will not
+  silently retry the same `request_id`.
 - Private Herdr binding expiration is guarded by authoritative healthy
   observation. Healthy empty observations may expire stale bindings; degraded or
   unavailable empty observations do not prune bindings as if Herdr were
@@ -535,19 +615,23 @@ Receipt semantics:
 
 ### Unsafe non-goals
 
-The only active Herdr mutation surface is `agent send`, which Herdr help
-describes as writing literal text. Tendwire does not use `pane send-text`,
-`send-keys`, `pane run`, shell/PTY control, signals, paste buffers, raw argv,
-client-provided worker IDs as backend targets, client-provided backend params,
-or fallback terminal-control paths.
+The only active Herdr mutation surface is the Tendwire-owned socket
+`agent.send` call for literal instruction text. Tendwire does not use
+`pane send-text`, `send-keys`, `pane run`, shell/PTY control, signals, paste
+buffers, raw argv, client-provided worker IDs as backend targets,
+client-provided backend params, fallback terminal-control paths, or connector
+delivery as a command transport.
 
-## Milestone 2 non-goals
+## Non-goals
 
-This milestone intentionally does **not** include:
+Tendwire intentionally does **not** include:
 
-- A Telegram connector or UI implementation.
+- Herdres, Telegram, Hermes, MCP, iOS, AR, UI, or local LLM integrations.
 - Modifications to Herdres or local Herdres files.
-- Connector-specific routing or delivery state inside core models or snapshots.
-- A required plugin ingestion path; plugins remain future optional triggers.
+- Connector-specific routing or delivery state inside core models or snapshots;
+  the neutral connector outbox boundary remains separate.
+- Tendwire source-mode polling, source adapters, or raw terminal integrations.
+- Raw Herdr pane, terminal, socket-path, target-value, shell, PTY, argv, env,
+  stdout, or stderr exposure in public JSON.
 - Network sync or cross-device transport.
 - Runtime dependencies beyond the Python standard library.
