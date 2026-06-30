@@ -93,6 +93,7 @@ class TendwireDaemon:
             get_health=self.get_health,
             submit_command=self.submit_command,
             get_attention=self.get_attention,
+            connector_call=self.connector_call,
         )
         self._server = UnixSocketJSONServer(
             self.socket_path,
@@ -193,6 +194,23 @@ class TendwireDaemon:
         from .core.attention import attention_payload_from_snapshot
 
         return attention_payload_from_snapshot(self.get_snapshot())
+
+    def connector_call(self, method: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
+        if self.config.db_path is None:
+            return {
+                "schema_version": 1,
+                "ok": False,
+                "status": "store_unavailable",
+                "host_id": self.config.host_id,
+                "name": str(params.get("name") or ""),
+                "error": {
+                    "code": "store_unavailable",
+                    "message": "daemon requires a sqlite db path for this method",
+                },
+            }
+        from .connectors import ConnectorOutboxAPI
+
+        return ConnectorOutboxAPI(Path(self.config.db_path), self.config.host_id).dispatch(method, params)
 
     def submit_command(self, params: Mapping[str, Any]) -> CommandEnvelope | Mapping[str, Any]:
         # Preserve the submitted keys exactly so the existing command parser can

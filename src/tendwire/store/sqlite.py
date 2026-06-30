@@ -7,8 +7,10 @@ provided for optional persistence and is kept intentionally stdlib-only.
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 from collections.abc import Iterable, Mapping
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -391,6 +393,700 @@ def _connect(
 
 def _canonical_json(data: Any) -> str:
     return stable_json_dumps(data)
+
+_CONNECTOR_LEASE_STATUS = "leased"
+_CONNECTOR_POLLABLE_STATUSES = frozenset({"queued", "deferred", "retry"})
+_CONNECTOR_TERMINAL_OUTBOX_STATUS = "delivered"
+
+
+def _json_object(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if not isinstance(raw, str) or not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+
+def _connector_datetime(value: str) -> datetime:
+    raw = str(value or "").strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        parsed = datetime.now(timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _connector_iso(value: str | datetime) -> str:
+    parsed = value if isinstance(value, datetime) else _connector_datetime(str(value))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _connector_now(value: str | None = None) -> str:
+    return _connector_iso(value or utc_timestamp())
+
+
+def _connector_add_seconds(now: str, seconds: int) -> str:
+    return _connector_iso(_connector_datetime(now) + timedelta(seconds=max(0, int(seconds))))
+
+
+def _connector_sanitize_payload(raw: Any) -> dict[str, Any]:
+    clean = sanitize_forbidden_fields(_json_object(raw))
+    return dict(clean) if isinstance(clean, Mapping) else {}
+
+
+def _connector_private_with_lease(
+    raw: Any,
+    *,
+    delivery_id: int | None,
+    attempt: int,
+    lease_token: str,
+    lease_expires_at: str,
+) -> str:
+    state = _json_object(raw)
+    state["current_delivery_id"] = delivery_id
+    state["current_attempt"] = int(attempt)
+    state["lease_token"] = str(lease_token)
+    state["lease_expires_at"] = str(lease_expires_at)
+    return _canonical_json(state)
+
+
+def _connector_private_clear_current(raw: Any) -> str:
+    state = _json_object(raw)
+    for key in ("current_delivery_id", "current_attempt", "lease_token", "lease_expires_at"):
+        state.pop(key, None)
+    return _canonical_json(state)
+
+
+def _connector_response(
+    *,
+    ok: bool,
+    status: str,
+    host_id: str,
+    name: str,
+    ref: str | None = None,
+    key: str | None = None,
+    attempt: int | None = None,
+    available_at: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "ok": bool(ok),
+        "status": str(status),
+        "host_id": str(host_id),
+        "name": str(name),
+    }
+    if ref is not None:
+        payload["ref"] = str(ref)
+    if key is not None:
+        payload["key"] = str(key)
+    if attempt is not None:
+        payload["attempt"] = int(attempt)
+    if available_at is not None:
+        payload["available_at"] = str(available_at)
+    return sanitize_forbidden_fields(payload)
+
+
+def _connector_error_response(
+    *,
+    status: str,
+    host_id: str,
+    name: str,
+    ref: str | None = None,
+) -> dict[str, Any]:
+    payload = _connector_response(ok=False, status=status, host_id=host_id, name=name, ref=ref)
+    payload["error"] = {
+        "code": str(status),
+        "message": "reference is not valid for the requested operation",
+    }
+    return sanitize_forbidden_fields(payload)
+
+
+def _connector_reclaim_expired_leases_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    name: str | None,
+    now: str,
+) -> int:
+    clauses = ["d.status = ?"]
+    params: list[Any] = [_CONNECTOR_LEASE_STATUS]
+    if host_id:
+        clauses.append("d.host_id = ?")
+        params.append(str(host_id))
+    if name:
+        clauses.append("d.connector = ?")
+        params.append(str(name))
+    rows = conn.execute(
+        f"""
+        SELECT
+            d.id,
+            d.outbox_id,
+            d.private_state_json,
+            o.status,
+            o.private_state_json
+        FROM connector_deliveries d
+        LEFT JOIN connector_outbox o ON o.id = d.outbox_id
+        WHERE {" AND ".join(clauses)}
+        """,
+        params,
+    ).fetchall()
+    reclaimed = 0
+    now_dt = _connector_datetime(now)
+    for delivery_id, outbox_id, delivery_private, outbox_status, outbox_private in rows:
+        state = _json_object(delivery_private)
+        lease_expires_at = state.get("lease_expires_at")
+        if not lease_expires_at or _connector_datetime(str(lease_expires_at)) > now_dt:
+            continue
+        conn.execute(
+            """
+            UPDATE connector_deliveries
+            SET status = ?, response_json = ?, delivered_at = ?
+            WHERE id = ? AND status = ?
+            """,
+            (
+                "expired",
+                _canonical_json({"schema_version": 1, "status": "expired"}),
+                now,
+                int(delivery_id),
+                _CONNECTOR_LEASE_STATUS,
+            ),
+        )
+        outbox_state = _json_object(outbox_private)
+        current_delivery_id = outbox_state.get("current_delivery_id")
+        if int(outbox_id or 0) > 0 and (
+            current_delivery_id is None or int(current_delivery_id or 0) == int(delivery_id)
+        ) and str(outbox_status or "") == _CONNECTOR_LEASE_STATUS:
+            conn.execute(
+                """
+                UPDATE connector_outbox
+                SET status = ?, updated_at = ?, private_state_json = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    "queued",
+                    now,
+                    _connector_private_clear_current(outbox_private),
+                    int(outbox_id),
+                    _CONNECTOR_LEASE_STATUS,
+                ),
+            )
+        reclaimed += 1
+    return reclaimed
+
+
+def reclaim_expired_connector_leases(
+    db_path: Path,
+    host_id: str,
+    name: str | None = None,
+    *,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Expire stale connector leases and return their outbox rows to polling."""
+    if not db_path.exists():
+        return {
+            "schema_version": 1,
+            "ok": False,
+            "status": "store_unavailable",
+            "host_id": str(host_id),
+            "name": str(name or ""),
+            "reclaimed": 0,
+        }
+    current_time = _connector_now(now)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            reclaimed = _connector_reclaim_expired_leases_conn(
+                conn,
+                host_id=str(host_id),
+                name=str(name) if name is not None else None,
+                now=current_time,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return sanitize_forbidden_fields(
+        {
+            "schema_version": 1,
+            "ok": True,
+            "status": "ok",
+            "host_id": str(host_id),
+            "name": str(name or ""),
+            "reclaimed": int(reclaimed),
+        }
+    )
+
+
+def poll_connector_outbox(
+    db_path: Path,
+    host_id: str,
+    name: str,
+    *,
+    limit: int = 1,
+    lease_seconds: int = 60,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Atomically lease due connector outbox rows for one neutral queue name."""
+    if not db_path.exists():
+        return {
+            "schema_version": 1,
+            "ok": False,
+            "status": "store_unavailable",
+            "host_id": str(host_id),
+            "name": str(name),
+            "items": [],
+        }
+    current_time = _connector_now(now)
+    lease_expires_at = _connector_add_seconds(current_time, max(1, int(lease_seconds)))
+    row_limit = max(1, min(int(limit), 100))
+    items: list[dict[str, Any]] = []
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _connector_reclaim_expired_leases_conn(
+                conn,
+                host_id=str(host_id),
+                name=str(name),
+                now=current_time,
+            )
+            rows = conn.execute(
+                """
+                SELECT
+                    id,
+                    delivery_key,
+                    payload_json,
+                    private_state_json
+                FROM connector_outbox
+                WHERE host_id = ?
+                  AND connector = ?
+                  AND status IN ('queued', 'deferred', 'retry')
+                  AND (next_attempt_at IS NULL OR next_attempt_at = '' OR next_attempt_at <= ?)
+                ORDER BY id
+                LIMIT ?
+                """,
+                (str(host_id), str(name), current_time, row_limit),
+            ).fetchall()
+            for row in rows:
+                outbox_id = int(row[0])
+                attempt_row = conn.execute(
+                    """
+                    SELECT COALESCE(MAX(attempt), 0)
+                    FROM connector_deliveries
+                    WHERE outbox_id = ?
+                    """,
+                    (outbox_id,),
+                ).fetchone()
+                attempt = int(attempt_row[0] or 0) + 1
+                lease_token = secrets.token_urlsafe(24)
+                cursor = conn.execute(
+                    """
+                    INSERT INTO connector_deliveries (
+                        outbox_id,
+                        host_id,
+                        connector,
+                        delivery_key,
+                        attempt,
+                        status,
+                        response_json,
+                        private_state_json,
+                        created_at,
+                        delivered_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        outbox_id,
+                        str(host_id),
+                        str(name),
+                        str(row[1]),
+                        attempt,
+                        _CONNECTOR_LEASE_STATUS,
+                        "{}",
+                        _connector_private_with_lease(
+                            {},
+                            delivery_id=None,
+                            attempt=attempt,
+                            lease_token=lease_token,
+                            lease_expires_at=lease_expires_at,
+                        ),
+                        current_time,
+                        None,
+                    ),
+                )
+                delivery_id = int(cursor.lastrowid)
+                conn.execute(
+                    """
+                    UPDATE connector_deliveries
+                    SET private_state_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        _connector_private_with_lease(
+                            {},
+                            delivery_id=delivery_id,
+                            attempt=attempt,
+                            lease_token=lease_token,
+                            lease_expires_at=lease_expires_at,
+                        ),
+                        delivery_id,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE connector_outbox
+                    SET status = ?, updated_at = ?, private_state_json = ?
+                    WHERE id = ? AND status IN ('queued', 'deferred', 'retry')
+                    """,
+                    (
+                        _CONNECTOR_LEASE_STATUS,
+                        current_time,
+                        _connector_private_with_lease(
+                            row[3],
+                            delivery_id=delivery_id,
+                            attempt=attempt,
+                            lease_token=lease_token,
+                            lease_expires_at=lease_expires_at,
+                        ),
+                        outbox_id,
+                    ),
+                )
+                items.append(
+                    {
+                        "outbox_id": outbox_id,
+                        "delivery_id": delivery_id,
+                        "host_id": str(host_id),
+                        "name": str(name),
+                        "key": str(row[1]),
+                        "attempt": attempt,
+                        "lease_token": lease_token,
+                        "leased_until": lease_expires_at,
+                        "available_at": current_time,
+                        "payload": _connector_sanitize_payload(row[2]),
+                    }
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return {
+        "schema_version": 1,
+        "ok": True,
+        "status": "ok",
+        "host_id": str(host_id),
+        "name": str(name),
+        "items": items,
+    }
+
+
+def _connector_validate_live_ref_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    name: str,
+    outbox_id: int,
+    delivery_id: int,
+    attempt: int,
+    lease_token: str,
+    now: str,
+) -> tuple[Any | None, str | None]:
+    row = conn.execute(
+        """
+        SELECT
+            d.id,
+            d.outbox_id,
+            d.host_id,
+            d.connector,
+            d.delivery_key,
+            d.attempt,
+            d.status,
+            d.private_state_json,
+            o.status,
+            o.private_state_json
+        FROM connector_deliveries d
+        LEFT JOIN connector_outbox o ON o.id = d.outbox_id
+        WHERE d.id = ? AND d.outbox_id = ?
+        """,
+        (int(delivery_id), int(outbox_id)),
+    ).fetchone()
+    if row is None:
+        return None, "invalid_ref"
+    if str(row[2]) != str(host_id) or str(row[3]) != str(name):
+        return row, "wrong_scope"
+    if int(row[5] or 0) != int(attempt):
+        return row, "stale_ref"
+    if str(row[6] or "") != _CONNECTOR_LEASE_STATUS:
+        return row, "stale_ref"
+    delivery_state = _json_object(row[7])
+    outbox_state = _json_object(row[9])
+    if str(delivery_state.get("lease_token") or "") != str(lease_token):
+        return row, "stale_ref"
+    if int(outbox_state.get("current_delivery_id") or 0) != int(delivery_id):
+        return row, "stale_ref"
+    if str(row[8] or "") != _CONNECTOR_LEASE_STATUS:
+        return row, "stale_ref"
+    lease_expires_at = str(delivery_state.get("lease_expires_at") or "")
+    if not lease_expires_at or _connector_datetime(lease_expires_at) <= _connector_datetime(now):
+        return row, "expired_ref"
+    return row, None
+
+
+def _connector_update_ref(
+    db_path: Path,
+    *,
+    action: str,
+    host_id: str,
+    name: str,
+    ref: str,
+    outbox_id: int,
+    delivery_id: int,
+    attempt: int,
+    lease_token: str,
+    response: Mapping[str, Any] | None = None,
+    reason: str | None = None,
+    available_at: str | None = None,
+    delay_seconds: int | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    if not db_path.exists():
+        return _connector_error_response(status="store_unavailable", host_id=host_id, name=name, ref=ref)
+    current_time = _connector_now(now)
+    sanitized_response = sanitize_forbidden_fields(dict(response or {}))
+    if not isinstance(sanitized_response, Mapping):
+        sanitized_response = {}
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _connector_reclaim_expired_leases_conn(
+                conn,
+                host_id=str(host_id),
+                name=str(name),
+                now=current_time,
+            )
+            row, error = _connector_validate_live_ref_conn(
+                conn,
+                host_id=str(host_id),
+                name=str(name),
+                outbox_id=int(outbox_id),
+                delivery_id=int(delivery_id),
+                attempt=int(attempt),
+                lease_token=str(lease_token),
+                now=current_time,
+            )
+            if error is not None or row is None:
+                conn.rollback()
+                return _connector_error_response(status=error or "invalid_ref", host_id=host_id, name=name, ref=ref)
+
+            delivery_key = str(row[4])
+            if action == "ack":
+                response_json = _canonical_json(
+                    sanitize_forbidden_fields(
+                        {
+                            "schema_version": 1,
+                            "status": "acknowledged",
+                            "response": dict(sanitized_response),
+                        }
+                    )
+                )
+                conn.execute(
+                    """
+                    UPDATE connector_deliveries
+                    SET status = ?, response_json = ?, delivered_at = ?
+                    WHERE id = ?
+                    """,
+                    ("delivered", response_json, current_time, int(delivery_id)),
+                )
+                conn.execute(
+                    """
+                    UPDATE connector_outbox
+                    SET status = ?, next_attempt_at = NULL, updated_at = ?, private_state_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        _CONNECTOR_TERMINAL_OUTBOX_STATUS,
+                        current_time,
+                        _connector_private_clear_current(row[9]),
+                        int(outbox_id),
+                    ),
+                )
+                conn.commit()
+                return _connector_response(
+                    ok=True,
+                    status="acknowledged",
+                    host_id=host_id,
+                    name=name,
+                    ref=ref,
+                    key=delivery_key,
+                    attempt=attempt,
+                )
+
+            if available_at is None:
+                available_at = _connector_add_seconds(
+                    current_time,
+                    60 if delay_seconds is None else int(delay_seconds),
+                )
+            else:
+                available_at = _connector_iso(available_at)
+            result_status = "retry_scheduled" if action == "fail" else "deferred"
+            delivery_status = "failed" if action == "fail" else "deferred"
+            outbox_status = "retry" if action == "fail" else "deferred"
+            response_json = _canonical_json(
+                sanitize_forbidden_fields(
+                    {
+                        "schema_version": 1,
+                        "status": result_status,
+                        "reason": str(reason or ""),
+                        "available_at": available_at,
+                        "response": dict(sanitized_response),
+                    }
+                )
+            )
+            conn.execute(
+                """
+                UPDATE connector_deliveries
+                SET status = ?, response_json = ?, delivered_at = ?
+                WHERE id = ?
+                """,
+                (delivery_status, response_json, current_time, int(delivery_id)),
+            )
+            conn.execute(
+                """
+                UPDATE connector_outbox
+                SET status = ?, next_attempt_at = ?, updated_at = ?, private_state_json = ?
+                WHERE id = ?
+                """,
+                (
+                    outbox_status,
+                    available_at,
+                    current_time,
+                    _connector_private_clear_current(row[9]),
+                    int(outbox_id),
+                ),
+            )
+            conn.commit()
+            return _connector_response(
+                ok=True,
+                status=result_status,
+                host_id=host_id,
+                name=name,
+                ref=ref,
+                key=delivery_key,
+                attempt=attempt,
+                available_at=available_at,
+            )
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def ack_connector_delivery(
+    db_path: Path,
+    *,
+    host_id: str,
+    name: str,
+    ref: str,
+    outbox_id: int,
+    delivery_id: int,
+    attempt: int,
+    lease_token: str,
+    response: Mapping[str, Any] | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Acknowledge a live connector lease and make the outbox item terminal."""
+    return _connector_update_ref(
+        db_path,
+        action="ack",
+        host_id=host_id,
+        name=name,
+        ref=ref,
+        outbox_id=outbox_id,
+        delivery_id=delivery_id,
+        attempt=attempt,
+        lease_token=lease_token,
+        response=response,
+        now=now,
+    )
+
+
+def fail_connector_delivery(
+    db_path: Path,
+    *,
+    host_id: str,
+    name: str,
+    ref: str,
+    outbox_id: int,
+    delivery_id: int,
+    attempt: int,
+    lease_token: str,
+    reason: str | None = None,
+    response: Mapping[str, Any] | None = None,
+    available_at: str | None = None,
+    delay_seconds: int | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Record a connector failure and schedule the outbox item for retry."""
+    return _connector_update_ref(
+        db_path,
+        action="fail",
+        host_id=host_id,
+        name=name,
+        ref=ref,
+        outbox_id=outbox_id,
+        delivery_id=delivery_id,
+        attempt=attempt,
+        lease_token=lease_token,
+        reason=reason,
+        response=response,
+        available_at=available_at,
+        delay_seconds=delay_seconds,
+        now=now,
+    )
+
+
+def defer_connector_delivery(
+    db_path: Path,
+    *,
+    host_id: str,
+    name: str,
+    ref: str,
+    outbox_id: int,
+    delivery_id: int,
+    attempt: int,
+    lease_token: str,
+    reason: str | None = None,
+    response: Mapping[str, Any] | None = None,
+    available_at: str | None = None,
+    delay_seconds: int | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Record a connector deferral and make the outbox item available later."""
+    return _connector_update_ref(
+        db_path,
+        action="defer",
+        host_id=host_id,
+        name=name,
+        ref=ref,
+        outbox_id=outbox_id,
+        delivery_id=delivery_id,
+        attempt=attempt,
+        lease_token=lease_token,
+        reason=reason,
+        response=response,
+        available_at=available_at,
+        delay_seconds=delay_seconds,
+        now=now,
+    )
 
 
 def _snapshot_dict(snapshot: Snapshot) -> dict[str, Any]:

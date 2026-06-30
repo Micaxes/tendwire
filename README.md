@@ -261,6 +261,44 @@ snapshot fields, command request fields, command response fields, or stored
 snapshot payload fields. Expired bindings are retained for local history and
 debugging but ignored by command routing.
 
+## Neutral connector outbox boundary
+
+Tendwire exposes a Tendwire-only connector delivery boundary above the SQLite
+store. The public daemon methods are `connector.poll`, `connector.ack`,
+`connector.fail`, `connector.defer`, and the operational helper
+`connector.reclaim`. The matching JSON-only CLI hook is:
+
+```bash
+tendwire connector poll --name attention --db-path /path/to/tendwire.db
+tendwire connector ack --name attention --ref '<opaque-ref>' --db-path /path/to/tendwire.db
+tendwire connector fail --name attention --ref '<opaque-ref>' --delay-seconds 60 --db-path /path/to/tendwire.db
+tendwire connector defer --name attention --ref '<opaque-ref>' --available-at 2026-01-01T00:10:00+00:00 --db-path /path/to/tendwire.db
+```
+
+The boundary is neutral. Public requests use `name`, `ref`, `limit`,
+`lease_seconds`, `available_at`, `delay_seconds`, `reason`, and optional
+sanitized `response`. Public responses use `schema_version`, `ok`, `status`,
+`host_id`, `name`, `items`, `ref`, `key`, `attempt`, `leased_until`,
+`available_at`, and sanitized `payload`. It does not expose `private_state_json`
+or connector/backend routing fields.
+
+`connector.poll` atomically leases due `connector_outbox` rows for one `name`
+and returns opaque per-attempt refs. A live lease prevents duplicate polling.
+Expired leases are reclaimed before polling and before ref-mutating operations;
+`connector.reclaim` can also be called directly. `connector.ack` validates the
+host, name, attempt, lease, and ref before marking the delivery and outbox item
+delivered. `connector.fail` records sanitized failure data and schedules retry
+availability. `connector.defer` records sanitized defer data and schedules future
+availability without treating the item as delivered. Stale, expired,
+wrong-host, wrong-name, and superseded refs fail closed with neutral errors.
+
+Connector payloads are generic jobs such as `attention_created` and
+`attention_escalated`; the existing attention lifecycle writer continues to
+enqueue them in `connector_outbox`. This boundary does not add Telegram
+delivery, Herdres integration, bot tokens, chat/topic/message IDs, backend
+targets, pane/session/terminal routing, shell control, argv handling, or private
+connector routing fields to public models or public JSON.
+
 ## Milestone 3 neutral command contract
 
 Tendwire now exposes a minimal, safety-first command interface:

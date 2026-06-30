@@ -33,6 +33,11 @@ REQUIRED_METHODS = frozenset(
         "turn.list",
         "pending.list",
         "command.submit",
+        "connector.poll",
+        "connector.ack",
+        "connector.fail",
+        "connector.defer",
+        "connector.reclaim",
     }
 )
 
@@ -113,11 +118,13 @@ class TendwireDaemonAPI:
         get_health: Callable[[], Mapping[str, Any]],
         submit_command: Callable[[Mapping[str, Any]], Mapping[str, Any] | CommandEnvelope],
         get_attention: Callable[[], Mapping[str, Any]] | None = None,
+        connector_call: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None,
     ) -> None:
         self._get_snapshot = get_snapshot
         self._get_health = get_health
         self._submit_command = submit_command
         self._get_attention = get_attention
+        self._connector_call = connector_call
 
     def dispatch(self, request: Any) -> dict[str, Any]:
         if not isinstance(request, Mapping):
@@ -181,6 +188,24 @@ class TendwireDaemonAPI:
             if method == "command.submit":
                 return success_response(
                     _command_result(self._submit_command(dict(params))),
+                    request_id=request_id,
+                )
+            if method.startswith("connector."):
+                if self._connector_call is None:
+                    return success_response(
+                        {
+                            "schema_version": 1,
+                            "ok": False,
+                            "status": "store_unavailable",
+                            "error": {
+                                "code": "store_unavailable",
+                                "message": "store is unavailable",
+                            },
+                        },
+                        request_id=request_id,
+                    )
+                return success_response(
+                    self._connector_call(method, dict(params)),
                     request_id=request_id,
                 )
         except Exception as exc:  # noqa: BLE001

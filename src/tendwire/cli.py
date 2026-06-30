@@ -212,7 +212,39 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print diagnostics as JSON (default).",
     )
 
+    _add_connector_parser(subparsers)
+
     return parser
+
+
+def _add_connector_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    connector_parser = subparsers.add_parser(
+        "connector",
+        help="Exercise the neutral connector outbox boundary with JSON-only output.",
+    )
+    actions = connector_parser.add_subparsers(dest="connector_action", required=True)
+
+    def add_common(action_parser: argparse.ArgumentParser) -> None:
+        action_parser.add_argument("--db-path", dest="db_path", default=None)
+        action_parser.add_argument("--name", required=True, help="Neutral connector queue name.")
+
+    poll_parser = actions.add_parser("poll", help="Lease due connector outbox items.")
+    add_common(poll_parser)
+    poll_parser.add_argument("--limit", type=int, default=1)
+    poll_parser.add_argument("--lease-seconds", dest="lease_seconds", type=int, default=60)
+
+    reclaim_parser = actions.add_parser("reclaim", help="Expire stale connector leases.")
+    add_common(reclaim_parser)
+
+    for action in ("ack", "fail", "defer"):
+        action_parser = actions.add_parser(action, help=f"Apply connector.{action} to a live ref.")
+        add_common(action_parser)
+        action_parser.add_argument("--ref", required=True)
+        action_parser.add_argument("--response-json", dest="response_json", default=None)
+        if action in {"fail", "defer"}:
+            action_parser.add_argument("--reason", default="")
+            action_parser.add_argument("--available-at", dest="available_at", default=None)
+            action_parser.add_argument("--delay-seconds", dest="delay_seconds", type=int, default=None)
 
 
 def _load_worker_bindings(config: Config) -> list[WorkerBinding]:
@@ -740,6 +772,60 @@ def cmd_command(
     return _command_exit_code(envelope)
 
 
+def _connector_params_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    params: dict[str, Any] = {"name": args.name}
+    if args.connector_action == "poll":
+        params["limit"] = args.limit
+        params["lease_seconds"] = args.lease_seconds
+    if args.connector_action in {"ack", "fail", "defer"}:
+        params["ref"] = args.ref
+        if args.response_json:
+            try:
+                parsed = json.loads(args.response_json)
+            except json.JSONDecodeError:
+                parsed = {}
+            if isinstance(parsed, dict):
+                params["response"] = parsed
+        if args.connector_action in {"fail", "defer"}:
+            params["reason"] = args.reason
+            if args.available_at:
+                params["available_at"] = args.available_at
+            if args.delay_seconds is not None:
+                params["delay_seconds"] = args.delay_seconds
+    return params
+
+
+def cmd_connector(config: Config, args: argparse.Namespace) -> int:
+    """Run a neutral connector boundary action and print one JSON object."""
+    method = f"connector.{args.connector_action}"
+    params = _connector_params_from_args(args)
+    daemon_result = _try_daemon_result(config, method, params)
+    if daemon_result is not None:
+        print(stable_json_dumps(daemon_result, indent=2))
+        return 0 if daemon_result.get("ok") is not False else 1
+    if config.db_path is None:
+        payload = {
+            "schema_version": 1,
+            "ok": False,
+            "status": "store_unavailable",
+            "host_id": config.host_id,
+            "name": params.get("name", ""),
+            "error": {
+                "code": "store_unavailable",
+                "message": "command requires --db-path or a reachable daemon",
+            },
+        }
+        print(stable_json_dumps(payload, indent=2))
+        return 1
+    from .connectors import ConnectorOutboxAPI
+    from .store.sqlite import init_store
+
+    init_store(config.db_path)
+    payload = ConnectorOutboxAPI(config.db_path, config.host_id).dispatch(method, params)
+    print(stable_json_dumps(payload, indent=2))
+    return 0 if payload.get("ok") is not False else 1
+
+
 def cmd_daemon(config: Config) -> int:
     """Run the long-lived local daemon."""
     from .daemon import run_daemon
@@ -785,6 +871,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "command":
         return cmd_command(config, json_output=args.json_output)
+
+    if args.command == "connector":
+        return cmd_connector(config, args)
 
     if args.command == "daemon":
         return cmd_daemon(config)
