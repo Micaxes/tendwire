@@ -520,12 +520,15 @@ tendwire connector defer --name attention --ref '<opaque-ref>' --reason schedule
 
 The boundary is neutral and separate from concrete connector integrations.
 Public requests use `name`, `ref`, `limit`, `lease_seconds`, `available_at`,
-`delay_seconds`, `reason`, and optional sanitized `response`. Public responses
-use `schema_version`, `ok`, `status`, `host_id`, `name`, `items`, `ref`, `key`,
-`attempt`, `leased_until`, `available_at`, and sanitized `payload`. They do not
-expose `private_state_json`, backend routing, pane/session/terminal identifiers,
-socket paths, target values, Telegram/chat/topic/message IDs, tokens, or
-connector-specific delivery internals.
+`delay_seconds`, `reason`, and optional sanitized `response`. `name` must be a
+neutral queue name: 1-64 ASCII letters, digits, `.`, `_`, or `-`, and not a
+concrete provider, delivery, backend, or terminal-routing token. Public
+responses use `schema_version`, `ok`, `status`, `host_id`, `name`, `items`,
+`ref`, `key`, `attempt`, `leased_until`, `available_at`, and sanitized
+`payload`. They do not expose `private_state_json`, backend routing,
+pane/session/terminal identifiers, socket paths, target values,
+Telegram/chat/topic/message IDs, tokens, or connector-specific delivery
+internals.
 
 `connector.poll` atomically leases due `connector_outbox` rows for one `name`
 and returns opaque per-attempt refs. A live lease prevents duplicate polling.

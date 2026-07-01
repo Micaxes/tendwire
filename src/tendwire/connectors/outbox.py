@@ -38,6 +38,7 @@ def _int(value: Any, default: int, *, minimum: int = 1, maximum: int = 100) -> i
 _DROP = object()
 _CONNECTOR_REF_PREFIX = "twref1."
 _CONNECTOR_REF_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+_CONNECTOR_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 _FORBIDDEN_PUBLIC_TEXT = (
     "telegram",
     "herdr",
@@ -59,7 +60,7 @@ _FORBIDDEN_PUBLIC_TEXT = (
 
 def _contains_forbidden_public_text(value: str) -> bool:
     lowered = value.lower()
-    compact = lowered.replace("-", "").replace("_", "")
+    compact = lowered.replace("-", "").replace("_", "").replace(".", "")
     return any(token in lowered or token.replace("_", "") in compact for token in _FORBIDDEN_PUBLIC_TEXT)
 
 
@@ -118,6 +119,17 @@ def _ref(value: Any) -> str:
     return ref
 
 
+def _name(value: Any) -> str:
+    name = _text(value)
+    if not name or len(name) > 64:
+        return ""
+    if any(char not in _CONNECTOR_NAME_CHARS for char in name):
+        return ""
+    if _contains_forbidden_public_text(name):
+        return ""
+    return name
+
+
 class ConnectorOutboxAPI:
     """Public-neutral facade for connector.poll/ack/fail/defer."""
 
@@ -141,7 +153,7 @@ class ConnectorOutboxAPI:
 
     def poll(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         data = dict(params or {})
-        name = _text(data.get("name"))
+        name = _name(data.get("name"))
         if not name:
             return _error("invalid_params", host_id=self.host_id)
         unavailable = self._require_store(name)
@@ -193,7 +205,7 @@ class ConnectorOutboxAPI:
 
     def reclaim(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         data = dict(params or {})
-        name = _text(data.get("name"))
+        name = _name(data.get("name"))
         if not name:
             return _error("invalid_params", host_id=self.host_id)
         unavailable = self._require_store(name)
@@ -202,20 +214,20 @@ class ConnectorOutboxAPI:
         assert self.db_path is not None
         return reclaim_expired_connector_leases(self.db_path, self.host_id, name)
 
-    def _mutation_parts(self, params: Mapping[str, Any] | None) -> tuple[dict[str, Any], str | None]:
+    def _mutation_parts(self, params: Mapping[str, Any] | None) -> tuple[dict[str, Any], str, str | None]:
         data = dict(params or {})
-        name = _text(data.get("name"))
+        name = _name(data.get("name"))
         ref = _ref(data.get("ref"))
         if not name or not ref:
-            return data, None
-        return data, ref
+            return data, name, None
+        return data, name, ref
 
     def ack(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        data, live_ref = self._mutation_parts(params)
-        name = _text(data.get("name"))
-        ref = _text(data.get("ref"))
+        data, name, live_ref = self._mutation_parts(params)
+        if not name:
+            return _error("invalid_params", host_id=self.host_id)
         if live_ref is None:
-            return _error("invalid_ref", host_id=self.host_id, name=name, ref=ref or None)
+            return _error("invalid_ref", host_id=self.host_id, name=name)
         unavailable = self._require_store(name)
         if unavailable is not None:
             return unavailable
@@ -235,11 +247,11 @@ class ConnectorOutboxAPI:
         return self._schedule("defer", params)
 
     def _schedule(self, action: str, params: Mapping[str, Any] | None) -> dict[str, Any]:
-        data, live_ref = self._mutation_parts(params)
-        name = _text(data.get("name"))
-        ref = _text(data.get("ref"))
+        data, name, live_ref = self._mutation_parts(params)
+        if not name:
+            return _error("invalid_params", host_id=self.host_id)
         if live_ref is None:
-            return _error("invalid_ref", host_id=self.host_id, name=name, ref=ref or None)
+            return _error("invalid_ref", host_id=self.host_id, name=name)
         unavailable = self._require_store(name)
         if unavailable is not None:
             return unavailable

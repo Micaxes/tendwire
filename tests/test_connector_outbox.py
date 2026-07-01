@@ -346,3 +346,39 @@ def test_invalid_wrong_host_and_wrong_name_refs_do_not_mutate(tmp_path: Path) ->
     assert wrong_name["ok"] is False
     assert malformed["ok"] is False
     assert _delivery_rows(db_path)[0][0] == "leased"
+
+
+def test_connector_api_rejects_non_neutral_public_names_without_echoing_them(tmp_path: Path) -> None:
+    db_path = tmp_path / "connector-name.db"
+    _enqueue(db_path)
+    api = ConnectorOutboxAPI(db_path, "host-a")
+
+    payloads = [
+        api.poll({"name": "telegram"}),
+        api.reclaim({"name": "herdres"}),
+        api.ack({"name": "attention/chat", "ref": "twref1.publicSafeRef"}),
+        api.fail({"name": "backend_target", "ref": "twref1.publicSafeRef"}),
+        api.defer({"name": "attention delivery", "ref": "twref1.publicSafeRef"}),
+        api.poll({"name": "backend.target"}),
+        api.reclaim({"name": "pane.id"}),
+        api.ack({"name": "message.id", "ref": "twref1.publicSafeRef"}),
+        api.fail({"name": "bot.token", "ref": "twref1.publicSafeRef"}),
+    ]
+    unsafe_ref_payloads = [
+        api.ack({"name": "attention", "ref": "telegram-message-id"}),
+        api.fail({"name": "attention", "ref": "herdres-route"}),
+        api.defer({"name": "attention", "ref": "backend_target"}),
+    ]
+    still_pollable = api.poll({"name": "attention"})
+
+    for payload in payloads:
+        assert payload["ok"] is False
+        assert payload["status"] == "invalid_params"
+        assert payload["name"] == ""
+        _assert_no_forbidden(payload)
+    for payload in unsafe_ref_payloads:
+        assert payload["ok"] is False
+        assert payload["status"] == "invalid_ref"
+        assert "ref" not in payload
+        _assert_no_forbidden(payload)
+    assert still_pollable["items"][0]["key"] == "job-1"
