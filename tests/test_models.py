@@ -842,6 +842,30 @@ def test_backend_health_message_redacts_secret_label_variants() -> None:
         assert "PROD" not in encoded
 
 
+def test_backend_health_name_buckets_connector_private_names() -> None:
+    unsafe_names = [
+        "herdres",
+        "telegram",
+        "telegram.delivery",
+        "connector-outbox",
+        "private-backend",
+        "raw-status",
+        "token-store",
+    ]
+
+    for name in unsafe_names:
+        payload = BackendHealth.from_dict({"name": name}).to_dict()
+        encoded = json.dumps(payload).lower()
+        assert payload["name"] == "unknown"
+        assert "herdres" not in encoded
+        assert "telegram" not in encoded
+        assert "connector" not in encoded
+        assert "private" not in encoded
+        assert "token" not in encoded
+
+    assert BackendHealth.from_dict({"name": "herdr-socket"}).to_dict()["name"] == "herdr-socket"
+
+
 def test_backend_health_message_keeps_safe_fixed_messages() -> None:
     safe_messages = [
         "Herdr observation is healthy",

@@ -249,6 +249,21 @@ FORBIDDEN_FIELD_NAMES = frozenset(
     }
 )
 _FORBIDDEN_FIELD_COMPACT = frozenset(name.replace("_", "") for name in FORBIDDEN_FIELD_NAMES)
+_FORBIDDEN_BACKEND_NAME_TEXT = frozenset(
+    {
+        "telegram",
+        "herdres",
+        "connector",
+        "connectors",
+        "delivery",
+        "deliveries",
+        "outbox",
+        "private",
+        "raw",
+        "secret",
+        "token",
+    }
+)
 _CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _BACKEND_MESSAGE_LABEL_RE = re.compile(
     r"[A-Za-z][A-Za-z0-9_-]*\s+[A-Za-z][A-Za-z0-9_-]*|[A-Za-z][A-Za-z0-9_.-]*"
@@ -452,6 +467,14 @@ def _optional_timestamp(value: Any) -> str | None:
 def _public_safe_backend_name(value: Any) -> str:
     text = _string_value(value, "unknown").strip().lower()
     clean = "".join(char for char in text if char.isalnum() or char in {"_", "-"})
+    if clean == "herdr" or clean.startswith(("herdr_", "herdr-")):
+        return clean[:40]
+    compact = clean.replace("_", "").replace("-", "")
+    if _is_forbidden_field_name(clean) or any(
+        marker in clean or marker.replace("_", "") in compact
+        for marker in _FORBIDDEN_BACKEND_NAME_TEXT
+    ):
+        return "unknown"
     return clean[:40] or "unknown"
 
 
