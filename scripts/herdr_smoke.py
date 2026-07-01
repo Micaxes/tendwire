@@ -932,6 +932,8 @@ def _send_accepted_count_from_payload(payload: Any) -> int | None:
         nested = _send_accepted_count_from_payload(result)
         if nested is not None:
             return nested
+        if payload.get("type") == "ok":
+            return 1
     return None
 
 
@@ -1003,14 +1005,120 @@ def _live_observe_check(options: SmokeOptions, session_plan: SessionPlan, runner
     )
 
 
-def _run_send_probe(options: SmokeOptions, session_plan: SessionPlan, runner: Runner | None) -> dict[str, Any]:
-    if not session_plan.default_isolated and session_plan.child_env.get("HERDR_SESSION") != DEFAULT_SESSION:
+def _live_send_probe_allowed(session_plan: SessionPlan) -> bool:
+    return session_plan.default_isolated or session_plan.child_env.get("HERDR_SESSION") == DEFAULT_SESSION
+
+
+def _extract_started_pane_id(payload: Any) -> str | None:
+    if not isinstance(payload, Mapping):
+        return None
+    result = payload.get("result")
+    if isinstance(result, Mapping):
+        agent = result.get("agent")
+        if isinstance(agent, Mapping):
+            pane_id = str(agent.get("pane_id") or "").strip()
+            if pane_id:
+                return pane_id
+        nested = _extract_started_pane_id(result)
+        if nested:
+            return nested
+    agent = payload.get("agent")
+    if isinstance(agent, Mapping):
+        pane_id = str(agent.get("pane_id") or "").strip()
+        if pane_id:
+            return pane_id
+    return None
+
+
+def _run_live_create_attach_probe(
+    options: SmokeOptions,
+    session_plan: SessionPlan,
+    runner: Runner | None,
+    *,
+    cwd: str | None,
+) -> tuple[dict[str, Any], str | None]:
+    if not _live_send_probe_allowed(session_plan):
+        return _deterministic_create_attach_check(limitation="caller_override"), None
+    if not cwd:
+        return _deterministic_create_attach_check(limitation="live_skipped_unreliable"), None
+    try:
+        completed = _run_command(
+            _herdr_args(
+                options,
+                session_plan,
+                ("agent", "start", SMOKE_ADDRESS, "--cwd", cwd, "--no-focus", "--", "sh", "-c", "sleep 300"),
+            ),
+            env=session_plan.child_env,
+            timeout=options.timeout,
+            runner=runner,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return _deterministic_create_attach_check(limitation="live_skipped_unreliable"), None
+    if _return_code(completed) != 0:
+        return _deterministic_create_attach_check(limitation="live_skipped_unreliable"), None
+    pane_id = _extract_started_pane_id(_parse_json(_stdout_text(completed)))
+    if not pane_id:
+        return _deterministic_create_attach_check(limitation="live_skipped_unreliable"), None
+    return (
+        _check(
+            "create_attach",
+            "ok",
+            required=True,
+            ok=True,
+            detail="live_created",
+            created_count=1,
+            attached_count=1,
+            observed=True,
+        ),
+        pane_id,
+    )
+
+
+def _close_live_smoke_pane(
+    options: SmokeOptions,
+    session_plan: SessionPlan,
+    runner: Runner | None,
+    pane_id: str | None,
+) -> None:
+    if not pane_id:
+        return
+    try:
+        _run_command(
+            _herdr_args(options, session_plan, ("pane", "close", pane_id)),
+            env=session_plan.child_env,
+            timeout=options.timeout,
+            runner=runner,
+        )
+    except Exception:
+        pass
+
+
+def _run_send_probe(
+    options: SmokeOptions,
+    session_plan: SessionPlan,
+    runner: Runner | None,
+    *,
+    live_target_ready: bool,
+) -> dict[str, Any]:
+    if not _live_send_probe_allowed(session_plan):
         return _check(
             "send_addressing",
             "skipped",
             required=False,
             ok=True,
             detail="caller_override",
+            attempted=False,
+            send_attempts=0,
+            accepted_count=0,
+        )
+    if not live_target_ready:
+        return _check(
+            "send_addressing",
+            "skipped",
+            required=False,
+            ok=True,
+            detail="live_skipped_unreliable",
+            limitation="live_skipped_unreliable",
             attempted=False,
             send_attempts=0,
             accepted_count=0,
@@ -1417,11 +1525,38 @@ def _live_payload(options: SmokeOptions, env: Mapping[str, str], runner: Runner 
         ]
         return _finalize_payload("live", "unavailable", checks, session_plan)
 
-    observe_check, _workspace_payload, _agent_payload = _live_observe_check(options, session_plan, runner)
+    smoke_cwd_context = (
+        tempfile.TemporaryDirectory(prefix="tendwire-herdr-smoke-agent-")
+        if _live_send_probe_allowed(session_plan)
+        else None
+    )
+    smoke_cwd = None
+    if smoke_cwd_context is not None:
+        smoke_cwd = smoke_cwd_context.__enter__()
+    smoke_pane_id: str | None = None
+    try:
+        create_check, smoke_pane_id = _run_live_create_attach_probe(
+            options,
+            session_plan,
+            runner,
+            cwd=smoke_cwd,
+        )
+        observe_check, _workspace_payload, _agent_payload = _live_observe_check(options, session_plan, runner)
+        send_check = _run_send_probe(
+            options,
+            session_plan,
+            runner,
+            live_target_ready=smoke_pane_id is not None,
+        )
+    finally:
+        _close_live_smoke_pane(options, session_plan, runner, smoke_pane_id)
+        if smoke_cwd_context is not None:
+            smoke_cwd_context.__exit__(None, None, None)
+
     checks = [
-        deterministic["create_attach"],
+        create_check,
         observe_check,
-        _run_send_probe(options, session_plan, runner),
+        send_check,
         deterministic["target_validation"],
         _event_subscription_aggregate_check(),
         _live_status_check(options, session_plan, runner, deterministic["status_agent_status_changed"]),

@@ -198,6 +198,21 @@ class RecordingRunner:
         joined = " ".join(part.lower() for part in argv)
         if "status" in joined and "server" in joined:
             return "status: running\n"
+        if argv[3:5] == ["agent", "start"]:
+            return json.dumps(
+                {
+                    "id": "cli:agent:start",
+                    "result": {
+                        "type": "agent_started",
+                        "agent": {
+                            "name": "tendwire-smoke-address-probe",
+                            "pane_id": "private-pane-id",
+                        },
+                    },
+                }
+            )
+        if argv[3:5] == ["pane", "close"]:
+            return json.dumps({"id": "cli:pane:close", "result": {"type": "ok"}})
         if "workspace" in joined and "list" in joined:
             return json.dumps({"status": "ok", "items": [{"label": "smoke-space"}], "count": 1})
         if "agent" in joined and "list" in joined:
@@ -293,14 +308,23 @@ def test_live_session_selection_and_argv_construction(
         assert isinstance(call["argv"], list)
         assert call["kwargs"].get("shell") is not True
         assert call["argv"][1:3] == ["--session", expected_session]
-    assert not any(call["argv"][3:4] == ["pane"] for call in runner.calls)
     send_calls = [call for call in runner.calls if call["argv"][3:5] == ["agent", "send"]]
     assert bool(send_calls) is expect_send
+    start_calls = [call for call in runner.calls if call["argv"][3:5] == ["agent", "start"]]
+    close_calls = [call for call in runner.calls if call["argv"][3:5] == ["pane", "close"]]
+    assert bool(start_calls) is expect_send
+    assert bool(close_calls) is expect_send
     assert data.get("default_isolated_session") is expected_default
     assert data.get("explicit_session") is expected_explicit
     assert REQUIRED_CHECKS <= _check_names(data)
     assert _check_by_name(data, "observe")["observed"] is True
-    assert _check_by_name(data, "create_attach")["limitation"] == "live_skipped_unreliable"
+    create = _check_by_name(data, "create_attach")
+    if expect_send:
+        assert create["status"] == "ok"
+        assert create["detail"] == "live_created"
+        assert "limitation" not in create
+    else:
+        assert create["limitation"] == "caller_override"
     assert _check_by_name(data, "pane_moved_binding_update")["limitation"] == "live_skipped_unreliable"
     _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
 
@@ -323,6 +347,7 @@ def test_environment_variable_opts_into_live_mode(smoke_module, monkeypatch, cap
         assert call["env"].get("HERDR_SESSION") == "tendwire-smoke"
         assert call["argv"][1:3] == ["--session", "tendwire-smoke"]
     assert data.get("mode") == "live"
+    assert _check_by_name(data, "create_attach")["detail"] == "live_created"
     assert _check_by_name(data, "send_addressing")["send_attempts"] == 1
     _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
 
@@ -383,7 +408,9 @@ def test_live_nonzero_send_is_not_ok(smoke_module, monkeypatch, capsys):
     assert send["exit_code"] == 1
     assert send["accepted_count"] == 0
     send_calls = [call for call in runner.calls if call["argv"][3:5] == ["agent", "send"]]
+    close_calls = [call for call in runner.calls if call["argv"][3:5] == ["pane", "close"]]
     assert len(send_calls) == 1
+    assert len(close_calls) == 1
     assert send_calls[0]["argv"][1:3] == ["--session", "tendwire-smoke"]
     _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
 
@@ -404,9 +431,20 @@ def test_live_zero_accepted_send_is_not_ok(smoke_module, monkeypatch, capsys):
     assert send["json_status"] == "valid"
     assert send["accepted_count"] == 0
     send_calls = [call for call in runner.calls if call["argv"][3:5] == ["agent", "send"]]
+    close_calls = [call for call in runner.calls if call["argv"][3:5] == ["pane", "close"]]
     assert len(send_calls) == 1
+    assert len(close_calls) == 1
     assert send_calls[0]["argv"][1:3] == ["--session", "tendwire-smoke"]
     _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
+
+
+def test_send_ok_envelope_counts_as_one_accepted(smoke_module):
+    accepted_count, json_status = smoke_module._send_accepted_count(
+        json.dumps({"id": "cli:agent:send", "result": {"type": "ok"}})
+    )
+
+    assert accepted_count == 1
+    assert json_status == "valid"
 
 
 def test_fixture_replay_is_deterministic_and_public_safe(smoke_module, monkeypatch, capsys):
