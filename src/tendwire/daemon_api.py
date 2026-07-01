@@ -491,7 +491,10 @@ class UnixSocketJSONServer:
                     "daemon request failed",
                     details={"type": type(exc).__name__},
                 )
-            conn.sendall(stable_json_dumps(response).encode("utf-8") + b"\n")
+            try:
+                conn.sendall(stable_json_dumps(response).encode("utf-8") + b"\n")
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, socket.timeout):
+                return
 
     def close(self) -> None:
         self.stop_event.set()

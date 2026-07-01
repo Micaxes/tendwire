@@ -7,6 +7,7 @@ import json
 import sqlite3
 import socket
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ from tendwire.core.models import (
 )
 from tendwire.core.projector import project_from_raw
 from tendwire.daemon import DaemonHooks, TendwireDaemon
-from tendwire.daemon_api import DaemonAPIClient, TendwireDaemonAPI
+from tendwire.daemon_api import DaemonAPIClient, TendwireDaemonAPI, UnixSocketJSONServer
 from tendwire.store.sqlite import (
     attention_payload_from_store,
     get_command_receipt,
@@ -426,6 +427,56 @@ def test_daemon_starts_observes_persists_serves_and_removes_socket(tmp_path: Pat
 
     assert not thread.is_alive()
     assert not socket_path.exists()
+
+
+def test_daemon_server_survives_client_disconnect_during_response(tmp_path: Path) -> None:
+    socket_path = tmp_path / "daemon.sock"
+    request_seen = threading.Event()
+    allow_response = threading.Event()
+
+    def dispatch(request: dict[str, Any]) -> dict[str, Any]:
+        if request.get("method") == "large.response":
+            request_seen.set()
+            allow_response.wait(timeout=2)
+            return {"ok": True, "result": {"payload": "x" * 5_000_000}}
+        return {"ok": True, "result": {"pong": True}}
+
+    server = UnixSocketJSONServer(
+        socket_path,
+        dispatch,
+        accept_timeout_seconds=0.05,
+        client_timeout_seconds=2,
+    )
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 2
+        while not socket_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.connect(str(socket_path))
+            conn.sendall(b'{"method":"large.response"}\n')
+            assert request_seen.wait(timeout=2)
+        allow_response.set()
+
+        deadline = time.monotonic() + 2
+        response: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            try:
+                response = DaemonAPIClient(socket_path, timeout_seconds=1).request("ping")
+                break
+            except Exception:
+                time.sleep(0.01)
+
+        assert response is not None
+        assert response["ok"] is True
+        assert response["result"]["pong"] is True
+        assert thread.is_alive()
+    finally:
+        server.close()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
 
 
 def test_daemon_command_submit_uses_existing_receipt_idempotency(
