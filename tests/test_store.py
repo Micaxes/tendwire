@@ -1745,3 +1745,85 @@ def test_store_command_receipt_reservation_allows_one_concurrent_mutation(tmp_pa
     with sqlite3.connect(str(db_path)) as conn:
         count = conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0]
     assert count == 1
+
+
+def test_distinct_source_turns_mint_distinct_public_turn_ids(tmp_path: Path) -> None:
+    db_path = tmp_path / "source-turns.db"
+    config = Config(host_id="turn-host", db_path=db_path)
+    snapshot = project_from_raw(
+        config,
+        workers=[{"id": "worker-1", "name": "claude", "status": "active", "space_id": "space-1"}],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+
+    for index, (prompt, reply) in enumerate(
+        [("first question", "first answer"), ("second question", "second answer")],
+        start=1,
+    ):
+        merge_turn_content(
+            db_path,
+            "turn-host",
+            "worker-1",
+            {
+                "user_text": prompt,
+                "assistant_final_text": reply,
+                "complete": True,
+                "has_open_turn": False,
+                "source_turn_id": f"uuid-{index}",
+            },
+            observed_at=f"2026-01-01T00:0{index}:00+00:00",
+        )
+
+    payload = turns_payload_from_store(db_path, "turn-host", snapshot=snapshot)
+    content_turns = [t for t in payload["turns"] if t.get("assistant_final_text")]
+    assert len(content_turns) == 2
+    assert len({t["id"] for t in content_turns}) == 2
+    # Newest first per worker; the worker's base row must not carry stale text.
+    assert content_turns[0]["assistant_final_text"] == "second answer"
+    base_rows = [t for t in payload["turns"] if not t.get("source_turn_id")]
+    assert all(not t.get("assistant_final_text") and not t.get("user_text") for t in base_rows)
+
+    # Same source turn observed again updates its row, keeping the id stable.
+    merge_turn_content(
+        db_path,
+        "turn-host",
+        "worker-1",
+        {"assistant_final_text": "second answer, revised", "complete": True, "source_turn_id": "uuid-2"},
+    )
+    payload2 = turns_payload_from_store(db_path, "turn-host", snapshot=snapshot)
+    revised = [t for t in payload2["turns"] if t.get("assistant_final_text") == "second answer, revised"]
+    assert len(revised) == 1
+    assert revised[0]["id"] in {t["id"] for t in content_turns}
+
+    # Snapshot rewrites must not prune per-source-turn rows.
+    save_snapshot(db_path, snapshot)
+    payload3 = turns_payload_from_store(db_path, "turn-host", snapshot=snapshot)
+    assert len([t for t in payload3["turns"] if t.get("source_turn_id")]) == 2
+
+
+def test_source_turn_history_is_capped(tmp_path: Path) -> None:
+    db_path = tmp_path / "source-turn-cap.db"
+    config = Config(host_id="turn-host", db_path=db_path)
+    snapshot = project_from_raw(
+        config,
+        workers=[{"id": "worker-1", "name": "claude", "status": "active", "space_id": "space-1"}],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    for index in range(10):
+        merge_turn_content(
+            db_path,
+            "turn-host",
+            "worker-1",
+            {
+                "assistant_final_text": f"answer {index}",
+                "complete": True,
+                "source_turn_id": f"uuid-{index}",
+            },
+            observed_at=f"2026-01-01T00:{index:02d}:00+00:00",
+        )
+    payload = turns_payload_from_store(db_path, "turn-host", snapshot=snapshot)
+    source_rows = [t for t in payload["turns"] if t.get("source_turn_id")]
+    assert len(source_rows) == 6
+    assert source_rows[0]["assistant_final_text"] == "answer 9"

@@ -66,6 +66,9 @@ def _read_private_turn(config: Config, pane_id: str) -> Mapping[str, Any] | None
     if not isinstance(turn, Mapping) or turn.get("available") is False:
         return None
     content = {key: turn.get(key) for key in _TURN_CONTENT_KEYS if key in turn}
+    source_turn_id = str(turn.get("turn_id") or "").strip()
+    if source_turn_id:
+        content["source_turn_id"] = source_turn_id[:160]
     user_text = content.get("user_text")
     if isinstance(user_text, str) and _is_internal_user_text(user_text):
         return None
@@ -247,6 +250,7 @@ def _read_codex_session_turn(session_id: str) -> Mapping[str, Any] | None:
         "assistant_final_text": final_text,
         "complete": bool(complete_by_turn.get(turn_id)) if has_final else False,
         "has_open_turn": not has_final,
+        "source_turn_id": turn_id[:160],
     }
     if not any(value not in (None, "", False) for value in content.values()):
         return None

@@ -1864,12 +1864,18 @@ def _prune_host_projection(
         conn.execute(f"DELETE FROM {table} WHERE host_id = ?", (str(host_id),))
 
 
-def _turn_payload_has_origin_command(payload_json: Any) -> bool:
+def _turn_payload_is_prune_protected(payload_json: Any) -> bool:
+    """Rows tied to a command or a concrete backend turn outlive snapshot rewrites."""
     try:
         payload = json.loads(str(payload_json or "{}"))
     except json.JSONDecodeError:
         return False
-    return isinstance(payload, Mapping) and bool(str(payload.get("origin_command_id") or "").strip())
+    if not isinstance(payload, Mapping):
+        return False
+    return bool(
+        str(payload.get("origin_command_id") or "").strip()
+        or str(payload.get("source_turn_id") or "").strip()
+    )
 
 
 def _prune_turn_projection(
@@ -1898,7 +1904,7 @@ def _prune_turn_projection(
             (str(host_id),),
         ).fetchall()
     for turn_id, payload_json in rows:
-        if _turn_payload_has_origin_command(payload_json):
+        if _turn_payload_is_prune_protected(payload_json):
             continue
         conn.execute(
             "DELETE FROM turns WHERE host_id = ? AND turn_id = ?",
@@ -3088,7 +3094,24 @@ _TURN_CONTENT_FIELDS = frozenset(
         "assistant_stream_text",
         "complete",
         "has_open_turn",
+        "source_turn_id",
     }
+)
+
+_SOURCE_TURN_HISTORY_LIMIT = 6
+
+_TURN_IDENTITY_SEED_FIELDS = (
+    "schema_version",
+    "host_id",
+    "worker_id",
+    "worker_fingerprint",
+    "space_id",
+    "status",
+    "kind",
+    "source",
+    "origin_command_id",
+    "title",
+    "summary",
 )
 
 
@@ -3168,43 +3191,148 @@ def merge_turn_content(
             if not isinstance(payload, dict):
                 payload = {}
             decoded_rows.append((turn_id, payload))
-        turn_id, payload = max(
+        incoming_source_turn = str(clean_content.get("source_turn_id") or "").strip()
+        exact_source_rows = [
+            (row_turn_id, row_payload)
+            for row_turn_id, row_payload in decoded_rows
+            if incoming_source_turn
+            and str(row_payload.get("source_turn_id") or "").strip() == incoming_source_turn
+        ]
+        base_turn_id, base_payload = max(
             decoded_rows,
             key=lambda row: _turn_merge_score(row[1], clean_content),
         )
         conn.execute("BEGIN IMMEDIATE")
         try:
-            payload.update(clean_content)
-            turn = Turn.from_dict(payload)
-            item = turn.to_dict()
-            conn.execute(
-                """
-                UPDATE turns
-                SET status = ?,
-                    kind = ?,
-                    updated_at = ?,
-                    fingerprint = ?,
-                    observed_at = ?,
-                    payload_json = ?
-                WHERE host_id = ? AND turn_id = ?
-                """,
-                (
-                    str(item.get("status") or "unknown"),
-                    str(item.get("kind") or "unknown"),
-                    item.get("updated_at") or current_time,
-                    str(item.get("fingerprint") or ""),
-                    current_time,
-                    _canonical_json(item),
-                    str(host_id),
-                    str(turn_id),
-                ),
-            )
-            updated += 1
+            if exact_source_rows:
+                # Same backend turn observed again: update its dedicated row.
+                turn_id, payload = exact_source_rows[0]
+                payload.update(clean_content)
+                _update_turn_row(conn, host_id, turn_id, payload, current_time)
+                updated += 1
+            elif incoming_source_turn:
+                # A new backend turn: mint a dedicated row with its own public
+                # identity instead of overwriting the worker's evolving row —
+                # otherwise every conversation turn shares one public turn id
+                # and downstream deliveries silently edit one old message.
+                seed = {
+                    key: base_payload.get(key)
+                    for key in _TURN_IDENTITY_SEED_FIELDS
+                    if base_payload.get(key) is not None
+                }
+                seed.update(clean_content)
+                item = Turn.from_dict(seed).to_dict()
+                conn.execute(
+                    """
+                    INSERT INTO turns (
+                        host_id, turn_id, worker_id, worker_fingerprint, space_id,
+                        status, kind, updated_at, fingerprint,
+                        snapshot_content_fingerprint, observed_at, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(host_id, turn_id) DO UPDATE SET
+                        status = excluded.status,
+                        kind = excluded.kind,
+                        updated_at = excluded.updated_at,
+                        fingerprint = excluded.fingerprint,
+                        observed_at = excluded.observed_at,
+                        payload_json = excluded.payload_json
+                    """,
+                    (
+                        str(host_id),
+                        str(item.get("id") or "unknown"),
+                        str(item.get("worker_id") or worker_id),
+                        item.get("worker_fingerprint"),
+                        item.get("space_id"),
+                        str(item.get("status") or "unknown"),
+                        str(item.get("kind") or "unknown"),
+                        current_time,
+                        str(item.get("fingerprint") or ""),
+                        "",
+                        current_time,
+                        _canonical_json(item),
+                    ),
+                )
+                if not str(base_payload.get("source_turn_id") or "").strip():
+                    # The worker's evolving row donated its (now superseded)
+                    # text to per-turn rows; clear it so stale content cannot
+                    # resurface as a deliverable turn.
+                    base_changed = False
+                    for key in ("user_text", "assistant_final_text", "assistant_stream_text"):
+                        if base_payload.get(key):
+                            base_payload[key] = None
+                            base_changed = True
+                    if base_changed:
+                        _update_turn_row(conn, host_id, base_turn_id, base_payload, current_time)
+                _prune_source_turn_history(conn, host_id, worker_id)
+                updated += 1
+            else:
+                turn_id, payload = base_turn_id, base_payload
+                payload.update(clean_content)
+                _update_turn_row(conn, host_id, turn_id, payload, current_time)
+                updated += 1
             conn.commit()
         except Exception:
             conn.rollback()
             raise
     return updated
+
+
+def _update_turn_row(
+    conn: sqlite3.Connection,
+    host_id: str,
+    turn_id: Any,
+    payload: dict[str, Any],
+    current_time: str,
+) -> None:
+    item = Turn.from_dict(payload).to_dict()
+    conn.execute(
+        """
+        UPDATE turns
+        SET status = ?,
+            kind = ?,
+            updated_at = ?,
+            fingerprint = ?,
+            observed_at = ?,
+            payload_json = ?
+        WHERE host_id = ? AND turn_id = ?
+        """,
+        (
+            str(item.get("status") or "unknown"),
+            str(item.get("kind") or "unknown"),
+            item.get("updated_at") or current_time,
+            str(item.get("fingerprint") or ""),
+            current_time,
+            _canonical_json(item),
+            str(host_id),
+            str(turn_id),
+        ),
+    )
+
+
+def _prune_source_turn_history(conn: sqlite3.Connection, host_id: str, worker_id: str) -> None:
+    rows = conn.execute(
+        """
+        SELECT turn_id, payload_json
+        FROM turns
+        WHERE host_id = ? AND worker_id = ?
+        ORDER BY COALESCE(updated_at, observed_at, '') DESC
+        """,
+        (str(host_id), str(worker_id)),
+    ).fetchall()
+    kept = 0
+    for turn_id, payload_json in rows:
+        try:
+            payload = json.loads(str(payload_json or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, Mapping) or not str(payload.get("source_turn_id") or "").strip():
+            continue
+        kept += 1
+        if kept > _SOURCE_TURN_HISTORY_LIMIT:
+            conn.execute(
+                "DELETE FROM turns WHERE host_id = ? AND turn_id = ?",
+                (str(host_id), str(turn_id)),
+            )
 
 
 def upsert_command_pending_turn(

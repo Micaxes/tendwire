@@ -441,6 +441,7 @@ class Turn:
     updated_at: str | None = None
     completed_at: str | None = None
     origin_command_id: str | None = None
+    source_turn_id: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
     id: str = ""
     fingerprint: str = ""
@@ -466,6 +467,7 @@ class Turn:
         updated_at = _optional_timestamp(self.updated_at)
         completed_at = _optional_timestamp(self.completed_at)
         origin_command_id = _optional_public_text(self.origin_command_id)
+        source_turn_id = _optional_public_text(self.source_turn_id)
         meta = _clean_meta(self.meta)
         identity_payload = {
             "schema_version": TURN_SCHEMA_VERSION,
@@ -476,6 +478,10 @@ class Turn:
             "source": source,
             "origin_command_id": origin_command_id,
         }
+        if source_turn_id:
+            # Distinct backend turns must mint distinct public turn ids;
+            # omitted for legacy rows so their identities stay stable.
+            identity_payload["source_turn_id"] = source_turn_id
         content_payload = {
             **identity_payload,
             "worker_fingerprint": worker_fingerprint,
@@ -512,6 +518,7 @@ class Turn:
         object.__setattr__(self, "completed_at", completed_at)
         object.__setattr__(self, "source", source)
         object.__setattr__(self, "origin_command_id", origin_command_id)
+        object.__setattr__(self, "source_turn_id", source_turn_id)
         object.__setattr__(self, "fingerprint", fingerprint)
         object.__setattr__(self, "meta", meta)
 
@@ -537,6 +544,7 @@ class Turn:
             "completed_at": self.completed_at,
             "source": self.source,
             "origin_command_id": self.origin_command_id,
+            "source_turn_id": self.source_turn_id,
             "fingerprint": self.fingerprint,
             "meta": _clean_meta(self.meta),
         }
@@ -569,6 +577,7 @@ class Turn:
             completed_at=clean.get("completed_at"),
             source=clean.get("source", "snapshot"),
             origin_command_id=clean.get("origin_command_id"),
+            source_turn_id=clean.get("source_turn_id"),
             fingerprint=_string_value(clean.get("fingerprint")),
             meta=clean.get("meta", {}),
         )
