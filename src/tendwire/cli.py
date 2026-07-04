@@ -432,7 +432,10 @@ def observe_public_snapshot(
     store_snapshot: bool = False,
 ) -> Any:
     """Build the public snapshot through the existing one-shot observation path."""
-    stored_bindings = _load_worker_bindings(config) if store_snapshot else []
+    # Always seed observation with stored bindings: they are what keeps public
+    # worker ids stable across snapshots. Skipping them re-letters duplicate
+    # worker names (claude, claude-1, ...) from scratch on every observation.
+    stored_bindings = _load_worker_bindings(config)
     spaces, workers, bindings, backend_health = _fetch_snapshot_observation_with_bindings(
         config,
         stored_bindings,
