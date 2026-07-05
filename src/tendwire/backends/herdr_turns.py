@@ -18,6 +18,7 @@ _TURN_CONTENT_KEYS = (
     "user_text",
     "assistant_final_text",
     "assistant_stream_text",
+    "model",
     "complete",
     "has_open_turn",
 )

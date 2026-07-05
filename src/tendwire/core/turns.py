@@ -435,6 +435,7 @@ class Turn:
     user_text: str | None = None
     assistant_final_text: str | None = None
     assistant_stream_text: str | None = None
+    model: str | None = None
     complete: bool | None = None
     has_open_turn: bool | None = None
     started_at: str | None = None
@@ -463,6 +464,7 @@ class Turn:
             self.assistant_stream_text,
             max_chars=TURN_STREAM_TEXT_MAX_CHARS,
         )
+        model = _optional_public_text(self.model)
         started_at = _optional_timestamp(self.started_at)
         updated_at = _optional_timestamp(self.updated_at)
         completed_at = _optional_timestamp(self.completed_at)
@@ -491,6 +493,7 @@ class Turn:
             "user_text": user_text,
             "assistant_final_text": assistant_final_text,
             "assistant_stream_text": assistant_stream_text,
+            "model": model,
             "complete": self.complete if isinstance(self.complete, bool) else None,
             "has_open_turn": self.has_open_turn if isinstance(self.has_open_turn, bool) else None,
             "meta": meta,
@@ -511,6 +514,7 @@ class Turn:
         object.__setattr__(self, "user_text", user_text)
         object.__setattr__(self, "assistant_final_text", assistant_final_text)
         object.__setattr__(self, "assistant_stream_text", assistant_stream_text)
+        object.__setattr__(self, "model", model)
         object.__setattr__(self, "complete", self.complete if isinstance(self.complete, bool) else None)
         object.__setattr__(self, "has_open_turn", self.has_open_turn if isinstance(self.has_open_turn, bool) else None)
         object.__setattr__(self, "started_at", started_at)
@@ -537,6 +541,7 @@ class Turn:
             "user_text": self.user_text,
             "assistant_final_text": self.assistant_final_text,
             "assistant_stream_text": self.assistant_stream_text,
+            "model": self.model,
             "complete": self.complete,
             "has_open_turn": self.has_open_turn,
             "started_at": self.started_at,
@@ -570,6 +575,7 @@ class Turn:
             user_text=clean.get("user_text"),
             assistant_final_text=clean.get("assistant_final_text"),
             assistant_stream_text=clean.get("assistant_stream_text"),
+            model=clean.get("model"),
             complete=clean.get("complete") if isinstance(clean.get("complete"), bool) else None,
             has_open_turn=clean.get("has_open_turn") if isinstance(clean.get("has_open_turn"), bool) else None,
             started_at=clean.get("started_at"),

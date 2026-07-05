@@ -642,12 +642,16 @@ class HerdrEventBackend:
 
     def _records_from_reconcile_payloads(self, agent_payload: Any, pane_payload: Any) -> list[Any]:
         records_by_identity: OrderedDict[str, Any] = OrderedDict()
-        for item in _payload_items(agent_payload, _AGENT_PAYLOAD_KEYS):
-            record = _worker_record_from_item(item, self.config)
-            records_by_identity.setdefault(record.private_fingerprint, record)
+        # Pane-shaped items first: PaneInfo carries display metadata (e.g. the user's pane `label`)
+        # that AgentInfo lacks, and both shapes share the same private fingerprint, so whichever is
+        # ingested first wins the setdefault. Identity/name resolution is unaffected (worker ids key
+        # off binding fingerprints, and both shapes carry the same `agent`).
         for item in _payload_items(pane_payload, _PANE_PAYLOAD_KEYS):
             if not _pane_has_agent(item):
                 continue
+            record = _worker_record_from_item(item, self.config)
+            records_by_identity.setdefault(record.private_fingerprint, record)
+        for item in _payload_items(agent_payload, _AGENT_PAYLOAD_KEYS):
             record = _worker_record_from_item(item, self.config)
             records_by_identity.setdefault(record.private_fingerprint, record)
         return list(records_by_identity.values())

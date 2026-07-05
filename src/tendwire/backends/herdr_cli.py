@@ -925,7 +925,6 @@ def _worker_from_item(item: Mapping[str, Any]) -> Worker:
             "slug",
             "name",
             "title",
-            "label",
             "agent",
             "meta",
             "space_id",
