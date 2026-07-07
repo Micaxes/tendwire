@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -258,6 +259,75 @@ def _public_turn_text(value: Any, *, max_chars: int = TURN_TEXT_MAX_CHARS) -> st
     if len(text) > max_chars:
         text = text[: max(0, max_chars - 14)].rstrip() + "\n[truncated]"
     return text or None
+
+
+# Bare private patterns (no field-name label) that must never reach public JSON when ingesting
+# free agent-authored prompt text: filesystem/socket paths, pseudo pane/terminal ids, network
+# endpoints, PII, and distinctive secret-token shapes. `_PRIVATE_TEXT_LABEL_RE` only catches
+# "<label>: value" forms; these catch the value on its own. This is a best-effort scrub of the
+# realistic, distinctive cases (same grade as user_text/assistant_final_text turn text): shapeless
+# high-entropy blobs (generic long hex / base64) are NOT matched, because doing so would redact
+# legitimate content (git SHAs, encoded data) — see redact_private_prompt_text docstring.
+_PRIVATE_PROMPT_PATTERNS_RE = re.compile(
+    r"(?<![\w/])/(?:[\w.-]+)(?:/[\w.-]*)+"       # absolute posix path: /home/x/y, /run/.../sock
+    r"|(?<![\w/])/(?:etc|root|home|var|opt|srv|usr|tmp|run|proc|sys|mnt|media|boot|dev|private)\b"  # single-segment sensitive root
+    r"|~/[\w./-]+"                                # home-relative: ~/.ssh/id_rsa
+    r"|\b(?:home|Users|root)/[\w.-]+/[\w./-]+"    # home path w/o leading slash: home/alice/.ssh/id_rsa
+    r"|\b[A-Za-z]:\\[^\s\"']+"                    # windows path: C:\Users\x
+    r"|\\\\[^\s\"']+"                             # UNC path: \\server\share
+    r"|\bw[0-9a-z]+:[a-z][0-9a-z]*\b"           # pseudo pane/terminal/tab id: w4V:p1, w1:t6
+    r"|\bterm_[0-9a-f]+\b"                        # terminal id: term_655ad3e5205705
+    r"|\bsk-[A-Za-z0-9_-]{6,}\b"                # sk- api secret
+    r"|\bgh[oprsu]_[A-Za-z0-9]{6,}\b"           # github tokens (ghp_/gho_/ghr_/ghs_/ghu_)
+    r"|\bxox[baprs]-[A-Za-z0-9-]{6,}\b"          # slack token
+    r"|\bAKIA[0-9A-Z]{12,}\b"                    # aws access key
+    r"|\bAIza[0-9A-Za-z_-]{10,}\b"              # google api key
+    r"|\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"  # JWT (header.payload.sig)
+    r"|\b\d{6,}:[A-Za-z0-9_-]{20,}\b"           # telegram bot token
+    r"|\b[Bb]earer\s+[A-Za-z0-9._-]{10,}"       # bearer token
+    r"|\b[\w.+-]+@[\w-]+\.[\w][\w.-]*\b"        # email / PII
+    r"|\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b"  # IPv4(:port)
+    r"|\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b"   # IPv6 full 8-group form
+    r"|\b[0-9a-f]{0,4}(?::[0-9a-f]{0,4}){1,}::[0-9a-f:]*\b",  # IPv6 compressed :: form
+    re.IGNORECASE,
+)
+
+# Zero-width / bidi / format characters used to obfuscate secrets across a match boundary.
+_ZERO_WIDTH_RE = re.compile("[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
+
+
+def redact_private_prompt_text(value: Any, *, max_chars: int = TURN_TEXT_MAX_CHARS) -> str:
+    """Best-effort redaction for free agent-authored prompt text (pending question / choice label),
+    the same content class as turn user_text/assistant_final_text. Normalizes unicode (NFKC +
+    zero-width strip, defeating fullwidth/zero-width obfuscation), then redacts labelled secrets and
+    distinctive bare private patterns (paths, pane/terminal ids, network endpoints, PII, prefixed
+    tokens, JWTs). Returns a cleaned single-spaced string (never None).
+
+    NOT a guarantee: shapeless high-entropy secrets (generic long hex, base64 blobs) cannot be
+    scrubbed from arbitrary free text without redacting legitimate content, so — exactly as the
+    contract already treats turn text — they remain the caller's responsibility."""
+    text = _string_value(value).replace("\x00", "").strip()
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    text = _ZERO_WIDTH_RE.sub("", text)
+    text = _PRIVATE_TEXT_LABEL_RE.sub("[redacted]", text)
+    text = _PRIVATE_PROMPT_PATTERNS_RE.sub("[redacted]", text)
+    text = " ".join(text.split())
+    return text[:max_chars]
+
+
+def recompute_pending_content_fingerprint(payload: Mapping[str, Any]) -> str:
+    """Recompute a pending payload's content_fingerprint after its pending_interactions list
+    is rewritten (e.g. the daemon backend overlay), matching pending_payload_from_snapshot."""
+    return _content_fingerprint(
+        {
+            "schema_version": payload.get("schema_version", TURN_SCHEMA_VERSION),
+            "host_id": payload.get("host_id"),
+            "pending_interactions": payload.get("pending_interactions", []),
+            "backend_health": payload.get("backend_health", []),
+        }
+    )
 
 
 def _automation_text(value: Any) -> str:
