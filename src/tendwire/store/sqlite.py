@@ -3198,7 +3198,10 @@ def merge_backend_pending(
 ) -> bool:
     """Presence-sync one worker's backend-provided pending prompt (a REAL pane prompt with choices,
     read through the turn adapter). `pending=None` prunes the row (the prompt was answered)."""
+    if not Path(db_path).exists():
+        return False
     with _connect(db_path) as conn:
+        _ensure_schema(conn)
         if pending is None:
             cur = conn.execute(
                 "DELETE FROM backend_pending WHERE host_id = ? AND worker_id = ?",
@@ -3224,21 +3227,47 @@ def merge_backend_pending(
 
 def list_backend_pending(db_path: Path | str, host_id: str) -> dict[str, dict[str, Any]]:
     """worker_id -> normalized pending dict for every live backend-provided prompt."""
-    import json as _json
-
     out: dict[str, dict[str, Any]] = {}
+    if not Path(db_path).exists():
+        return out
     with _connect(db_path) as conn:
+        _ensure_schema(conn)
         for worker_id, payload_json in conn.execute(
             "SELECT worker_id, payload_json FROM backend_pending WHERE host_id = ?",
             (host_id,),
-        ):
+        ).fetchall():
             try:
-                payload = _json.loads(payload_json)
+                payload = json.loads(payload_json)
             except (TypeError, ValueError):
                 continue
             if isinstance(payload, dict):
                 out[str(worker_id)] = payload
     return out
+
+
+def prune_backend_pending(db_path: Path | str, host_id: str, live_worker_ids: Iterable[str]) -> int:
+    """Delete backend_pending rows whose worker no longer has a live binding. Presence-sync only
+    prunes workers still being polled; this reaps rows orphaned when a worker/pane disappears with
+    a prompt still open (otherwise get_pending would surface a phantom prompt for a dead worker)."""
+    if not Path(db_path).exists():
+        return 0
+    live = {str(worker_id) for worker_id in live_worker_ids}
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        stored = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT worker_id FROM backend_pending WHERE host_id = ?",
+                (host_id,),
+            ).fetchall()
+        ]
+        stale = [worker_id for worker_id in stored if worker_id not in live]
+        for worker_id in stale:
+            conn.execute(
+                "DELETE FROM backend_pending WHERE host_id = ? AND worker_id = ?",
+                (host_id, worker_id),
+            )
+        return len(stale)
 
 
 def merge_turn_content(

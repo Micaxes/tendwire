@@ -247,7 +247,11 @@ class TendwireDaemon:
         """pending.list: snapshot-derived (attention) pendings, with backend-provided REAL prompts
         (question + choices captured through the turn adapter) superseding a worker's synthetic row."""
         snapshot = self.get_snapshot()
-        from .core.turns import PendingInteraction, pending_payload_from_snapshot
+        from .core.turns import (
+            PendingInteraction,
+            pending_payload_from_snapshot,
+            recompute_pending_content_fingerprint,
+        )
 
         payload = dict(pending_payload_from_snapshot(snapshot))
         if self.config.db_path is None:
@@ -258,7 +262,9 @@ class TendwireDaemon:
         if not backend:
             return payload
         workers = {worker.id: worker for worker in snapshot.workers}
-        rows = [row for row in payload.get("pending_interactions", []) if row.get("worker_id") not in backend]
+        # Build backend interactions first; only a worker whose interaction builds successfully
+        # supersedes its synthetic row (atomic per worker — a build failure never drops both).
+        built: dict[str, dict[str, Any]] = {}
         for worker_id, pending in sorted(backend.items()):
             worker = workers.get(worker_id)
             try:
@@ -277,8 +283,12 @@ class TendwireDaemon:
                 )
             except Exception:
                 continue
-            rows.append(interaction.to_dict())
+            built[worker_id] = interaction.to_dict()
+        rows = [row for row in payload.get("pending_interactions", []) if row.get("worker_id") not in built]
+        rows.extend(built.values())
         payload["pending_interactions"] = rows
+        # The wrapper change-token must reflect the overlaid list, not the pre-overlay snapshot one.
+        payload["content_fingerprint"] = recompute_pending_content_fingerprint(payload)
         return payload
 
     def get_turns(self) -> Mapping[str, Any]:

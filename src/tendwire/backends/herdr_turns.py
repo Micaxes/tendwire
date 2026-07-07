@@ -14,8 +14,13 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Config
-from ..core.turns import is_internal_automation_turn_payload
-from ..store.sqlite import list_worker_bindings, merge_backend_pending, merge_turn_content
+from ..core.turns import is_internal_automation_turn_payload, redact_private_prompt_text
+from ..store.sqlite import (
+    list_worker_bindings,
+    merge_backend_pending,
+    merge_turn_content,
+    prune_backend_pending,
+)
 
 
 _TURN_CONTENT_KEYS = (
@@ -102,17 +107,22 @@ def _backend_pending_from_turn(turn: Mapping[str, Any]) -> dict[str, Any] | None
         for option in options[:_PENDING_MAX_CHOICES]:
             if not isinstance(option, Mapping):
                 continue
-            label = str(option.get("label") or "").strip()[:_PENDING_TEXT_MAX]
+            # Agent-authored text (prompt/label) is free-form and can carry private paths, pane
+            # ids, or secrets; redact it to turn-text grade BEFORE it enters the store, matching how
+            # the contract handles user_text/assistant_final_text (best-effort for exotic secret
+            # shapes). The machine-send payload (send_text) is NOT published: it is the highest-risk
+            # field (verbatim strings the agent would send) and no public consumer needs it — the
+            # herdres number-reply flow sends the chosen digit, not this value.
+            label = redact_private_prompt_text(option.get("label"), max_chars=_PENDING_TEXT_MAX)
             if not label:
                 continue
             choices.append(
                 {
                     "choice_id": str(option.get("id") or "")[:80] or label[:80],
                     "label": label,
-                    "value": str(option.get("send_text") or "")[:_PENDING_TEXT_MAX],
                 }
             )
-        question = str(decision.get("prompt") or "").strip()[:_PENDING_TEXT_MAX]
+        question = redact_private_prompt_text(decision.get("prompt"), max_chars=_PENDING_TEXT_MAX)
         if not question and not choices:
             return None
         option_ids = {str(option.get("id") or "") for option in options if isinstance(option, Mapping)}
@@ -121,24 +131,24 @@ def _backend_pending_from_turn(turn: Mapping[str, Any]) -> dict[str, Any] | None
             "question": question or "Input needed",
             "kind": kind,
             "choices": choices,
-            "meta": {
-                "source": "backend",
-                "decision_id": str(decision.get("decision_id") or "")[:160],
-            },
+            # decision_id (internal tool_use_id) is not published; no public consumer needs it.
+            "meta": {"source": "backend"},
         }
     interaction = turn.get("pending_interaction")
     if isinstance(interaction, Mapping):
         questions = interaction.get("questions") if isinstance(interaction.get("questions"), list) else []
         parts = []
         for q in questions[:4]:
-            if isinstance(q, Mapping) and str(q.get("question") or "").strip():
-                parts.append(str(q.get("question")).strip())
+            if isinstance(q, Mapping):
+                part = redact_private_prompt_text(q.get("question"))
+                if part:
+                    parts.append(part)
         question = " / ".join(parts)[:_PENDING_TEXT_MAX] or "Input needed (multi-question form)"
         return {
             "question": question,
             "kind": "review",
             "choices": [],  # multi-question forms stay read-only (never key-driven)
-            "meta": {"source": "backend", "decision_id": str(interaction.get("decision_id") or "")[:160]},
+            "meta": {"source": "backend"},
         }
     return None
 
@@ -799,7 +809,11 @@ def refresh_structured_turn_content(config: Config) -> dict[str, Any]:
             if binding.turn_target_kind == _PANE_TURN_KIND:
                 # Presence-based: a successful pane read either carries the live pending prompt
                 # (upsert) or it doesn't (the prompt was answered/dismissed -> prune the row).
-                merge_backend_pending(config.db_path, config.host_id, binding.worker_id, pending)
+                try:
+                    merge_backend_pending(config.db_path, config.host_id, binding.worker_id, pending)
+                except Exception:
+                    # A pending-sync failure must not abort the whole refresh cycle.
+                    pass
             if content is None:
                 continue
             updated += merge_turn_content(
@@ -808,4 +822,15 @@ def refresh_structured_turn_content(config: Config) -> dict[str, Any]:
                 binding.worker_id,
                 content,
             )
+    # Reap backend_pending rows for workers that no longer have a live binding (pane closed /
+    # worker gone): presence-sync above only prunes workers still being polled, so a prompt open
+    # at the moment a worker disappears would otherwise linger in pending.list forever.
+    try:
+        prune_backend_pending(
+            config.db_path,
+            config.host_id,
+            {binding.worker_id for binding in bindings},
+        )
+    except Exception:
+        pass
     return {"ok": True, "status": "ok", "updated": updated, "attempted": len(turn_bindings)}
