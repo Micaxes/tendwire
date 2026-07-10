@@ -1239,6 +1239,46 @@ def test_reconcile_retains_authenticated_snapshot_until_installation_key_recover
 
     assert recovered.backend_health[0].status == "healthy"
     assert recovered.workers[0].meta["stable_key"] == stable_key
+    recovered_bindings = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+
+    unmatched = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "wR9", "name": "Build"}],
+            panes=[],
+            agents=[
+                {
+                    "worker_id": "public-worker",
+                    "agent_id": "agent-secret",
+                    "workspace_id": "wR9",
+                    "pane_id": "wR9:pA",
+                    "terminal_id": "terminal-secret",
+                    "agent": "codex",
+                    "status": "running",
+                }
+            ],
+        )
+    )
+
+    assert unmatched.workers == recovered.workers
+    assert unmatched.spaces == recovered.spaces
+    assert unmatched.backend_health[0].status == "degraded"
+    assert unmatched.backend_health[0].outcome == "continuity_unavailable"
+    assert (
+        list_worker_bindings(
+            backend.db_path,
+            backend.config.host_id,
+            backend="herdr",
+        )
+        == recovered_bindings
+    )
+
+    recovered_again = backend.reconcile_once(client=client)
+    assert recovered_again.backend_health[0].status == "healthy"
+    assert recovered_again.workers[0].meta["stable_key"] == stable_key
 
 
 def test_incomplete_pane_event_does_not_clear_continuity_failure(

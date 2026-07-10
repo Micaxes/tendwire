@@ -375,6 +375,13 @@ snapshot/projections instead of publishing a truncated authoritative snapshot.
 Incremental events that would add workers over the cap are ignored with the
 same public-safe degraded evidence.
 
+An active `agent.list` row must resolve to one authoritative `pane.list` owner
+before a healthy source snapshot can replace authenticated worker continuity.
+If both probes succeed but that match is missing, Tendwire reports
+`continuity_unavailable` and retains the previous authenticated snapshot and
+bindings. This treats cross-probe lifecycle skew as non-authoritative without
+turning it into a permanent connector quarantine.
+
 `health.get` remains schema-version 1 and now includes public-safe operational
 fields: daemon status and `started_at`; store status/counts and outbox counts;
 snapshot and last event/snapshot/reconcile timestamps when available; backend

@@ -42,6 +42,7 @@ from ..store.sqlite import (
     upsert_worker_bindings,
 )
 from .herdr_cli import (
+    HerdrContinuityUnavailableError,
     _pane_has_agent,
     _payload_items,
     _spaces_from_payload,
@@ -818,7 +819,7 @@ class HerdrEventBackend:
                     message=health.message,
                 )
                 return snapshot
-        except InstallationKeyError:
+        except (HerdrContinuityUnavailableError, InstallationKeyError):
             snapshot = self._mark_unhealthy("continuity_unavailable")
             with self._lock:
                 self._last_reconcile_at = snapshot.updated_at
@@ -941,7 +942,7 @@ class HerdrEventBackend:
                     changed = self._apply_event(event) or changed
                 if changed:
                     self._persist_current_state()
-        except InstallationKeyError:
+        except (HerdrContinuityUnavailableError, InstallationKeyError):
             self._mark_unhealthy("continuity_unavailable")
         finally:
             with self._lock:
@@ -1078,7 +1079,7 @@ class HerdrEventBackend:
                 stored_bindings=self._current_bindings(),
                 require_authenticated_continuity=True,
             )
-        except InstallationKeyError:
+        except (HerdrContinuityUnavailableError, InstallationKeyError):
             raise
         except Exception:
             return None, None, self._match_binding(item)

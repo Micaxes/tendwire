@@ -883,12 +883,65 @@ def test_fetch_herdr_command_observation_reports_healthy_empty(monkeypatch) -> N
     assert observation.backend_health[0].counts == {"spaces": 0, "workers": 0}
 
 
-def test_fetch_herdr_snapshot_observation_reports_healthy_non_empty(monkeypatch) -> None:
+def test_fetch_herdr_command_observation_degrades_unmatched_agent(monkeypatch) -> None:
     config = Config(host_id="testhost", herdr_bin="herdr")
     responses = {
-        ("workspace", "list"): {"result": {"workspaces": [{"workspace_id": "ws-1", "label": "Build"}]}},
-        ("agent", "list"): {"result": {"agents": [{"worker_id": "w-1", "agent_id": "agent-1", "agent": "Coder"}]}},
+        ("workspace", "list"): {
+            "result": {"workspaces": [{"workspace_id": "wR9", "label": "Build"}]}
+        },
+        ("agent", "list"): {
+            "result": {
+                "agents": [
+                    {"worker_id": "w-1", "agent_id": "agent-1", "agent": "Coder"}
+                ]
+            }
+        },
         ("pane", "list"): {"result": {"panes": []}},
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(
+        herdr_cli,
+        "_run_herdr",
+        lambda args, cfg: _respond(args, responses),
+    )
+
+    observation = herdr_cli.fetch_herdr_command_observation(config)
+
+    assert observation.healthy is False
+    assert observation.status == "degraded"
+    assert observation.outcome == "continuity_unavailable"
+    assert observation.workers == []
+    assert observation.bindings == []
+
+
+def test_fetch_herdr_snapshot_observation_reports_healthy_non_empty(monkeypatch, tmp_path) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr", data_dir=tmp_path / "state")
+    responses = {
+        ("workspace", "list"): {"result": {"workspaces": [{"workspace_id": "wR9", "label": "Build"}]}},
+        ("agent", "list"): {
+            "result": {
+                "agents": [
+                    {
+                        "worker_id": "w-1",
+                        "agent_id": "agent-1",
+                        "terminal_id": "terminal-1",
+                        "agent": "Coder",
+                    }
+                ]
+            }
+        },
+        ("pane", "list"): {
+            "result": {
+                "panes": [
+                    {
+                        "workspace_id": "wR9",
+                        "pane_id": "wR9:pA",
+                        "terminal_id": "terminal-1",
+                        "agent": "Coder",
+                    }
+                ]
+            }
+        },
     }
     monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
     monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
@@ -896,8 +949,9 @@ def test_fetch_herdr_snapshot_observation_reports_healthy_non_empty(monkeypatch)
     observation = herdr_cli.fetch_herdr_snapshot_observation(config)
     health = observation.backend_health[0]
 
-    assert [space.id for space in observation.spaces] == ["ws-1"]
+    assert [space.id for space in observation.spaces] == ["wR9"]
     assert [worker.id for worker in observation.workers] == ["w-1"]
+    assert observation.workers[0].meta["stable_key"].startswith("wsk1_")
     assert health.to_dict() == {
         "name": "herdr",
         "status": "healthy",
@@ -906,6 +960,37 @@ def test_fetch_herdr_snapshot_observation_reports_healthy_non_empty(monkeypatch)
         "message": "Herdr observation is healthy",
         "counts": {"spaces": 1, "workers": 1},
     }
+
+
+def test_fetch_herdr_snapshot_observation_degrades_unmatched_agent(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list"): {
+            "result": {"workspaces": [{"workspace_id": "wR9", "label": "Build"}]}
+        },
+        ("agent", "list"): {
+            "result": {
+                "agents": [
+                    {"worker_id": "w-1", "agent_id": "agent-1", "agent": "Coder"}
+                ]
+            }
+        },
+        ("pane", "list"): {"result": {"panes": []}},
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(
+        herdr_cli,
+        "_run_herdr",
+        lambda args, cfg: _respond(args, responses),
+    )
+
+    observation = herdr_cli.fetch_herdr_snapshot_observation(config)
+
+    assert [space.id for space in observation.spaces] == ["wR9"]
+    assert observation.workers == []
+    assert observation.bindings == []
+    assert observation.backend_health[0].status == "degraded"
+    assert observation.backend_health[0].outcome == "continuity_unavailable"
 
 
 def test_fetch_herdr_snapshot_observation_reports_healthy_empty(monkeypatch) -> None:
@@ -1056,6 +1141,30 @@ def test_cli_snapshot_retains_authenticated_worker_while_pane_probe_recovers(
 
     assert recovered.backend_health[0].status == "healthy"
     assert recovered.workers[0].meta["stable_key"] == first_worker.meta["stable_key"]
+    recovered_binding = list_worker_bindings(
+        config.db_path,
+        config.host_id,
+        backend="herdr",
+    )
+
+    healthy_panes = responses[("pane", "list")]
+    responses[("pane", "list")] = {"result": {"panes": []}}
+    unmatched = tendwire_cli.observe_public_snapshot(config, store_snapshot=True)
+
+    assert unmatched.workers == first.workers
+    assert unmatched.spaces == first.spaces
+    assert unmatched.backend_health[0].status == "degraded"
+    assert unmatched.backend_health[0].outcome == "continuity_unavailable"
+    assert (
+        list_worker_bindings(config.db_path, config.host_id, backend="herdr")
+        == recovered_binding
+    )
+
+    responses[("pane", "list")] = healthy_panes
+    recovered_again = tendwire_cli.observe_public_snapshot(config, store_snapshot=True)
+
+    assert recovered_again.backend_health[0].status == "healthy"
+    assert recovered_again.workers[0].meta["stable_key"] == first_worker.meta["stable_key"]
 
 
 def test_cli_snapshot_retains_authenticated_worker_while_installation_key_recovers(

@@ -31,6 +31,13 @@ Because derivation is keyed per Tendwire installation, equivalent raw
 identities observed under different installation keys are not linkable by their
 handles.
 
+Successful Herdr list calls are not sufficient authority by themselves. An
+active agent row that has no unique authoritative pane owner makes the
+observation `continuity_unavailable`; Tendwire preserves the last authenticated
+snapshot and bindings until a later reconcile restores the match. Connectors
+therefore never receive a healthy identity-less replacement solely because the
+agent and pane probes observed different lifecycle instants.
+
 The connector outbox is a neutral boundary. It stores public connector jobs and
 public-safe delivery state; concrete Telegram delivery, topic routing, retries,
 and rate limits stay in Herdres or another connector process.

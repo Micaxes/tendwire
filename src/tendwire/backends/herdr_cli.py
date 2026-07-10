@@ -17,7 +17,7 @@ import subprocess
 import time
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..config import Config
@@ -47,6 +47,11 @@ _AMBIGUOUS_BINDING_REASONS = frozenset(
     {"ambiguous_pane_match", "duplicate_backend_target", "not_unique"}
 )
 
+
+class HerdrContinuityUnavailableError(RuntimeError):
+    """A healthy-looking Herdr observation cannot authenticate worker continuity."""
+
+
 @dataclass(frozen=True)
 class _WorkerRecord:
     worker: Worker
@@ -62,6 +67,7 @@ class _WorkerRecord:
     # Continuity is authorized only by a PaneInfo observation, never by
     # workspace/pane-shaped fields reported by agent.list.
     pane_info_observed: bool = False
+    unmatched_agent_observation: bool = False
 
 _FORBIDDEN_CONNECTOR_FIELDS = {
     "telegram",
@@ -1088,10 +1094,13 @@ def _agent_observation_record(
     config: Config | None = None,
 ) -> _WorkerRecord:
     """Record agent.list provenance without authorizing pane continuity."""
-    return _worker_record_from_item(
-        item,
-        config,
-        pane_info_observed=False,
+    return replace(
+        _worker_record_from_item(
+            item,
+            config,
+            pane_info_observed=False,
+        ),
+        unmatched_agent_observation=True,
     )
 
 
@@ -1235,6 +1244,7 @@ def _record_with_worker(record: _WorkerRecord, worker: Worker) -> _WorkerRecord:
         terminal_id=record.terminal_id,
         agent_session_id=record.agent_session_id,
         pane_info_observed=record.pane_info_observed,
+        unmatched_agent_observation=record.unmatched_agent_observation,
     )
 
 
@@ -1402,6 +1412,12 @@ def _workers_and_bindings_from_records(
 ) -> tuple[list[Worker], list[WorkerBinding]]:
     observed_at = utc_timestamp()
     deduplicated = _deduplicated_worker_records(records, stored_bindings)
+    if require_authenticated_continuity and any(
+        record.unmatched_agent_observation for record in deduplicated
+    ):
+        raise HerdrContinuityUnavailableError(
+            "Herdr agent observation has no authoritative pane owner"
+        )
     installation_key = None
     if any(
         _stable_pane_identity(record) is not None
@@ -2130,9 +2146,9 @@ def fetch_herdr_command_observation(
             config,
             records,
             stored_bindings=stored_bindings,
-            require_authenticated_continuity=True,
+            require_authenticated_continuity=pane_outcome == "ok",
         )
-    except InstallationKeyError:
+    except (HerdrContinuityUnavailableError, InstallationKeyError):
         return _degraded_observation(
             "continuity_unavailable",
             _HEALTH_MESSAGES["continuity_unavailable"],
@@ -2176,6 +2192,8 @@ def _state_result(
 def fetch_herdr_snapshot_observation(
     config: Config,
     stored_bindings: Sequence[WorkerBinding] | None = None,
+    *,
+    require_authenticated_continuity: bool = True,
 ) -> HerdrSnapshotObservation:
     """Return Herdr snapshot observations plus public backend health."""
     try:
@@ -2253,9 +2271,11 @@ def fetch_herdr_snapshot_observation(
             config,
             records,
             stored_bindings=stored_bindings,
-            require_authenticated_continuity=True,
+            require_authenticated_continuity=(
+                require_authenticated_continuity and pane_outcome == "ok"
+            ),
         )
-    except InstallationKeyError:
+    except (HerdrContinuityUnavailableError, InstallationKeyError):
         return _snapshot_observation(
             spaces,
             [],
@@ -2297,5 +2317,6 @@ def fetch_herdr_state(
     observation = fetch_herdr_snapshot_observation(
         config,
         stored_bindings=stored_bindings,
+        require_authenticated_continuity=False,
     )
     return _state_result(observation.spaces, observation.workers, observation.bindings, include_bindings)
