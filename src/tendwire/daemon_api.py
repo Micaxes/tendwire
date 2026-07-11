@@ -47,6 +47,7 @@ from .local_state import (
 
 API_SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 1024 * 1024
+MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_PUBLIC_REQUEST_ID_CHARS = 128
 _SOCKET_STARTUP_LOCK_TIMEOUT_SECONDS = 1.0
 _SOCKET_STARTUP_LOCK_RETRY_SECONDS = 0.01
@@ -135,8 +136,10 @@ REQUIRED_METHODS = frozenset(
         "snapshot.get",
         "attention.list",
         "turn.list",
+        "turn.content.get",
         "pending.list",
         "command.submit",
+        "connector.prepare",
         "connector.poll",
         "connector.ack",
         "connector.fail",
@@ -279,7 +282,8 @@ class TendwireDaemonAPI:
         get_health: Callable[[], Mapping[str, Any]],
         submit_command: Callable[[Mapping[str, Any]], Mapping[str, Any] | CommandEnvelope],
         get_attention: Callable[[], Mapping[str, Any]] | None = None,
-        get_turns: Callable[[], Mapping[str, Any]] | None = None,
+        get_turns: Callable[..., Mapping[str, Any]] | None = None,
+        get_turn_content: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
         get_pending: Callable[[], Mapping[str, Any]] | None = None,
         connector_call: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None,
     ) -> None:
@@ -288,6 +292,7 @@ class TendwireDaemonAPI:
         self._submit_command = submit_command
         self._get_attention = get_attention
         self._get_turns = get_turns
+        self._get_turn_content = get_turn_content
         self._get_pending = get_pending
         self._connector_call = connector_call
 
@@ -347,9 +352,117 @@ class TendwireDaemonAPI:
                     return success_response(self._get_attention(), request_id=request_id)
                 return success_response(attention_payload_from_snapshot(self._get_snapshot()), request_id=request_id)
             if method == "turn.list":
+                unknown_params = sorted(str(key) for key in params if str(key) != "schema_version")
+                if unknown_params:
+                    return error_response(
+                        "invalid_params",
+                        "turn.list contains unknown parameters",
+                        details={"field_count": len(unknown_params)},
+                        request_id=request_id,
+                    )
+                schema_version = params.get("schema_version", 1)
+                if schema_version not in {1, 2} or isinstance(schema_version, bool):
+                    return error_response(
+                        "unsupported_schema",
+                        "unsupported turn list schema version",
+                        details={"supported_turn_schema_versions": [1, 2]},
+                        request_id=request_id,
+                    )
                 if self._get_turns is not None:
-                    return success_response(self._get_turns(), request_id=request_id)
-                return success_response(turns_payload_from_snapshot(self._get_snapshot()), request_id=request_id)
+                    turn_result = dict(self._get_turns(schema_version=schema_version))
+                else:
+                    snapshot = self._get_snapshot()
+                    if schema_version == 1:
+                        try:
+                            turn_result = turns_payload_from_snapshot(snapshot)
+                        except ValueError as exc:
+                            if str(exc) != "upgrade_required":
+                                raise
+                            turn_result = {
+                                "schema_version": 1,
+                                "ok": False,
+                                "status": "upgrade_required",
+                                "required_turn_schema_version": 2,
+                            }
+                    else:
+                        turn_result = turns_payload_from_snapshot(snapshot, schema_version=2)
+                response = success_response(turn_result, request_id=request_id)
+                _restore_turn_list_text(response, turn_result)
+                return response
+            if method == "turn.content.get":
+                allowed_content_params = {
+                    "schema_version",
+                    "turn_id",
+                    "content_revision",
+                    "field",
+                    "cursor",
+                }
+                unknown_content_params = sorted(
+                    str(key) for key in params if str(key) not in allowed_content_params
+                )
+                if unknown_content_params:
+                    return error_response(
+                        "invalid_params",
+                        "turn.content.get contains unknown parameters",
+                        details={"field_count": len(unknown_content_params)},
+                        request_id=request_id,
+                    )
+                content_schema = params.get("schema_version", 1)
+                if content_schema != 1 or isinstance(content_schema, bool):
+                    return error_response(
+                        "unsupported_schema",
+                        "unsupported turn content schema version",
+                        details={"supported_content_schema_versions": [1]},
+                        request_id=request_id,
+                    )
+                if not isinstance(params.get("turn_id"), str) or not params.get("turn_id"):
+                    return error_response(
+                        "invalid_params",
+                        "turn_id is required",
+                        details={"field": "turn_id"},
+                        request_id=request_id,
+                    )
+                if not isinstance(params.get("content_revision"), str) or not params.get(
+                    "content_revision"
+                ):
+                    return error_response(
+                        "invalid_params",
+                        "content_revision is required",
+                        details={"field": "content_revision"},
+                        request_id=request_id,
+                    )
+                if params.get("field") not in {"user_text", "assistant_final_text"}:
+                    return error_response(
+                        "invalid_params",
+                        "field is invalid",
+                        details={"field": "field"},
+                        request_id=request_id,
+                    )
+                cursor = params.get("cursor")
+                if cursor is not None and (not isinstance(cursor, str) or not cursor):
+                    return error_response(
+                        "invalid_params",
+                        "cursor must be a non-empty string or null",
+                        details={"field": "cursor"},
+                        request_id=request_id,
+                    )
+                if self._get_turn_content is None:
+                    return success_response(
+                        {
+                            "schema_version": 1,
+                            "ok": False,
+                            "status": "store_unavailable",
+                            "error": {
+                                "code": "store_unavailable",
+                                "message": "content store is unavailable",
+                            },
+                        },
+                        request_id=request_id,
+                    )
+                result = dict(self._get_turn_content(dict(params)))
+                response = success_response(result, request_id=request_id)
+                _restore_content_page_text(response, result)
+                return response
             if method == "pending.list":
                 if self._get_pending is not None:
                     return success_response(self._get_pending(), request_id=request_id)
@@ -373,10 +486,11 @@ class TendwireDaemonAPI:
                         },
                         request_id=request_id,
                     )
-                return success_response(
-                    self._connector_call(method, dict(params)),
-                    request_id=request_id,
-                )
+                connector_result = dict(self._connector_call(method, dict(params)))
+                response = success_response(connector_result, request_id=request_id)
+                if method == "connector.prepare":
+                    _restore_plan_token(response, connector_result)
+                return response
         except Exception as exc:  # noqa: BLE001
             return error_response(
                 "internal_error",
@@ -390,6 +504,99 @@ class TendwireDaemonAPI:
             "unknown method",
             request_id=request_id,
         )
+
+
+def _restore_turn_list_text(
+    response: dict[str, Any],
+    original_result: Mapping[str, Any],
+) -> None:
+    """Restore trusted canonical inline fields/previews after generic sanitation."""
+    if original_result.get("schema_version") not in {1, 2}:
+        return
+    original_turns = original_result.get("turns")
+    result = response.get("result")
+    if not isinstance(original_turns, list) or not isinstance(result, dict):
+        return
+    sanitized_turns = result.get("turns")
+    if not isinstance(sanitized_turns, list):
+        return
+    by_id = {
+        item.get("id"): item
+        for item in sanitized_turns
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    for original in original_turns:
+        if not isinstance(original, Mapping):
+            continue
+        target = by_id.get(original.get("id"))
+        if not isinstance(target, dict):
+            continue
+        descriptors = (original.get("content") or {}).get("fields", {})
+        for field in ("user_text", "assistant_final_text"):
+            text = original.get(field)
+            descriptor = descriptors.get(field) if isinstance(descriptors, Mapping) else None
+            trusted_inline = original_result.get("schema_version") == 1 or (
+                isinstance(descriptor, Mapping)
+                and descriptor.get("availability") == "complete"
+                and descriptor.get("inline") is True
+            )
+            if trusted_inline and isinstance(text, str):
+                target[field] = text
+        for preview_key in ("user_preview", "assistant_final_preview"):
+            preview = original.get(preview_key)
+            if isinstance(preview, str):
+                target[preview_key] = preview
+
+
+def _restore_content_page_text(
+    response: dict[str, Any],
+    original_result: Mapping[str, Any],
+) -> None:
+    """Restore an already-canonical page after generic public string bounding."""
+    text = original_result.get("text")
+    if not isinstance(text, str):
+        return
+    if original_result.get("schema_version") != 1:
+        return
+    if original_result.get("field") not in {"user_text", "assistant_final_text"}:
+        return
+    if original_result.get("availability") != "complete":
+        return
+    result = response.get("result")
+    if isinstance(result, dict):
+        result["text"] = text
+
+
+def _restore_plan_token(
+    response: dict[str, Any],
+    original_result: Mapping[str, Any],
+) -> None:
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return
+    for key in ("plan_token", "failed_plan_token"):
+        plan_token = original_result.get(key)
+        if (
+            isinstance(plan_token, str)
+            and re.fullmatch(r"twplan1\.[A-Za-z0-9_-]+", plan_token) is not None
+        ):
+            result[key] = plan_token
+
+
+def _serialized_response(response: Mapping[str, Any]) -> bytes:
+    """Serialize one public response while preserving canonical content pages."""
+    sanitized = sanitize_public_mapping(response)
+    original_result = response.get("result")
+    if isinstance(original_result, Mapping):
+        _restore_turn_list_text(sanitized, original_result)
+        _restore_content_page_text(sanitized, original_result)
+        _restore_plan_token(sanitized, original_result)
+    return json.dumps(
+        sanitized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _ensure_unix_socket_supported() -> None:
@@ -503,6 +710,7 @@ class UnixSocketJSONServer:
         accept_timeout_seconds: float = 0.2,
         client_timeout_seconds: float = 1.0,
         max_request_bytes: int = MAX_REQUEST_BYTES,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
         socket_group: str | None = None,
         prepare_parent: bool = False,
     ) -> None:
@@ -512,6 +720,7 @@ class UnixSocketJSONServer:
         self.accept_timeout_seconds = accept_timeout_seconds
         self.client_timeout_seconds = client_timeout_seconds
         self.max_request_bytes = max_request_bytes
+        self.max_response_bytes = max_response_bytes
         self.socket_group = socket_group
         self.prepare_parent = prepare_parent
         self._listener: socket.socket | None = None
@@ -519,6 +728,7 @@ class UnixSocketJSONServer:
         self._pin_fd: int | None = None
         self._parent_fd: int | None = None
         self._leaf: str | None = None
+        self._lifecycle_lock = threading.Lock()
 
     @property
     def listening(self) -> bool:
@@ -711,11 +921,24 @@ class UnixSocketJSONServer:
                     details={"type": type(exc).__name__},
                 )
             try:
-                conn.sendall(public_json_dumps(response).encode("utf-8") + b"\n")
+                encoded = _serialized_response(response)
+                if len(encoded) > self.max_response_bytes:
+                    encoded = _serialized_response(
+                        error_response(
+                            "response_too_large",
+                            "daemon response exceeds maximum frame size",
+                            details={"max_response_bytes": self.max_response_bytes},
+                        )
+                    )
+                conn.sendall(encoded + b"\n")
             except OSError:
                 return
 
     def close(self) -> None:
+        with self._lifecycle_lock:
+            self._close_locked()
+
+    def _close_locked(self) -> None:
         self.stop_event.set()
         listener = self._listener
         self._listener = None
@@ -878,7 +1101,7 @@ class DaemonAPIClient:
         socket_path: str | os.PathLike[str],
         *,
         timeout_seconds: float = 1.0,
-        max_response_bytes: int = MAX_REQUEST_BYTES,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
         socket_group: str | None = None,
     ) -> None:
         self.socket_path = Path(socket_path)

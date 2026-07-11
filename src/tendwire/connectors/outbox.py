@@ -16,6 +16,10 @@ from ..store.sqlite import (
     defer_connector_delivery,
     fail_connector_delivery,
     poll_connector_outbox,
+    prepare_connector_plan_begin,
+    prepare_connector_plan_commit,
+    prepare_connector_plan_recover,
+    prepare_connector_plan_part,
     reclaim_expired_connector_leases,
 )
 
@@ -38,6 +42,13 @@ def _int(value: Any, default: int, *, minimum: int = 1, maximum: int = 100) -> i
 _CONNECTOR_REF_PREFIX = "twref1."
 _CONNECTOR_REF_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 _CONNECTOR_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+_PLAN_TOKEN_PREFIX = "twplan1."
+_REVISION_PREFIX = "twrev1."
+_PREPARE_NAME = "turn-final"
+_PREPARE_MAX_PARTS = 10_000
+_PREPARE_MAX_SPANS = 64
+_PREPARE_FIELDS = frozenset({"user_text", "assistant_final_text"})
+_PREPARE_VERSION_CHARS = _CONNECTOR_NAME_CHARS
 _FORBIDDEN_PUBLIC_TEXT = (
     "telegram",
     "herdr",
@@ -67,8 +78,48 @@ def _contains_forbidden_public_text(value: str) -> bool:
     return any(token in lowered or token.replace("_", "") in compact for token in _FORBIDDEN_PUBLIC_TEXT)
 
 
+def _opaque_token(value: Any, prefix: str) -> str:
+    token = _text(value)
+    if not token.startswith(prefix):
+        return ""
+    body = token[len(prefix) :]
+    if not body or any(char not in _CONNECTOR_REF_CHARS for char in body):
+        return ""
+    return token
+
+
+def _plan_token(value: Any) -> str:
+    return _opaque_token(value, _PLAN_TOKEN_PREFIX)
+
+
+def _revision(value: Any) -> str:
+    return _opaque_token(value, _REVISION_PREFIX)
+
+
+def _restore_plan_tokens(clean: dict[str, Any], original: Mapping[str, Any]) -> dict[str, Any]:
+    for key in (
+        "plan_token",
+        "replaces_plan_token",
+        "failed_plan_token",
+    ):
+        if key not in original:
+            continue
+        value = original.get(key)
+        if value is None:
+            clean[key] = None
+            continue
+        token = _plan_token(value)
+        if token:
+            clean[key] = token
+    return clean
+
+
 def _clean_mapping(value: Any) -> dict[str, Any]:
-    return sanitize_public_mapping(value, backend_neutral=True)
+    original = dict(value) if isinstance(value, Mapping) else {}
+    return _restore_plan_tokens(
+        sanitize_public_mapping(original, backend_neutral=True),
+        original,
+    )
 
 
 def _error(status: str, *, host_id: str, name: str = "", ref: str | None = None) -> dict[str, Any]:
@@ -108,6 +159,16 @@ def _name(value: Any) -> str:
         return ""
     return name
 
+def _request_id(value: Any) -> str:
+    request_id = _text(value)
+    if not request_id or len(request_id) > 128:
+        return ""
+    if any(char not in _CONNECTOR_NAME_CHARS for char in request_id):
+        return ""
+    if _contains_forbidden_public_text(request_id):
+        return ""
+    return request_id
+
 
 class ConnectorOutboxAPI:
     """Public-neutral facade for connector.poll/ack/fail/defer."""
@@ -129,6 +190,158 @@ class ConnectorOutboxAPI:
         if self.db_path is None:
             return _error("store_unavailable", host_id=self.host_id, name=name)
         return None
+
+    def prepare(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        data = dict(params or {})
+        if data.get("schema_version") != 1 or isinstance(
+            data.get("schema_version"), bool
+        ):
+            return _error("invalid_params", host_id=self.host_id)
+        action = data.get("action")
+        name = _name(data.get("name"))
+        if name != _PREPARE_NAME or action not in {"begin", "part", "commit", "recover"}:
+            return _error("invalid_params", host_id=self.host_id)
+        unavailable = self._require_store(name)
+        if unavailable is not None:
+            return unavailable
+        assert self.db_path is not None
+
+        if action == "begin":
+            if set(data) != {
+                "schema_version",
+                "action",
+                "name",
+                "turn_id",
+                "content_revision",
+                "presentation_version",
+                "part_count",
+            }:
+                return _error("invalid_params", host_id=self.host_id, name=name)
+            turn_id = _text(data.get("turn_id"))
+            revision = _revision(data.get("content_revision"))
+            version = _text(data.get("presentation_version"))
+            part_count = data.get("part_count")
+            if (
+                not turn_id.startswith("turn-")
+                or len(turn_id) > 128
+                or any(char not in _CONNECTOR_NAME_CHARS for char in turn_id)
+                or not revision
+                or not version
+                or len(version) > 128
+                or any(char not in _PREPARE_VERSION_CHARS for char in version)
+                or _contains_forbidden_public_text(version)
+                or isinstance(part_count, bool)
+                or not isinstance(part_count, int)
+                or part_count < 1
+                or part_count > _PREPARE_MAX_PARTS
+            ):
+                return _error("invalid_params", host_id=self.host_id, name=name)
+            return prepare_connector_plan_begin(
+                self.db_path,
+                self.host_id,
+                name=name,
+                turn_id=turn_id,
+                content_revision=revision,
+                presentation_version=version,
+                part_count=part_count,
+            )
+
+        if action == "recover":
+            if set(data) != {
+                "schema_version",
+                "action",
+                "name",
+                "failed_plan_token",
+                "request_id",
+            }:
+                return _error("invalid_params", host_id=self.host_id, name=name)
+            failed_plan_token = _plan_token(data.get("failed_plan_token"))
+            request_id = _request_id(data.get("request_id"))
+            if not failed_plan_token or not request_id:
+                return _error("invalid_params", host_id=self.host_id, name=name)
+            return prepare_connector_plan_recover(
+                self.db_path,
+                self.host_id,
+                name=name,
+                failed_plan_token=failed_plan_token,
+                request_id=request_id,
+            )
+
+        token = _plan_token(data.get("plan_token"))
+        if not token:
+            return _error("invalid_params", host_id=self.host_id, name=name)
+        if action == "commit":
+            if set(data) != {
+                "schema_version",
+                "action",
+                "name",
+                "plan_token",
+            }:
+                return _error("invalid_params", host_id=self.host_id, name=name)
+            return prepare_connector_plan_commit(
+                self.db_path,
+                self.host_id,
+                name=name,
+                plan_token=token,
+            )
+
+        if set(data) != {
+            "schema_version",
+            "action",
+            "name",
+            "plan_token",
+            "ordinal",
+            "spans",
+        }:
+            return _error("invalid_params", host_id=self.host_id, name=name)
+        ordinal = data.get("ordinal")
+        raw_spans = data.get("spans")
+        if (
+            isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or ordinal < 0
+            or not isinstance(raw_spans, list)
+            or not raw_spans
+            or len(raw_spans) > _PREPARE_MAX_SPANS
+        ):
+            return _error("invalid_params", host_id=self.host_id, name=name)
+        spans: list[dict[str, Any]] = []
+        for raw_span in raw_spans:
+            if not isinstance(raw_span, Mapping) or set(raw_span) != {
+                "field",
+                "start_char",
+                "end_char",
+            }:
+                return _error("invalid_params", host_id=self.host_id, name=name)
+            field = raw_span.get("field")
+            start = raw_span.get("start_char")
+            end = raw_span.get("end_char")
+            if (
+                field not in _PREPARE_FIELDS
+                or isinstance(start, bool)
+                or isinstance(end, bool)
+                or not isinstance(start, int)
+                or not isinstance(end, int)
+                or start < 0
+                or end <= start
+            ):
+                return _error("invalid_params", host_id=self.host_id, name=name)
+            spans.append(
+                {
+                    "field": str(field),
+                    "start_char": start,
+                    "end_char": end,
+                }
+            )
+        return prepare_connector_plan_part(
+            self.db_path,
+            self.host_id,
+            name=name,
+            plan_token=token,
+            ordinal=ordinal,
+            spans=spans,
+        )
+
 
     def poll(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         data = dict(params or {})
@@ -159,24 +372,30 @@ class ConnectorOutboxAPI:
             ref = _ref(item.get("ref"))
             if not ref:
                 continue
-            items.append(
-                sanitize_public_value({
+            clean_payload = _clean_mapping(item.get("payload"))
+            clean_item = sanitize_public_value(
+                {
                     "ref": ref,
                     "key": str(item.get("key") or ""),
                     "attempt": int(item.get("attempt") or 0),
                     "leased_until": str(item.get("leased_until") or ""),
                     "available_at": str(item.get("available_at") or ""),
-                    "payload": _clean_mapping(item.get("payload")),
-                })
+                    "payload": clean_payload,
+                }
             )
-        return sanitize_public_value({
+            if isinstance(clean_item, dict):
+                sanitized_payload = clean_item.get("payload")
+                if isinstance(sanitized_payload, dict):
+                    _restore_plan_tokens(sanitized_payload, clean_payload)
+                items.append(clean_item)
+        return {
             "schema_version": 1,
             "ok": bool(store_result.get("ok", False)),
             "status": str(store_result.get("status") or "ok"),
             "host_id": self.host_id,
             "name": name,
             "items": items,
-        })
+        }
 
     def reclaim(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         data = dict(params or {})
@@ -247,6 +466,8 @@ class ConnectorOutboxAPI:
         return defer_connector_delivery(self.db_path, **kwargs)
 
     def dispatch(self, method: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        if method == "connector.prepare":
+            return self.prepare(params)
         if method == "connector.poll":
             return self.poll(params)
         if method == "connector.ack":

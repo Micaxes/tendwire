@@ -8,6 +8,8 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,13 +22,17 @@ from tendwire.cli import _build_parser, main, observe_public_snapshot
 from tendwire.config import Config
 from tendwire.core.models import AttentionSignal, Snapshot, Space, SuggestedAction, Worker
 from tendwire.core.projector import project_from_raw
+from tendwire.daemon_api import TendwireDaemonAPI, UnixSocketJSONServer
 from tendwire.store.sqlite import (
     SnapshotObservationContext,
     append_event,
+    get_turn_content,
     init_store,
     latest_snapshot,
     list_worker_bindings,
+    merge_turn_content,
     save_snapshot,
+    turns_payload_from_store,
 )
 
 
@@ -190,6 +196,574 @@ def test_cli_turns_json_no_herdr_prints_public_empty_collection(capsys) -> None:
     assert payload["backend_health"][0]["name"] == "herdr"
     assert payload["backend_health"][0]["status"] == "unavailable"
     assert payload["backend_health"][0]["outcome"] == "missing_binary"
+
+
+def test_cli_turns_schema_v2_daemon_request_requires_no_content_fetch(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class FakeDaemonAPIClient:
+        def __init__(self, _socket_path: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            calls.append((method, dict(params or {})))
+            return {
+                "ok": True,
+                "result": {
+                    "schema_version": 2,
+                    "host_id": "turns-host",
+                    "turns": [
+                        {
+                            "id": "turn-public",
+                            "assistant_final_text": "short final",
+                            "content": {
+                                "schema_version": 1,
+                                "content_revision": "twrev1.public",
+                                "known_incomplete": False,
+                                "fields": {
+                                    "assistant_final_text": {
+                                        "availability": "complete",
+                                        "inline": True,
+                                        "char_length": 11,
+                                        "byte_length": 11,
+                                        "page_count": 1,
+                                        "first_cursor": None,
+                                    }
+                                },
+                            },
+                        }
+                    ],
+                },
+            }
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", FakeDaemonAPIClient)
+    code = main(
+        [
+            "--host-id",
+            "turns-host",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "turns",
+            "--schema-version",
+            "2",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["schema_version"] == 2
+    assert payload["turns"][0]["assistant_final_text"] == "short final"
+    assert payload["turns"][0]["content"]["fields"]["assistant_final_text"]["inline"] is True
+    assert calls == [("turn.list", {"schema_version": 2})]
+
+
+def test_cli_turns_v1_upgrade_required_is_json_and_nonzero(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    class FakeDaemonAPIClient:
+        def __init__(self, _socket_path: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            assert method == "turn.list"
+            assert params == {"schema_version": 1}
+            return {
+                "ok": True,
+                "result": {
+                    "schema_version": 1,
+                    "ok": False,
+                    "status": "upgrade_required",
+                    "required_turn_schema_version": 2,
+                    "error": {
+                        "code": "upgrade_required",
+                        "message": "turn content requires schema version 2",
+                    },
+                },
+            }
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", FakeDaemonAPIClient)
+    code = main(
+        [
+            "--host-id",
+            "turns-host",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "turns",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 1
+    assert captured.err == ""
+    assert payload["status"] == "upgrade_required"
+    assert payload["required_turn_schema_version"] == 2
+    assert payload["error"]["code"] == "upgrade_required"
+
+
+def test_cli_turn_content_get_preserves_exact_page_and_params(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    page_text = "\n  " + ("界" * 20_000) + "\r\n  "
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class FakeDaemonAPIClient:
+        def __init__(self, _socket_path: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            calls.append((method, dict(params or {})))
+            return {
+                "ok": True,
+                "result": {
+                    "schema_version": 1,
+                    "ok": True,
+                    "status": "ok",
+                    "turn_id": "turn-public",
+                    "content_revision": "twrev1.public",
+                    "field": "assistant_final_text",
+                    "availability": "complete",
+                    "segment_id": "twseg1.public",
+                    "index": 1,
+                    "count": 2,
+                    "text": page_text,
+                    "segment_char_length": len(page_text),
+                    "segment_byte_length": len(page_text.encode("utf-8")),
+                    "total_char_length": 40_000,
+                    "total_byte_length": 120_000,
+                    "next_cursor": None,
+                },
+            }
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", FakeDaemonAPIClient)
+    code = main(
+        [
+            "--host-id",
+            "turns-host",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "turn",
+            "content",
+            "get",
+            "--json",
+            "--turn-id",
+            "turn-public",
+            "--revision",
+            "twrev1.public",
+            "--field",
+            "assistant_final_text",
+            "--cursor",
+            "twcur1.public",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 0
+    assert captured.err == ""
+    assert payload["text"] == page_text
+    assert calls == [
+        (
+            "turn.content.get",
+            {
+                "schema_version": 1,
+                "turn_id": "turn-public",
+                "content_revision": "twrev1.public",
+                "field": "assistant_final_text",
+                "cursor": "twcur1.public",
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize("with_db_path", [False, True])
+@pytest.mark.parametrize(
+    ("error_code", "details"),
+    [
+        ("internal_error", {"type": "RuntimeError"}),
+        ("response_too_large", {"max_response_bytes": 1024 * 1024}),
+    ],
+)
+def test_cli_turn_content_preserves_reachable_daemon_errors_without_store_fallback(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    with_db_path: bool,
+    error_code: str,
+    details: dict[str, Any],
+) -> None:
+    direct_calls: list[str] = []
+    original_error = {
+        "code": error_code,
+        "message": f"daemon {error_code}",
+        "details": details,
+    }
+
+    class FakeDaemonAPIClient:
+        def __init__(self, _socket_path: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            assert method == "turn.content.get"
+            return {
+                "schema_version": 1,
+                "ok": False,
+                "status": "error",
+                "result": None,
+                "error": original_error,
+            }
+
+    def forbidden_store_call(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        direct_calls.append("store")
+        raise AssertionError("reachable daemon errors must not fall back to the store")
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", FakeDaemonAPIClient)
+    monkeypatch.setattr("tendwire.store.sqlite.init_store", forbidden_store_call)
+    monkeypatch.setattr("tendwire.store.sqlite.get_turn_content", forbidden_store_call)
+    argv = [
+        "--host-id",
+        "turns-host",
+        "--socket-path",
+        str(tmp_path / "daemon.sock"),
+        "turn",
+        "content",
+        "get",
+        "--json",
+        "--turn-id",
+        "turn-public",
+        "--revision",
+        "twrev1.public",
+        "--field",
+        "assistant_final_text",
+    ]
+    if with_db_path:
+        argv += ["--db-path", str(tmp_path / "direct.db")]
+
+    code = main(argv)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 1
+    assert captured.err == ""
+    assert payload["status"] == "error"
+    assert payload["error"] == original_error
+    assert direct_calls == []
+
+
+def test_cli_long_content_pages_match_direct_store_and_daemon(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "long-content.db"
+    socket_path = tmp_path / "long-content.sock"
+    config = Config(host_id="long-host", db_path=db_path)
+    snapshot = project_from_raw(
+        config,
+        workers=[{"id": "worker-1", "name": "Worker", "status": "active"}],
+    )
+    canonical = (
+        "# Exact heading\n\n"
+        + ("safe-value αβγ\n- nested-looking item\n```text\ncode\n```\n" * 30_000)
+    )[:1_100_000] + "終"
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    assert merge_turn_content(
+        db_path,
+        "long-host",
+        "worker-1",
+        {
+            "user_text": "short prompt",
+            "assistant_final_text": canonical,
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-01-01T00:00:00+00:00",
+    ) == 1
+    listed = turns_payload_from_store(
+        db_path,
+        "long-host",
+        snapshot=snapshot,
+        schema_version=2,
+    )
+    turn = listed["turns"][0]
+    revision = turn["content"]["content_revision"]
+    descriptor = turn["content"]["fields"]["assistant_final_text"]
+    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", lambda _config: 0)
+
+    v1_code = main(
+        [
+            "--host-id",
+            "long-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "turns",
+            "--db-path",
+            str(db_path),
+            "--json",
+        ]
+    )
+    v1_payload = json.loads(capsys.readouterr().out)
+    v2_code = main(
+        [
+            "--host-id",
+            "long-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "turns",
+            "--db-path",
+            str(db_path),
+            "--schema-version",
+            "2",
+            "--json",
+        ]
+    )
+    v2_payload = json.loads(capsys.readouterr().out)
+
+    assert v1_code == 1
+    assert v1_payload["status"] == "upgrade_required"
+    assert v1_payload["required_turn_schema_version"] == 2
+    assert v2_code == 0
+    assert v2_payload["schema_version"] == 2
+    assert descriptor["inline"] is False
+    assert descriptor["char_length"] == len(canonical)
+    assert descriptor["byte_length"] == len(canonical.encode("utf-8"))
+    assert descriptor["page_count"] > 1
+
+    def fetch_pages(*, socket: Path | None, direct_db: Path | None) -> list[dict[str, Any]]:
+        pages: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            argv = ["--host-id", "long-host"]
+            if socket is not None:
+                argv += ["--socket-path", str(socket)]
+            argv += [
+                "turn",
+                "content",
+                "get",
+                "--json",
+                "--turn-id",
+                turn["id"],
+                "--revision",
+                revision,
+                "--field",
+                "assistant_final_text",
+            ]
+            if direct_db is not None:
+                argv += ["--db-path", str(direct_db)]
+            if cursor is not None:
+                argv += ["--cursor", cursor]
+            assert main(argv) == 0
+            captured = capsys.readouterr()
+            assert captured.err == ""
+            page = json.loads(captured.out)
+            assert len(json.dumps(page, ensure_ascii=False).encode("utf-8")) < 1024 * 1024
+            pages.append(page)
+            next_cursor = page["next_cursor"]
+            if next_cursor is None:
+                return pages
+            assert next_cursor not in {item.get("next_cursor") for item in pages[:-1]}
+            cursor = next_cursor
+
+    direct_pages = fetch_pages(socket=None, direct_db=db_path)
+    bad_cursor_code = main(
+        [
+            "--host-id",
+            "long-host",
+            "turn",
+            "content",
+            "get",
+            "--json",
+            "--turn-id",
+            turn["id"],
+            "--revision",
+            revision,
+            "--field",
+            "assistant_final_text",
+            "--cursor",
+            "twcur1.tampered",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    bad_cursor_payload = json.loads(capsys.readouterr().out)
+    assert bad_cursor_code == 1
+    assert bad_cursor_payload["status"] == "invalid_cursor"
+
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: snapshot,
+        get_health=lambda: {"schema_version": 1, "status": "ok"},
+        submit_command=lambda _params: {},
+        get_turn_content=lambda params: get_turn_content(
+            db_path,
+            "long-host",
+            turn_id=params["turn_id"],
+            content_revision=params["content_revision"],
+            field=params["field"],
+            cursor=params.get("cursor"),
+            schema_version=params.get("schema_version", 1),
+        ),
+    )
+    server = UnixSocketJSONServer(
+        socket_path,
+        api.dispatch,
+        accept_timeout_seconds=0.05,
+    )
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 2
+        while not server.listening and time.monotonic() < deadline:
+            time.sleep(0.01)
+        daemon_pages = fetch_pages(socket=socket_path, direct_db=None)
+        daemon_bad_code = main(
+            [
+                "--host-id",
+                "long-host",
+                "--socket-path",
+                str(socket_path),
+                "turn",
+                "content",
+                "get",
+                "--json",
+                "--turn-id",
+                turn["id"],
+                "--revision",
+                revision,
+                "--field",
+                "assistant_final_text",
+                "--cursor",
+                "twcur1.tampered",
+            ]
+        )
+        daemon_bad_payload = json.loads(capsys.readouterr().out)
+        assert daemon_bad_code == 1
+        assert daemon_bad_payload == bad_cursor_payload
+    finally:
+        server.close()
+        thread.join(timeout=2)
+
+    assert daemon_pages == direct_pages
+    assert "".join(page["text"] for page in direct_pages) == canonical
+    assert [page["index"] for page in direct_pages] == list(range(len(direct_pages)))
+    assert all(page["count"] == len(direct_pages) for page in direct_pages)
+    assert not thread.is_alive()
+
+
+def test_cli_short_v1_compatibility_then_known_incomplete_refusal(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "content-compatibility.db"
+    config = Config(host_id="compat-host", db_path=db_path)
+    snapshot = project_from_raw(
+        config,
+        workers=[{"id": "worker-1", "name": "Worker", "status": "active"}],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    assert merge_turn_content(
+        db_path,
+        "compat-host",
+        "worker-1",
+        {
+            "user_text": "  short prompt\n",
+            "assistant_final_text": "\n short final  ",
+            "complete": True,
+        },
+    ) == 1
+    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", lambda _config: 0)
+    common = [
+        "--host-id",
+        "compat-host",
+        "--herdr-bin",
+        "definitely-not-a-real-herdr-binary",
+        "turns",
+        "--db-path",
+        str(db_path),
+        "--json",
+    ]
+
+    short_v1_code = main(common)
+    short_v1 = json.loads(capsys.readouterr().out)
+    short_v2_code = main([*common, "--schema-version", "2"])
+    short_v2 = json.loads(capsys.readouterr().out)
+    short_turn = short_v2["turns"][0]
+
+    assert short_v1_code == 0
+    assert short_v1["schema_version"] == 1
+    assert short_v1["turns"][0]["assistant_final_text"] == "\n short final  "
+    assert short_v1["turns"][0]["user_text"] == "  short prompt\n"
+    assert "content" not in short_v1["turns"][0]
+    assert short_v2_code == 0
+    assert short_turn["assistant_final_text"] == "\n short final  "
+    assert short_turn["content"]["fields"]["assistant_final_text"]["inline"] is True
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            UPDATE turn_content_revisions
+            SET final_state = 'known_incomplete'
+            WHERE host_id = ? AND turn_id = ? AND is_current = 1
+            """,
+            ("compat-host", short_turn["id"]),
+        )
+
+    incomplete_v1_code = main(common)
+    incomplete_v1 = json.loads(capsys.readouterr().out)
+    incomplete_v2_code = main([*common, "--schema-version", "2"])
+    incomplete_v2 = json.loads(capsys.readouterr().out)
+    revision = incomplete_v2["turns"][0]["content"]["content_revision"]
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            UPDATE turn_content_revisions
+            SET content_revision = ?
+            WHERE host_id = ? AND turn_id = ? AND is_current = 1
+            """,
+            (revision, "compat-host", short_turn["id"]),
+        )
+    content_code = main(
+        [
+            "--host-id",
+            "compat-host",
+            "turn",
+            "content",
+            "get",
+            "--json",
+            "--turn-id",
+            short_turn["id"],
+            "--revision",
+            revision,
+            "--field",
+            "assistant_final_text",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    content_error = json.loads(capsys.readouterr().out)
+
+    assert incomplete_v1_code == 1
+    assert incomplete_v1["status"] == "upgrade_required"
+    assert incomplete_v1["required_turn_schema_version"] == 2
+    assert incomplete_v2_code == 0
+    incomplete_field = incomplete_v2["turns"][0]["content"]["fields"]["assistant_final_text"]
+    assert incomplete_field["availability"] == "known_incomplete"
+    assert incomplete_field["inline"] is False
+    assert "assistant_final_text" not in incomplete_v2["turns"][0]
+    assert content_code == 1
+    assert content_error["status"] == "content_known_incomplete"
 
 
 def test_cli_pending_json_no_herdr_prints_public_empty_collection(capsys) -> None:

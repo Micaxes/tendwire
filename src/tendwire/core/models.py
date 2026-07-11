@@ -799,6 +799,7 @@ def sanitize_public_text(
     *,
     max_chars: int | None = None,
     collapse_whitespace: bool = False,
+    strip_outer: bool = True,
 ) -> str:
     """Redact recognizable private values while preserving ordinary public prose.
 
@@ -808,7 +809,8 @@ def sanitize_public_text(
     tool adapters must still construct progress from allowlisted fields.
 
     Redaction semantically precedes truncation, including when an arbitrarily long
-    credential crosses the visible boundary.
+    credential crosses the visible boundary. ``strip_outer=False`` is reserved for
+    already-typed canonical text whose remaining code points must be lossless.
     """
     if not isinstance(value, str):
         return ""
@@ -817,9 +819,22 @@ def sanitize_public_text(
     text = _redact_and_truncate_public_text(text, max_chars)
     if collapse_whitespace:
         text = " ".join(text.split())
-    else:
+    elif strip_outer:
         text = text.strip()
     return text
+
+
+def sanitize_canonical_turn_text(value: object) -> str | None:
+    """Return lossless public-safe canonical turn text.
+
+    Canonical turn content uses the same NFKC, forbidden-code-point removal,
+    and recognizable-private-value redaction as other public text, but it is
+    never truncated and its remaining leading/trailing whitespace is retained.
+    Non-string values are absent rather than being stringified.
+    """
+    if not isinstance(value, str):
+        return None
+    return sanitize_public_text(value, max_chars=None, strip_outer=False)
 
 
 def sanitize_public_value(

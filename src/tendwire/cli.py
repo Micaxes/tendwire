@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import socket
 import sys
 from dataclasses import dataclass
@@ -75,6 +76,7 @@ from .store.sqlite import (
 _HERDR_BACKEND = "herdr"
 _DEFAULT_FETCH_HERDR_STATE = fetch_herdr_state
 _DAEMON_FAST_CLIENT_TIMEOUT_SECONDS = 0.35
+_DAEMON_CONTENT_CLIENT_TIMEOUT_SECONDS = 10.0
 _DAEMON_COMMAND_CLIENT_TIMEOUT_FLOOR_SECONDS = 2.0
 _DAEMON_COMMAND_CLIENT_TIMEOUT_GRACE_SECONDS = 0.5
 
@@ -82,6 +84,7 @@ _DAEMON_COMMAND_CLIENT_TIMEOUT_GRACE_SECONDS = 0.5
 @dataclass(frozen=True)
 class _DaemonAttempt:
     result: dict[str, Any] | None = None
+    response_error: dict[str, Any] | None = None
     error_kind: str | None = None
 
 
@@ -91,6 +94,8 @@ def _daemon_client_timeout_seconds(config: Config, method: str) -> float:
             _DAEMON_COMMAND_CLIENT_TIMEOUT_FLOOR_SECONDS,
             float(config.herdr_timeout_seconds) + _DAEMON_COMMAND_CLIENT_TIMEOUT_GRACE_SECONDS,
         )
+    if method == "turn.content.get":
+        return _DAEMON_CONTENT_CLIENT_TIMEOUT_SECONDS
     return _DAEMON_FAST_CLIENT_TIMEOUT_SECONDS
 
 
@@ -187,6 +192,39 @@ def _build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Print turns as JSON (default).",
     )
+    turns_parser.add_argument(
+        "--schema-version",
+        dest="schema_version",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Turn-list schema version (default: 1).",
+    )
+    turns_parser.add_argument(
+        "--db-path",
+        dest="db_path",
+        default=None,
+        help="SQLite database path for store-backed turns (default: config path).",
+    )
+
+    turn_parser = subparsers.add_parser(
+        "turn",
+        help="Access bounded canonical turn content.",
+    )
+    turn_actions = turn_parser.add_subparsers(dest="turn_action", required=True)
+    content_parser = turn_actions.add_parser("content", help="Access turn content.")
+    content_actions = content_parser.add_subparsers(dest="content_action", required=True)
+    content_get = content_actions.add_parser("get", help="Fetch one bounded content page.")
+    content_get.add_argument("--json", dest="json_output", action="store_true", default=True)
+    content_get.add_argument("--turn-id", dest="turn_id", required=True)
+    content_get.add_argument("--revision", dest="content_revision", required=True)
+    content_get.add_argument(
+        "--field",
+        choices=("user_text", "assistant_final_text"),
+        required=True,
+    )
+    content_get.add_argument("--cursor", default=None)
+    content_get.add_argument("--db-path", dest="db_path", default=None)
 
     pending_parser = subparsers.add_parser(
         "pending",
@@ -294,6 +332,19 @@ def _add_connector_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     def add_common(action_parser: argparse.ArgumentParser) -> None:
         action_parser.add_argument("--db-path", dest="db_path", default=None)
         action_parser.add_argument("--name", required=True, help="Neutral connector queue name.")
+
+    prepare_parser = actions.add_parser(
+        "prepare",
+        help="Stage one bounded neutral presentation-plan action from stdin.",
+    )
+    add_common(prepare_parser)
+    prepare_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        default=True,
+        help="Read one schema-v1 JSON action from stdin and print JSON.",
+    )
 
     poll_parser = actions.add_parser("poll", help="Lease due connector outbox items.")
     add_common(poll_parser)
@@ -544,6 +595,8 @@ def _try_daemon_attempt(
     config: Config,
     method: str,
     params: dict[str, Any] | None = None,
+    *,
+    preserve_content_text: bool = False,
 ) -> _DaemonAttempt:
     """Return a daemon result when a Tendwire daemon socket is reachable."""
     socket_path = config.socket_path
@@ -578,10 +631,20 @@ def _try_daemon_attempt(
     except DaemonAPIError:
         return _DaemonAttempt(error_kind="protocol")
     if not response.get("ok"):
-        return _DaemonAttempt(error_kind="protocol")
+        return _DaemonAttempt(
+            error_kind="daemon_error",
+            response_error=sanitize_public_mapping(response),
+        )
     result = response.get("result")
     if isinstance(result, dict):
-        return _DaemonAttempt(result=sanitize_public_mapping(result))
+        sanitized = sanitize_public_mapping(result)
+        if preserve_content_text:
+            _restore_cli_content_text(sanitized, result)
+        if method == "turn.list":
+            _restore_cli_turn_list_text(sanitized, result)
+        if method == "connector.prepare":
+            _restore_cli_plan_token(sanitized, result)
+        return _DaemonAttempt(result=sanitized)
     return _DaemonAttempt(error_kind="protocol")
 
 
@@ -640,26 +703,216 @@ def cmd_snapshot(
     return 0
 
 
+def _restore_cli_turn_list_text(
+    sanitized: dict[str, Any],
+    original: dict[str, Any],
+) -> None:
+    if original.get("schema_version") not in {1, 2}:
+        return
+    original_turns = original.get("turns")
+    sanitized_turns = sanitized.get("turns")
+    if not isinstance(original_turns, list) or not isinstance(sanitized_turns, list):
+        return
+    by_id = {
+        item.get("id"): item
+        for item in sanitized_turns
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    for original_turn in original_turns:
+        if not isinstance(original_turn, dict):
+            continue
+        target = by_id.get(original_turn.get("id"))
+        if not isinstance(target, dict):
+            continue
+        descriptors = (original_turn.get("content") or {}).get("fields", {})
+        for field in ("user_text", "assistant_final_text"):
+            text = original_turn.get(field)
+            descriptor = descriptors.get(field) if isinstance(descriptors, dict) else None
+            trusted_inline = original.get("schema_version") == 1 or (
+                isinstance(descriptor, dict)
+                and descriptor.get("availability") == "complete"
+                and descriptor.get("inline") is True
+            )
+            if trusted_inline and isinstance(text, str):
+                target[field] = text
+        for preview_key in ("user_preview", "assistant_final_preview"):
+            preview = original_turn.get(preview_key)
+            if isinstance(preview, str):
+                target[preview_key] = preview
+
+
+def _turn_list_payload_json(payload: dict[str, Any], *, indent: int | None = None) -> str:
+    sanitized = sanitize_public_mapping(payload)
+    _restore_cli_turn_list_text(sanitized, payload)
+    return json.dumps(
+        sanitized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        indent=indent,
+    )
+
+
+def _restore_cli_content_text(
+    sanitized: dict[str, Any],
+    original: dict[str, Any],
+) -> None:
+    text = original.get("text")
+    if (
+        isinstance(text, str)
+        and original.get("schema_version") == 1
+        and original.get("field") in {"user_text", "assistant_final_text"}
+        and original.get("availability") == "complete"
+    ):
+        sanitized["text"] = text
+
+
+def _restore_cli_plan_token(
+    sanitized: dict[str, Any],
+    original: dict[str, Any],
+) -> None:
+    for key in ("plan_token", "failed_plan_token"):
+        plan_token = original.get(key)
+        if isinstance(plan_token, str) and re.fullmatch(
+            r"twplan1\.[A-Za-z0-9_-]+", plan_token
+        ):
+            sanitized[key] = plan_token
+
+
+def _connector_payload_json(payload: dict[str, Any], *, indent: int | None = None) -> str:
+    sanitized = sanitize_public_mapping(payload)
+    _restore_cli_plan_token(sanitized, payload)
+    return json.dumps(
+        sanitized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        indent=indent,
+    )
+
+
+def _content_payload_json(payload: dict[str, Any], *, indent: int | None = None) -> str:
+    sanitized = sanitize_public_mapping(payload)
+    _restore_cli_content_text(sanitized, payload)
+    return json.dumps(
+        sanitized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        indent=indent,
+    )
+
+
 def cmd_turns(
     config: Config,
     *,
     json_output: bool = True,
+    schema_version: int = 1,
 ) -> int:
     """Build and print neutral public turns."""
     if not json_output:
         print("error: only --json output is supported", file=sys.stderr)
         return 2
-    daemon_result = _try_daemon_result(config, "turn.list")
+    daemon_result = _try_daemon_result(
+        config,
+        "turn.list",
+        {"schema_version": schema_version},
+    )
     if daemon_result is not None:
-        print(payload_to_json(daemon_result, indent=2))
-        return 0
+        print(_turn_list_payload_json(daemon_result, indent=2))
+        return 0 if daemon_result.get("status") != "upgrade_required" else 1
     snapshot = _current_public_snapshot(config)
     if config.db_path is not None and Path(config.db_path).exists():
         refresh_structured_turn_content(config)
-        print(payload_to_json(turns_payload_from_store(config.db_path, config.host_id, snapshot=snapshot), indent=2))
-        return 0
-    print(payload_to_json(turns_payload_from_snapshot(snapshot), indent=2))
-    return 0
+        payload = (
+            turns_payload_from_store(
+                config.db_path,
+                config.host_id,
+                snapshot=snapshot,
+            )
+            if schema_version == 1
+            else turns_payload_from_store(
+                config.db_path,
+                config.host_id,
+                snapshot=snapshot,
+                schema_version=2,
+            )
+        )
+        print(_turn_list_payload_json(payload, indent=2))
+        return 0 if payload.get("status") != "upgrade_required" else 1
+    if schema_version == 1:
+        try:
+            payload = turns_payload_from_snapshot(snapshot)
+        except ValueError as exc:
+            if str(exc) != "upgrade_required":
+                raise
+            payload = {
+                "schema_version": 1,
+                "ok": False,
+                "status": "upgrade_required",
+                "required_turn_schema_version": 2,
+            }
+    else:
+        payload = turns_payload_from_snapshot(snapshot, schema_version=2)
+    print(_turn_list_payload_json(payload, indent=2))
+    return 0 if payload.get("status") != "upgrade_required" else 1
+
+
+def cmd_turn_content_get(config: Config, args: argparse.Namespace) -> int:
+    """Fetch one bounded canonical content page with daemon/store parity."""
+    params: dict[str, Any] = {
+        "schema_version": 1,
+        "turn_id": args.turn_id,
+        "content_revision": args.content_revision,
+        "field": args.field,
+    }
+    if args.cursor is not None:
+        params["cursor"] = args.cursor
+    daemon_attempt = _try_daemon_attempt(
+        config,
+        "turn.content.get",
+        params,
+        preserve_content_text=True,
+    )
+    if daemon_attempt.result is not None:
+        payload = daemon_attempt.result
+    elif daemon_attempt.response_error is not None:
+        payload = daemon_attempt.response_error
+    elif daemon_attempt.error_kind not in {"unavailable", "timeout"}:
+        payload = {
+            "schema_version": 1,
+            "ok": False,
+            "status": "daemon_protocol_error",
+            "error": {
+                "code": "daemon_protocol_error",
+                "message": "daemon returned an invalid response",
+            },
+        }
+    elif config.db_path is None:
+        payload = {
+            "schema_version": 1,
+            "ok": False,
+            "status": "store_unavailable",
+            "error": {
+                "code": "store_unavailable",
+                "message": "command requires --db-path or a reachable daemon",
+            },
+        }
+    else:
+        from .store.sqlite import get_turn_content, init_store
+
+        init_store(config.db_path)
+        payload = get_turn_content(
+            config.db_path,
+            config.host_id,
+            turn_id=args.turn_id,
+            content_revision=args.content_revision,
+            field=args.field,
+            cursor=args.cursor,
+            schema_version=1,
+        )
+    print(_content_payload_json(payload, indent=2))
+    return 0 if payload.get("ok") is not False and isinstance(payload.get("text"), str) else 1
 
 
 def cmd_attention(
@@ -1007,6 +1260,16 @@ def cmd_command(
 
 def _connector_params_from_args(args: argparse.Namespace) -> dict[str, Any]:
     params: dict[str, Any] = {"name": args.name}
+    if args.connector_action == "prepare":
+        try:
+            parsed = json.loads(sys.stdin.read())
+        except json.JSONDecodeError as exc:
+            raise ValueError("connector prepare requires valid JSON on stdin") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("connector prepare request must be a JSON object")
+        params.update(parsed)
+        params["name"] = args.name
+        return params
     if args.connector_action == "poll":
         params["limit"] = args.limit
         if args.lease_seconds is not None:
@@ -1032,10 +1295,23 @@ def _connector_params_from_args(args: argparse.Namespace) -> dict[str, Any]:
 def cmd_connector(config: Config, args: argparse.Namespace) -> int:
     """Run a neutral connector boundary action and print one JSON object."""
     method = f"connector.{args.connector_action}"
-    params = _connector_params_from_args(args)
+    try:
+        params = _connector_params_from_args(args)
+    except ValueError as exc:
+        payload = {
+            "schema_version": 1,
+            "ok": False,
+            "status": "invalid_request",
+            "error": {
+                "code": "invalid_request",
+                "message": str(exc),
+            },
+        }
+        print(public_json_dumps(payload, indent=2))
+        return 2
     daemon_result = _try_daemon_result(config, method, params)
     if daemon_result is not None:
-        print(public_json_dumps(daemon_result, indent=2))
+        print(_connector_payload_json(daemon_result, indent=2))
         return 0 if daemon_result.get("ok") is not False else 1
     if config.db_path is None:
         payload = {
@@ -1061,7 +1337,7 @@ def cmd_connector(config: Config, args: argparse.Namespace) -> int:
         default_lease_seconds=config.connector_claim_ttl_seconds,
         max_attempts=config.max_outbox_attempts,
     ).dispatch(method, params)
-    print(public_json_dumps(payload, indent=2))
+    print(_connector_payload_json(payload, indent=2))
     return 0 if payload.get("ok") is not False else 1
 
 
@@ -1156,7 +1432,14 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.command == "turns":
-        return cmd_turns(config, json_output=args.json_output)
+        return cmd_turns(
+            config,
+            json_output=args.json_output,
+            schema_version=args.schema_version,
+        )
+
+    if args.command == "turn":
+        return cmd_turn_content_get(config, args)
 
     if args.command == "pending":
         return cmd_pending(config, json_output=args.json_output)

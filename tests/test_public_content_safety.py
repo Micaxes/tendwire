@@ -18,6 +18,7 @@ from tendwire.core.models import (
     Space,
     SuggestedAction,
     Worker,
+    sanitize_canonical_turn_text,
     public_json_dumps,
     sanitize_public_text,
     sanitize_public_value,
@@ -26,6 +27,7 @@ from tendwire.core.turns import (
     InteractionChoice,
     PendingInteraction,
     Turn,
+    segment_canonical_text,
     payload_to_json,
     pending_payload_from_snapshot,
     turns_payload_from_snapshot,
@@ -35,8 +37,11 @@ from tendwire.store.sqlite import (
     SnapshotObservationContext,
     attention_payload_from_store,
     init_store,
+    get_turn_content,
+    merge_turn_content,
     save_snapshot,
     tail_event_metadata,
+    turns_payload_from_store,
 )
 
 
@@ -966,3 +971,263 @@ def test_cli_json_output_applies_the_final_public_value_boundary(tmp_path, monke
     assert payload["assistant_final_text"] == safe_markdown
     _assert_sentinels_absent(payload, corpus)
     assert payload["dynamic_keys"] == {}
+
+
+def test_canonical_turn_sanitizer_redacts_once_without_trimming_or_truncating() -> None:
+    corpus = _sentinel_corpus()
+    raw = (
+        " \r\n# Public result\r\n\r\n"
+        + _unsafe_prompt(corpus)
+        + "\r\n```text\r\n"
+        + ("public-content-" * 2_000)
+        + "\r\n```\r\n "
+    )
+
+    canonical = sanitize_canonical_turn_text(raw)
+
+    assert canonical is not None
+    assert canonical.startswith(" \r\n# Public result\r\n\r\n")
+    assert canonical.endswith("\r\n```\r\n ")
+    assert len(canonical) > 20_000
+    assert "[truncated]" not in canonical
+    assert "\x00" not in canonical
+    _assert_sentinels_absent(canonical, corpus)
+    segments = segment_canonical_text(canonical)
+    assert "".join(segment.text for segment in segments) == canonical
+    for segment in segments:
+        assert segment.byte_length <= 48 * 1024
+        _assert_sentinels_absent(segment.text, corpus)
+
+
+def test_generic_public_text_limit_does_not_change_canonical_content_contract() -> None:
+    raw = " \r\n" + ("safe😀" * 4_000) + "\r\n "
+
+    generic = sanitize_public_text(raw, max_chars=12_000)
+    canonical = sanitize_canonical_turn_text(raw)
+
+    assert generic.endswith("[truncated]")
+    assert canonical == raw
+    assert canonical is not None
+    assert len(canonical) > 12_000
+
+
+def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
+    tmp_path,
+) -> None:
+    host_id = "boundary-safety-host"
+    worker_id = "worker-1"
+    page_bytes = 48 * 1024
+    private_secret = _sentinel_corpus()["openai_key"]
+    safe_prefix = ("A" * (page_bytes - (len(private_secret) // 2) - 1)) + " "
+    dirty_final = (
+        safe_prefix
+        + private_secret
+        + "\npublic-tail-🙂\n"
+        + ("Z" * page_bytes)
+    )
+    secret_offset = dirty_final.encode("utf-8").index(private_secret.encode("utf-8"))
+    assert secret_offset < page_bytes < secret_offset + len(private_secret.encode("utf-8"))
+
+    expected = sanitize_canonical_turn_text(dirty_final)
+    assert expected is not None
+    assert expected.count("[redacted]") == 1
+    assert private_secret not in expected
+
+    db_path = tmp_path / "boundary-content-safety.db"
+    snapshot = Snapshot(
+        host_id=host_id,
+        updated_at="2026-07-11T00:00:00+00:00",
+        workers=[Worker(id=worker_id, name="Boundary worker", status="active")],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    assert merge_turn_content(
+        db_path,
+        host_id,
+        worker_id,
+        {
+            "assistant_final_text": dirty_final,
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-07-11T00:00:01+00:00",
+    ) == 1
+
+    listed = turns_payload_from_store(
+        db_path,
+        host_id,
+        snapshot=snapshot,
+        schema_version=2,
+    )
+    turn = next(
+        item
+        for item in listed["turns"]
+        if item["content"]["fields"]["assistant_final_text"]["availability"]
+        == "complete"
+    )
+    revision = turn["content"]["content_revision"]
+    cursor = None
+    pages: list[dict[str, Any]] = []
+    while True:
+        page = get_turn_content(
+            db_path,
+            host_id,
+            turn_id=turn["id"],
+            content_revision=revision,
+            field="assistant_final_text",
+            cursor=cursor,
+        )
+        assert page.get("status") is None
+        assert page["segment_byte_length"] <= page_bytes
+        _assert_sentinels_absent(page, {"boundary_secret": private_secret})
+        pages.append(page)
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+
+    joined = "".join(page["text"] for page in pages)
+    assert joined == expected
+    assert "[redacted]" in joined
+    assert private_secret not in joined
+    assert len(pages) >= 2
+    assert turn["content"]["fields"]["assistant_final_text"]["page_count"] == len(pages)
+
+    api = ConnectorOutboxAPI(db_path, host_id)
+    begun = api.prepare(
+        {
+            "schema_version": 1,
+            "action": "begin",
+            "name": "turn-final",
+            "turn_id": turn["id"],
+            "content_revision": revision,
+            "presentation_version": "boundary-safety-v1",
+            "part_count": len(pages),
+        }
+    )
+    assert begun["ok"] is True
+    plan_token = begun["plan_token"]
+    prepared_parts: list[dict[str, Any]] = []
+    start_char = 0
+    for ordinal, page in enumerate(pages):
+        end_char = start_char + page["segment_char_length"]
+        part = api.prepare(
+            {
+                "schema_version": 1,
+                "action": "part",
+                "name": "turn-final",
+                "plan_token": plan_token,
+                "ordinal": ordinal,
+                "spans": [
+                    {
+                        "field": "assistant_final_text",
+                        "start_char": start_char,
+                        "end_char": end_char,
+                    }
+                ],
+            }
+        )
+        assert part["ok"] is True
+        prepared_parts.append(part)
+        start_char = end_char
+    assert start_char == len(expected)
+
+    committed = api.prepare(
+        {
+            "schema_version": 1,
+            "action": "commit",
+            "name": "turn-final",
+            "plan_token": plan_token,
+        }
+    )
+    assert committed["ok"] is True
+    assert committed["job_count"] == len(pages)
+
+    poll_surfaces: list[dict[str, Any]] = []
+    job_items: list[dict[str, Any]] = []
+    ack_surfaces: list[dict[str, Any]] = []
+    for _ in range(len(pages) + 1):
+        polled = api.poll({"name": "turn-final", "limit": 100})
+        poll_surfaces.append(polled)
+        assert polled["ok"] is True
+        if not polled["items"]:
+            break
+        assert len(polled["items"]) == 1
+        item = polled["items"][0]
+        job_items.append(item)
+        acknowledged = api.ack({"name": "turn-final", "ref": item["ref"]})
+        assert acknowledged["ok"] is True
+        ack_surfaces.append(acknowledged)
+    assert len(job_items) == len(pages)
+    assert poll_surfaces[-1]["items"] == []
+
+    with sqlite3.connect(str(db_path)) as conn:
+        canonical_row = conn.execute(
+            """
+            SELECT assistant_final_text, final_char_length, final_byte_length
+            FROM turn_content_revisions
+            WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+            """,
+            (host_id, turn["id"], revision),
+        ).fetchone()
+        stored_turn = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
+                (host_id, turn["id"]),
+            ).fetchone()[0]
+        )
+        stored_plans = conn.execute(
+            """
+            SELECT name, plan_token, turn_id, content_revision,
+                   presentation_version, part_count, state
+            FROM turn_presentation_plans
+            WHERE host_id = ?
+            """,
+            (host_id,),
+        ).fetchall()
+        stored_jobs = conn.execute(
+            """
+            SELECT operation, part_ordinal, sequence_index, outbox_id, spans_json
+            FROM turn_presentation_jobs
+            WHERE plan_id = (
+                SELECT id FROM turn_presentation_plans
+                WHERE host_id = ? AND plan_token = ?
+            )
+            ORDER BY sequence_index
+            """,
+            (host_id, plan_token),
+        ).fetchall()
+        stored_outbox = [
+            json.loads(row[0])
+            for row in conn.execute(
+                """
+                SELECT payload_json FROM connector_outbox
+                WHERE host_id = ? AND connector = 'turn-final'
+                ORDER BY id
+                """,
+                (host_id,),
+            )
+        ]
+
+    assert canonical_row == (expected, len(expected), len(expected.encode("utf-8")))
+    assert "assistant_final_text" not in stored_turn
+    assert len(stored_plans) == 1
+    assert len(stored_jobs) == len(pages)
+    assert len(stored_outbox) == len(pages)
+
+    clean_surfaces = (
+        listed,
+        pages,
+        begun,
+        prepared_parts,
+        committed,
+        poll_surfaces,
+        job_items,
+        ack_surfaces,
+        canonical_row,
+        stored_turn,
+        stored_plans,
+        stored_jobs,
+        stored_outbox,
+    )
+    for surface in clean_surfaces:
+        _assert_sentinels_absent(surface, {"boundary_secret": private_secret})

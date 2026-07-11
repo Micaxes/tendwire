@@ -6,10 +6,14 @@ turn/pending JSON shapes and conservative projections from public snapshots.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 from .models import (
@@ -23,6 +27,7 @@ from .models import (
     _is_forbidden_public_text_phrase,
     _TEXT_FORBIDDEN_FIELD_NAMES,
     normalize_status,
+    sanitize_canonical_turn_text,
     public_json_dumps,
     sanitize_public_mapping,
     sanitize_public_text,
@@ -38,8 +43,15 @@ from .models import (
 
 
 TURN_SCHEMA_VERSION = 1
+TURN_LIST_SCHEMA_VERSION = 2
+TURN_CONTENT_SCHEMA_VERSION = 1
 TURN_TEXT_MAX_CHARS = 12000
 TURN_STREAM_TEXT_MAX_CHARS = 4000
+TURN_CONTENT_PREVIEW_MAX_CHARS = 1000
+TURN_CONTENT_PAGE_MAX_UTF8_BYTES = 48 * 1024
+
+TURN_CONTENT_FIELDS = ("user_text", "assistant_final_text")
+TURN_CONTENT_AVAILABILITIES = frozenset({"absent", "complete", "known_incomplete"})
 
 TURN_KINDS = frozenset({"task", "message", "review", "unknown"})
 PENDING_KINDS = frozenset(
@@ -254,9 +266,15 @@ def _optional_public_fingerprint(value: Any) -> str | None:
     return text
 
 
-def _public_turn_text(value: Any, *, max_chars: int = TURN_TEXT_MAX_CHARS) -> str | None:
-    text = sanitize_public_text(value, max_chars=max_chars)
-    return text or None
+def _public_turn_text(value: Any) -> str | None:
+    return sanitize_canonical_turn_text(value)
+
+
+def _public_stream_text(value: Any) -> str | None:
+    text = sanitize_public_text(value, max_chars=None)
+    if not text:
+        return None
+    return text[-TURN_STREAM_TEXT_MAX_CHARS:]
 
 
 
@@ -273,6 +291,694 @@ def redact_private_prompt_text(value: Any, *, max_chars: int = TURN_TEXT_MAX_CHA
         max_chars=max_chars,
         collapse_whitespace=True,
     )
+
+def _base64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _domain_digest(domain: str, value: Mapping[str, Any]) -> str:
+    encoded = stable_json_dumps({"domain": domain, **value}).encode("utf-8")
+    return _base64url(hashlib.sha256(encoded).digest())
+
+
+def _validate_content_field(field: str) -> str:
+    if field not in TURN_CONTENT_FIELDS:
+        raise ValueError("invalid_content_field")
+    return field
+
+
+def _validate_content_state(state: str, text: str | None) -> str:
+    if not isinstance(state, str):
+        raise ValueError("invalid_content_availability")
+    if text is not None and not isinstance(text, str):
+        raise ValueError("invalid_content_text")
+    if state not in TURN_CONTENT_AVAILABILITIES:
+        raise ValueError("invalid_content_availability")
+    if state == "absent" and text is not None:
+        raise ValueError("absent_content_has_text")
+    if state != "absent" and text is None:
+        raise ValueError("available_content_has_no_text")
+    return state
+
+
+def _inferred_content_state(text: str | None, state: str | None) -> str:
+    return _validate_content_state(state or ("absent" if text is None else "complete"), text)
+
+
+def content_revision(
+    turn_id: str,
+    user_text: str | None,
+    final_text: str | None,
+    user_state: str,
+    final_state: str,
+) -> str:
+    """Return the stable opaque identity of one immutable canonical revision."""
+    clean_turn_id = str(turn_id)
+    if not clean_turn_id:
+        raise ValueError("invalid_turn_id")
+    _validate_content_state(user_state, user_text)
+    _validate_content_state(final_state, final_text)
+    digest = _domain_digest(
+        "tendwire.turn-content-revision.v1",
+        {
+            "turn_id": clean_turn_id,
+            "user_text": user_text,
+            "assistant_final_text": final_text,
+            "user_state": user_state,
+            "final_state": final_state,
+        },
+    )
+    return f"twrev1.{digest}"
+
+
+def content_segment_id(revision: str, field: str, index: int) -> str:
+    """Return a stable opaque identity for a transport segment."""
+    _validate_content_field(field)
+    if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+        raise ValueError("invalid_segment_index")
+    digest = _domain_digest(
+        "tendwire.turn-content-segment.v1",
+        {"content_revision": str(revision), "field": field, "index": index},
+    )
+    return f"twseg1.{digest}"
+
+
+@dataclass(frozen=True)
+class ContentCursorPosition:
+    """Integrity-bound continuation coordinates decoded from an opaque cursor."""
+
+    index: int
+    segment_id: str
+    start_char: int
+    start_byte: int
+
+
+def content_cursor(
+    revision: str,
+    field: str,
+    index: int,
+    *,
+    start_char: int | None = None,
+    start_byte: int | None = None,
+) -> str:
+    """Encode one deterministic cursor bound to its segment and exact start."""
+    _validate_content_field(field)
+    if start_char is None or start_byte is None:
+        if index != 0 or start_char is not None or start_byte is not None:
+            raise ValueError("invalid_cursor")
+        start_char = 0
+        start_byte = 0
+    coordinates = (index, start_char, start_byte)
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in coordinates
+    ):
+        raise ValueError("invalid_cursor")
+    segment_id = content_segment_id(revision, field, index)
+    material = {
+        "content_revision": str(revision),
+        "field": field,
+        "segment_id": segment_id,
+        "index": index,
+        "start_char": start_char,
+        "start_byte": start_byte,
+    }
+    integrity = _domain_digest(
+        "tendwire.turn-content-cursor-integrity.v2",
+        material,
+    )
+    body = stable_json_dumps(
+        {
+            "b": start_byte,
+            "c": start_char,
+            "h": integrity,
+            "i": index,
+            "s": segment_id,
+            "v": 2,
+        }
+    ).encode("utf-8")
+    return f"twcur1.{_base64url(body)}"
+
+
+def decode_content_cursor(
+    cursor: str,
+    *,
+    revision: str,
+    field: str,
+    count: int,
+) -> ContentCursorPosition:
+    """Validate a cursor and return its revision-bound continuation coordinates."""
+    _validate_content_field(field)
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+        raise ValueError("invalid_cursor")
+    if not isinstance(cursor, str) or not cursor.startswith("twcur1."):
+        raise ValueError("invalid_cursor")
+    encoded = cursor.removeprefix("twcur1.")
+    if (
+        not encoded
+        or len(encoded) > 1024
+        or any(
+            char
+            not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+            for char in encoded
+        )
+    ):
+        raise ValueError("invalid_cursor")
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        raw = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
+        if _base64url(raw) != encoded:
+            raise ValueError("noncanonical cursor encoding")
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        raise ValueError("invalid_cursor") from None
+    if (
+        not isinstance(body, dict)
+        or set(body) != {"b", "c", "h", "i", "s", "v"}
+        or body.get("v") != 2
+    ):
+        raise ValueError("invalid_cursor")
+    index = body.get("i")
+    start_char = body.get("c")
+    start_byte = body.get("b")
+    segment_id = body.get("s")
+    integrity = body.get("h")
+    if (
+        any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in (index, start_char, start_byte)
+        )
+        or not 0 <= index < count
+        or not isinstance(segment_id, str)
+        or segment_id != content_segment_id(revision, field, index)
+        or not isinstance(integrity, str)
+    ):
+        raise ValueError("invalid_cursor")
+    expected = _domain_digest(
+        "tendwire.turn-content-cursor-integrity.v2",
+        {
+            "content_revision": str(revision),
+            "field": field,
+            "segment_id": segment_id,
+            "index": index,
+            "start_char": start_char,
+            "start_byte": start_byte,
+        },
+    )
+    if not hmac.compare_digest(integrity, expected):
+        raise ValueError("invalid_cursor")
+    return ContentCursorPosition(index, segment_id, start_char, start_byte)
+
+
+def _utf8_code_point_width(character: str) -> int:
+    value = ord(character)
+    if 0xD800 <= value <= 0xDFFF:
+        raise ValueError("canonical text contains an invalid Unicode surrogate")
+    if value <= 0x7F:
+        return 1
+    if value <= 0x7FF:
+        return 2
+    if value <= 0xFFFF:
+        return 3
+    return 4
+
+
+@dataclass(frozen=True)
+class ContentSegment:
+    """One exact half-open canonical code-point transport page."""
+
+    index: int
+    start_char: int
+    end_char: int
+    start_byte: int
+    end_byte: int
+    text: str
+    char_length: int
+    byte_length: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "start_char": self.start_char,
+            "end_char": self.end_char,
+            "start_byte": self.start_byte,
+            "end_byte": self.end_byte,
+            "text": self.text,
+            "char_length": self.char_length,
+            "byte_length": self.byte_length,
+        }
+
+
+def segment_canonical_text(
+    text: str,
+    *,
+    max_utf8_bytes: int = TURN_CONTENT_PAGE_MAX_UTF8_BYTES,
+) -> tuple[ContentSegment, ...]:
+    """Split canonical text into exact UTF-8-bounded code-point pages."""
+    if not isinstance(text, str):
+        raise TypeError("canonical text must be a string")
+    if (
+        not isinstance(max_utf8_bytes, int)
+        or isinstance(max_utf8_bytes, bool)
+        or max_utf8_bytes < 1
+    ):
+        raise ValueError("max_utf8_bytes must be positive")
+    if not text:
+        return ()
+
+    segments: list[ContentSegment] = []
+    start = 0
+    start_byte = 0
+    byte_length = 0
+    for offset, character in enumerate(text):
+        width = _utf8_code_point_width(character)
+        if width > max_utf8_bytes:
+            raise ValueError("max_utf8_bytes cannot hold one code point")
+        if byte_length and byte_length + width > max_utf8_bytes:
+            page = text[start:offset]
+            segments.append(
+                ContentSegment(
+                    index=len(segments),
+                    start_char=start,
+                    end_char=offset,
+                    start_byte=start_byte,
+                    end_byte=start_byte + byte_length,
+                    text=page,
+                    char_length=offset - start,
+                    byte_length=byte_length,
+                )
+            )
+            start = offset
+            start_byte += byte_length
+            byte_length = 0
+        byte_length += width
+    page = text[start:]
+    segments.append(
+        ContentSegment(
+            index=len(segments),
+            start_char=start,
+            end_char=len(text),
+            start_byte=start_byte,
+            end_byte=start_byte + byte_length,
+            text=page,
+            char_length=len(text) - start,
+            byte_length=byte_length,
+        )
+    )
+    return tuple(segments)
+
+
+@dataclass(frozen=True)
+class ContentFieldDescriptor:
+    """Bounded public metadata for one canonical content field."""
+
+    availability: str
+    inline: bool
+    char_length: int
+    byte_length: int
+    page_count: int
+    first_cursor: str | None
+
+    def __post_init__(self) -> None:
+        if self.availability not in TURN_CONTENT_AVAILABILITIES:
+            raise ValueError("invalid_content_availability")
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in (self.char_length, self.byte_length, self.page_count)
+        ):
+            raise ValueError("invalid_content_length")
+        if not isinstance(self.inline, bool):
+            raise ValueError("invalid_inline_state")
+        if self.first_cursor is not None and not isinstance(self.first_cursor, str):
+            raise ValueError("invalid_first_cursor")
+        if self.availability != "complete" and (
+            self.inline or self.page_count or self.first_cursor is not None
+        ):
+            raise ValueError("incomplete_content_cannot_be_inline_or_pageable")
+        if self.availability == "absent" and (self.char_length or self.byte_length):
+            raise ValueError("absent_content_has_length")
+        if self.inline and self.first_cursor is not None:
+            raise ValueError("inline_content_has_cursor")
+        if (
+            self.availability == "complete"
+            and not self.inline
+            and self.char_length
+            and (not self.page_count or self.first_cursor is None)
+        ):
+            raise ValueError("paged_content_requires_cursor")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "availability": self.availability,
+            "inline": self.inline,
+            "char_length": self.char_length,
+            "byte_length": self.byte_length,
+            "page_count": self.page_count,
+            "first_cursor": self.first_cursor,
+        }
+
+
+@dataclass(frozen=True)
+class TurnContentDescriptor:
+    """Immutable v1 description of a canonical turn content revision."""
+
+    schema_version: int
+    content_revision: str
+    known_incomplete: bool
+    fields: Mapping[str, ContentFieldDescriptor]
+
+    def __post_init__(self) -> None:
+        if self.schema_version != TURN_CONTENT_SCHEMA_VERSION:
+            raise ValueError("invalid_content_schema_version")
+        if set(self.fields) != set(TURN_CONTENT_FIELDS):
+            raise ValueError("invalid_content_fields")
+        if not isinstance(self.known_incomplete, bool):
+            raise ValueError("invalid_known_incomplete")
+        if any(
+            not isinstance(descriptor, ContentFieldDescriptor)
+            for descriptor in self.fields.values()
+        ):
+            raise ValueError("invalid_content_field_descriptor")
+        expected_incomplete = any(
+            descriptor.availability == "known_incomplete"
+            for descriptor in self.fields.values()
+        )
+        if self.known_incomplete != expected_incomplete:
+            raise ValueError("inconsistent_known_incomplete")
+        immutable = MappingProxyType(dict(self.fields))
+        object.__setattr__(self, "fields", immutable)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "content_revision": self.content_revision,
+            "known_incomplete": self.known_incomplete,
+            "fields": {
+                field: self.fields[field].to_dict()
+                for field in TURN_CONTENT_FIELDS
+            },
+        }
+
+
+def _content_field_descriptor(
+    revision: str,
+    field: str,
+    text: str | None,
+    state: str,
+    *,
+    inline_max_chars: int,
+) -> ContentFieldDescriptor:
+    if text is None:
+        return ContentFieldDescriptor(state, False, 0, 0, 0, None)
+    char_length = len(text)
+    if state == "complete":
+        segments = segment_canonical_text(text)
+        page_count = len(segments)
+        byte_length = sum(segment.byte_length for segment in segments)
+    else:
+        page_count = 0
+        byte_length = len(text.encode("utf-8"))
+    inline = state == "complete" and char_length <= inline_max_chars
+    first_cursor = (
+        content_cursor(revision, field, 0, start_char=0, start_byte=0)
+        if state == "complete" and not inline and page_count
+        else None
+    )
+    return ContentFieldDescriptor(
+        availability=state,
+        inline=inline,
+        char_length=char_length,
+        byte_length=byte_length,
+        page_count=page_count,
+        first_cursor=first_cursor,
+    )
+
+
+def build_turn_content_descriptor(
+    turn_id: str,
+    user_text: str | None,
+    final_text: str | None,
+    *,
+    user_state: str | None = None,
+    final_state: str | None = None,
+    inline_max_chars: int = TURN_TEXT_MAX_CHARS,
+) -> TurnContentDescriptor:
+    """Describe one canonical revision without copying its content."""
+    if (
+        not isinstance(inline_max_chars, int)
+        or isinstance(inline_max_chars, bool)
+        or inline_max_chars < 0
+    ):
+        raise ValueError("inline_max_chars must be nonnegative")
+    resolved_user_state = _inferred_content_state(user_text, user_state)
+    resolved_final_state = _inferred_content_state(final_text, final_state)
+    revision = content_revision(
+        turn_id,
+        user_text,
+        final_text,
+        resolved_user_state,
+        resolved_final_state,
+    )
+    fields = {
+        "user_text": _content_field_descriptor(
+            revision,
+            "user_text",
+            user_text,
+            resolved_user_state,
+            inline_max_chars=inline_max_chars,
+        ),
+        "assistant_final_text": _content_field_descriptor(
+            revision,
+            "assistant_final_text",
+            final_text,
+            resolved_final_state,
+            inline_max_chars=inline_max_chars,
+        ),
+    }
+    return TurnContentDescriptor(
+        schema_version=TURN_CONTENT_SCHEMA_VERSION,
+        content_revision=revision,
+        known_incomplete=(
+            resolved_user_state == "known_incomplete"
+            or resolved_final_state == "known_incomplete"
+        ),
+        fields=fields,
+    )
+
+
+def project_turn_content(
+    turn_id: str,
+    user_text: str | None,
+    final_text: str | None,
+    *,
+    user_state: str | None = None,
+    final_state: str | None = None,
+    inline_max_chars: int = TURN_TEXT_MAX_CHARS,
+    preview_max_chars: int = TURN_CONTENT_PREVIEW_MAX_CHARS,
+) -> dict[str, Any]:
+    """Return the bounded v2 inline/preview projection for canonical content."""
+    if (
+        not isinstance(preview_max_chars, int)
+        or isinstance(preview_max_chars, bool)
+        or preview_max_chars < 0
+    ):
+        raise ValueError("preview_max_chars must be nonnegative")
+    descriptor = build_turn_content_descriptor(
+        turn_id,
+        user_text,
+        final_text,
+        user_state=user_state,
+        final_state=final_state,
+        inline_max_chars=inline_max_chars,
+    )
+    projected: dict[str, Any] = {"content": descriptor.to_dict()}
+    values = {
+        "user_text": (user_text, "user_preview"),
+        "assistant_final_text": (final_text, "assistant_final_preview"),
+    }
+    for field, (text, preview_key) in values.items():
+        field_descriptor = descriptor.fields[field]
+        if field_descriptor.inline:
+            projected[field] = text
+        elif text is not None:
+            projected[preview_key] = text[:preview_max_chars]
+    return projected
+
+def project_persisted_turn_content(
+    revision: str,
+    *,
+    user_state: str,
+    user_char_length: int,
+    user_byte_length: int,
+    user_page_count: int,
+    user_inline: str | None,
+    user_preview: str | None,
+    final_state: str,
+    final_char_length: int,
+    final_byte_length: int,
+    final_page_count: int,
+    final_inline: str | None,
+    final_preview: str | None,
+    inline_max_chars: int = TURN_TEXT_MAX_CHARS,
+    preview_max_chars: int = TURN_CONTENT_PREVIEW_MAX_CHARS,
+) -> dict[str, Any]:
+    """Project persisted descriptors and bounded SQL text without canonical scans."""
+    if (
+        not isinstance(revision, str)
+        or not revision
+        or not isinstance(inline_max_chars, int)
+        or isinstance(inline_max_chars, bool)
+        or inline_max_chars < 0
+        or not isinstance(preview_max_chars, int)
+        or isinstance(preview_max_chars, bool)
+        or preview_max_chars < 0
+    ):
+        raise ValueError("invalid_persisted_content_descriptor")
+    inputs = {
+        "user_text": (
+            user_state,
+            user_char_length,
+            user_byte_length,
+            user_page_count,
+            user_inline,
+            user_preview,
+            "user_preview",
+        ),
+        "assistant_final_text": (
+            final_state,
+            final_char_length,
+            final_byte_length,
+            final_page_count,
+            final_inline,
+            final_preview,
+            "assistant_final_preview",
+        ),
+    }
+    fields: dict[str, ContentFieldDescriptor] = {}
+    projected: dict[str, Any] = {}
+    for field, (
+        state,
+        char_length,
+        byte_length,
+        page_count,
+        inline_text,
+        preview_text,
+        preview_key,
+    ) in inputs.items():
+        if state not in TURN_CONTENT_AVAILABILITIES or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in (char_length, byte_length, page_count)
+        ):
+            raise ValueError("invalid_persisted_content_descriptor")
+        inline = state == "complete" and char_length <= inline_max_chars and char_length > 0
+        if state == "absent":
+            if any((char_length, byte_length, page_count)) or any(
+                value is not None for value in (inline_text, preview_text)
+            ):
+                raise ValueError("invalid_persisted_content_descriptor")
+        elif state == "known_incomplete":
+            if page_count or inline_text is not None:
+                raise ValueError("invalid_persisted_content_descriptor")
+        elif char_length:
+            if page_count < 1 or (inline and not isinstance(inline_text, str)):
+                raise ValueError("invalid_persisted_content_descriptor")
+        elif any((byte_length, page_count)) or inline_text not in (None, ""):
+            raise ValueError("invalid_persisted_content_descriptor")
+        if isinstance(inline_text, str):
+            if not inline or len(inline_text) != char_length:
+                raise ValueError("invalid_persisted_content_descriptor")
+            projected[field] = inline_text
+        elif state != "absent" and isinstance(preview_text, str):
+            if len(preview_text) > preview_max_chars:
+                raise ValueError("invalid_persisted_content_descriptor")
+            projected[preview_key] = preview_text
+        fields[field] = ContentFieldDescriptor(
+            availability=state,
+            inline=inline,
+            char_length=char_length,
+            byte_length=byte_length,
+            page_count=page_count if state == "complete" else 0,
+            first_cursor=(
+                content_cursor(revision, field, 0, start_char=0, start_byte=0)
+                if state == "complete" and not inline and page_count
+                else None
+            ),
+        )
+    descriptor = TurnContentDescriptor(
+        schema_version=TURN_CONTENT_SCHEMA_VERSION,
+        content_revision=revision,
+        known_incomplete=any(
+            descriptor.availability == "known_incomplete"
+            for descriptor in fields.values()
+        ),
+        fields=fields,
+    )
+    return {"content": descriptor.to_dict(), **projected}
+
+
+def build_turn_content_page(
+    turn_id: str,
+    revision: str,
+    field: str,
+    text: str,
+    *,
+    cursor: str | None = None,
+    max_utf8_bytes: int = TURN_CONTENT_PAGE_MAX_UTF8_BYTES,
+) -> dict[str, Any]:
+    """Build one trusted lossless content-page payload from canonical text."""
+    _validate_content_field(field)
+    segments = segment_canonical_text(text, max_utf8_bytes=max_utf8_bytes)
+    count = len(segments)
+    if not count:
+        raise ValueError("content_has_no_segments")
+    position = (
+        ContentCursorPosition(
+            index=0,
+            segment_id=content_segment_id(revision, field, 0),
+            start_char=0,
+            start_byte=0,
+        )
+        if cursor is None
+        else decode_content_cursor(
+            cursor,
+            revision=revision,
+            field=field,
+            count=count,
+        )
+    )
+    segment = segments[position.index]
+    if (
+        position.segment_id != content_segment_id(revision, field, segment.index)
+        or position.start_char != segment.start_char
+        or position.start_byte != segment.start_byte
+    ):
+        raise ValueError("invalid_cursor")
+    return {
+        "schema_version": TURN_CONTENT_SCHEMA_VERSION,
+        "turn_id": str(turn_id),
+        "content_revision": str(revision),
+        "field": field,
+        "availability": "complete",
+        "segment_id": position.segment_id,
+        "index": position.index,
+        "count": count,
+        "text": segment.text,
+        "segment_char_length": segment.char_length,
+        "segment_byte_length": segment.byte_length,
+        "total_char_length": len(text),
+        "total_byte_length": segments[-1].end_byte,
+        "next_cursor": (
+            content_cursor(
+                revision,
+                field,
+                position.index + 1,
+                start_char=segment.end_char,
+                start_byte=segment.end_byte,
+            )
+            if position.index + 1 < count
+            else None
+        ),
+    }
 
 
 def recompute_pending_content_fingerprint(payload: Mapping[str, Any]) -> str:
@@ -541,10 +1247,7 @@ class Turn:
         summary = _optional_public_text(self.summary)
         user_text = _public_turn_text(self.user_text)
         assistant_final_text = _public_turn_text(self.assistant_final_text)
-        assistant_stream_text = _public_turn_text(
-            self.assistant_stream_text,
-            max_chars=TURN_STREAM_TEXT_MAX_CHARS,
-        )
+        assistant_stream_text = _public_stream_text(self.assistant_stream_text)
         model = _optional_public_text(self.model)
         started_at = _optional_timestamp(self.started_at)
         updated_at = _optional_timestamp(self.updated_at)
@@ -589,7 +1292,7 @@ class Turn:
             "meta": meta,
         }
         turn_id = _stable_id("turn", identity_payload)
-        fingerprint = _content_fingerprint(content_payload)
+        fingerprint = stable_fingerprint(_strip_volatile(content_payload))
 
         object.__setattr__(self, "schema_version", TURN_SCHEMA_VERSION)
         object.__setattr__(self, "id", turn_id)
@@ -617,7 +1320,10 @@ class Turn:
         object.__setattr__(self, "meta", meta)
 
     def to_dict(self) -> dict[str, Any]:
-        return sanitize_public_mapping({
+        # Canonical prompt/final values were sanitized once in __post_init__.
+        # Re-routing this trusted shape through the generic mapping sanitizer
+        # would silently impose its unrelated 12,000-character value bound.
+        return {
             "schema_version": self.schema_version,
             "id": self.id,
             "host_id": self.host_id,
@@ -642,10 +1348,10 @@ class Turn:
             "source_turn_id": self.source_turn_id,
             "fingerprint": self.fingerprint,
             "meta": _clean_meta(self.meta),
-        })
+        }
 
     def to_json(self, indent: int | None = None) -> str:
-        return public_json_dumps(self.to_dict(), indent=indent)
+        return stable_json_dumps(self.to_dict(), indent=indent)
 
     @classmethod
     def from_dict(cls, data: "Turn | Mapping[str, Any]") -> "Turn":
@@ -960,26 +1666,52 @@ def _backend_health_payload(backend_health: Iterable[BackendHealth]) -> list[dic
     return [BackendHealth.from_dict(health).to_dict() for health in backend_health]
 
 
-def turns_payload_from_snapshot(snapshot: Snapshot) -> dict[str, Any]:
-    """Return the public JSON wrapper for projected turns."""
-    turns = [turn.to_dict() for turn in turns_from_snapshot(snapshot)]
+def turns_payload_from_snapshot(
+    snapshot: Snapshot,
+    *,
+    schema_version: int = TURN_SCHEMA_VERSION,
+) -> dict[str, Any]:
+    """Return a negotiated bounded public turn-list projection.
+
+    Legacy v1 remains available only when every canonical field is safely
+    inline. Callers requesting v2 receive explicit content metadata/previews.
+    """
+    if schema_version not in {TURN_SCHEMA_VERSION, TURN_LIST_SCHEMA_VERSION}:
+        raise ValueError("unsupported_turn_schema_version")
+    turns: list[dict[str, Any]] = []
+    for turn in turns_from_snapshot(snapshot):
+        item = turn.to_dict()
+        if schema_version == TURN_SCHEMA_VERSION:
+            if any(
+                isinstance(item.get(field), str)
+                and len(item[field]) > TURN_TEXT_MAX_CHARS
+                for field in TURN_CONTENT_FIELDS
+            ):
+                raise ValueError("upgrade_required")
+        else:
+            user_text = item.pop("user_text")
+            final_text = item.pop("assistant_final_text")
+            item.update(project_turn_content(turn.id, user_text, final_text))
+        turns.append(item)
     backend_health = _backend_health_payload(snapshot.backend_health)
     payload = {
-        "schema_version": TURN_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "host_id": snapshot.host_id,
         "updated_at": snapshot.updated_at,
         "turns": turns,
         "backend_health": backend_health,
     }
-    payload["content_fingerprint"] = _content_fingerprint(
-        {
-            "schema_version": payload["schema_version"],
-            "host_id": payload["host_id"],
-            "turns": turns,
-            "backend_health": backend_health,
-        }
+    payload["content_fingerprint"] = stable_fingerprint(
+        _strip_volatile(
+            {
+                "schema_version": payload["schema_version"],
+                "host_id": payload["host_id"],
+                "turns": turns,
+                "backend_health": backend_health,
+            }
+        )
     )
-    return sanitize_public_mapping(payload)
+    return payload
 
 
 def pending_payload_from_snapshot(snapshot: Snapshot) -> dict[str, Any]:

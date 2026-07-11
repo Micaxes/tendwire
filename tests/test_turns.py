@@ -5,19 +5,35 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from typing import Any
+import pytest
 
 from tendwire.config import Config
-from tendwire.core.models import AttentionSignal, Snapshot, SuggestedAction, Worker
+from tendwire.core.models import (
+    AttentionSignal,
+    Snapshot,
+    SuggestedAction,
+    Worker,
+    sanitize_canonical_turn_text,
+)
 from tendwire.core.projector import project_from_raw
 from tendwire.core.turns import (
     InteractionChoice,
     PendingInteraction,
     Turn,
+    TURN_CONTENT_PAGE_MAX_UTF8_BYTES,
+    build_turn_content_descriptor,
+    build_turn_content_page,
+    content_cursor,
+    content_revision,
+    content_segment_id,
+    decode_content_cursor,
     payload_to_json,
     pending_from_snapshot,
     pending_payload_from_snapshot,
     turns_from_snapshot,
     turns_payload_from_snapshot,
+    project_turn_content,
+    segment_canonical_text,
 )
 
 
@@ -1220,3 +1236,360 @@ def test_turn_and_pending_payload_fingerprints_ignore_wrapper_timestamps() -> No
     assert json.loads(payload_to_json(pending_payload_a)) == pending_payload_a
     _assert_no_forbidden_fields(turns_payload_a)
     _assert_no_forbidden_fields(pending_payload_a)
+
+
+@pytest.mark.parametrize(
+    ("length", "inline"),
+    ((11_999, True), (12_000, True), (12_001, False)),
+)
+def test_canonical_turn_inline_boundaries_are_lossless(length: int, inline: bool) -> None:
+    text = "x" * length
+    turn = Turn(
+        host_id="canonical-boundary-host",
+        worker_id="worker-boundary",
+        user_text=text,
+        assistant_final_text=text,
+        complete=True,
+    )
+
+    assert turn.user_text == text
+    assert turn.assistant_final_text == text
+    assert Turn.from_json(turn.to_json()).user_text == text
+    projection = project_turn_content(turn.id, turn.user_text, turn.assistant_final_text)
+    for field in ("user_text", "assistant_final_text"):
+        descriptor = projection["content"]["fields"][field]
+        assert descriptor["inline"] is inline
+        assert descriptor["char_length"] == length
+        assert descriptor["byte_length"] == length
+        assert descriptor["availability"] == "complete"
+    if inline:
+        assert projection["user_text"] == text
+        assert projection["assistant_final_text"] == text
+        assert "user_preview" not in projection
+        assert "assistant_final_preview" not in projection
+    else:
+        assert "user_text" not in projection
+        assert "assistant_final_text" not in projection
+        assert projection["user_preview"] == text[:1000]
+        assert projection["assistant_final_preview"] == text[:1000]
+
+
+@pytest.mark.parametrize("length", (3_999, 4_000, 4_001))
+def test_assistant_stream_is_a_rolling_4000_code_point_projection(length: int) -> None:
+    stream = ("x" + ("s" * 4_000)) if length == 4_001 else ("s" * length)
+    turn = Turn(
+        host_id="stream-boundary-host",
+        worker_id=f"worker-stream-{length}",
+        assistant_stream_text=stream,
+    )
+    assert turn.assistant_stream_text == stream[-4000:]
+    assert len(turn.assistant_stream_text or "") == min(len(stream), 4000)
+    assert "[truncated]" not in (turn.assistant_stream_text or "")
+
+
+def test_canonical_turn_roundtrip_preserves_remaining_exact_code_points() -> None:
+    raw = (
+        " \r\n\r\n# He\u0301ading\r\n"
+        "- first\r\n  - nested\r\n\r\n"
+        "```python\r\nprint('public')\r\n```\r\n"
+        "\u200bvisible\x00\r\n "
+    )
+    expected = (
+        " \r\n\r\n# Héading\r\n"
+        "- first\r\n  - nested\r\n\r\n"
+        "```python\r\nprint('public')\r\n```\r\n"
+        "visible\r\n "
+    )
+    canonical = sanitize_canonical_turn_text(raw)
+    turn = Turn(
+        host_id="canonical-fidelity-host",
+        worker_id="worker-fidelity",
+        user_text=raw,
+        assistant_final_text=raw + ("z" * 20_000),
+        complete=True,
+    )
+
+    assert canonical == expected
+    assert turn.user_text == expected
+    assert turn.assistant_final_text == expected + ("z" * 20_000)
+    restored = Turn.from_json(turn.to_json())
+    assert restored.user_text == turn.user_text
+    assert restored.assistant_final_text == turn.assistant_final_text
+    assert restored.fingerprint == turn.fingerprint
+
+
+def test_large_multibyte_canonical_content_pages_reassemble_exactly() -> None:
+    text = ("😀漢字e\u0301\r\n# heading\n- item\n```text\nx\n```\n" * 35_000)
+    canonical = sanitize_canonical_turn_text(text)
+    assert canonical is not None
+    assert len(canonical.encode("utf-8")) > 1024 * 1024
+
+    segments = segment_canonical_text(canonical)
+
+    assert "".join(segment.text for segment in segments) == canonical
+    assert sum(segment.char_length for segment in segments) == len(canonical)
+    assert sum(segment.byte_length for segment in segments) == len(canonical.encode("utf-8"))
+    assert all(
+        segment.byte_length == len(segment.text.encode("utf-8"))
+        and segment.byte_length <= TURN_CONTENT_PAGE_MAX_UTF8_BYTES
+        and segment.start_char == (segments[index - 1].end_char if index else 0)
+        for index, segment in enumerate(segments)
+    )
+    assert segments[-1].end_char == len(canonical)
+    assert segments == segment_canonical_text(canonical)
+
+@pytest.mark.parametrize(
+    ("byte_length", "expected_page_bytes"),
+    (
+        (TURN_CONTENT_PAGE_MAX_UTF8_BYTES - 1, (TURN_CONTENT_PAGE_MAX_UTF8_BYTES - 1,)),
+        (TURN_CONTENT_PAGE_MAX_UTF8_BYTES, (TURN_CONTENT_PAGE_MAX_UTF8_BYTES,)),
+        (TURN_CONTENT_PAGE_MAX_UTF8_BYTES + 1, (TURN_CONTENT_PAGE_MAX_UTF8_BYTES - 3, 4)),
+    ),
+)
+def test_multibyte_content_pages_honor_exact_utf8_byte_boundaries(
+    byte_length: int,
+    expected_page_bytes: tuple[int, ...],
+) -> None:
+    text = ("a" * (byte_length - 4)) + "😀"
+
+    segments = segment_canonical_text(text)
+
+    assert len(text.encode("utf-8")) == byte_length
+    assert tuple(segment.byte_length for segment in segments) == expected_page_bytes
+    assert "".join(segment.text for segment in segments) == text
+    assert segments[-1].text.endswith("😀")
+
+
+
+def test_content_identities_and_cursors_are_deterministic_and_revision_bound() -> None:
+    turn_id = "turn-" + ("a" * 24)
+    user_text = " prompt "
+    final_text = "final😀" * 10_000
+    revision = content_revision(
+        turn_id,
+        user_text,
+        final_text,
+        "complete",
+        "complete",
+    )
+    same_revision = content_revision(
+        turn_id,
+        user_text,
+        final_text,
+        "complete",
+        "complete",
+    )
+    changed_revision = content_revision(
+        turn_id,
+        user_text,
+        final_text + "!",
+        "complete",
+        "complete",
+    )
+    cursor = content_cursor(
+        revision,
+        "assistant_final_text",
+        1,
+        start_char=6_144,
+        start_byte=9_216,
+    )
+
+    assert revision == same_revision
+    assert revision.startswith("twrev1.")
+    assert changed_revision != revision
+    assert content_segment_id(revision, "assistant_final_text", 1).startswith("twseg1.")
+    assert content_segment_id(revision, "assistant_final_text", 1) == content_segment_id(
+        revision,
+        "assistant_final_text",
+        1,
+    )
+    assert cursor.startswith("twcur1.")
+    position = decode_content_cursor(
+        cursor,
+        revision=revision,
+        field="assistant_final_text",
+        count=3,
+    )
+    assert position.index == 1
+    assert position.segment_id == content_segment_id(
+        revision, "assistant_final_text", 1
+    )
+    assert position.start_char == 6_144
+    assert position.start_byte == 9_216
+    with pytest.raises(ValueError, match="invalid_cursor"):
+        content_cursor(revision, "assistant_final_text", 1)
+    with pytest.raises(ValueError, match="invalid_cursor"):
+        decode_content_cursor(
+            cursor,
+            revision=changed_revision,
+            field="assistant_final_text",
+            count=3,
+        )
+    with pytest.raises(ValueError, match="invalid_cursor"):
+        decode_content_cursor(
+            cursor[:-1] + ("A" if cursor[-1] != "A" else "B"),
+            revision=revision,
+            field="assistant_final_text",
+            count=3,
+        )
+    with pytest.raises(ValueError, match="invalid_cursor"):
+        decode_content_cursor(
+            cursor,
+            revision=revision,
+            field="user_text",
+            count=3,
+        )
+
+@pytest.mark.parametrize(
+    "cursor",
+    (
+        "",
+        "not-a-cursor",
+        "twcur1.",
+        "twcur1.!!!!",
+        "twcur1.e30",
+    ),
+)
+def test_content_cursor_rejects_malformed_encodings(cursor: str) -> None:
+    revision = "twrev1." + ("d" * 43)
+
+    with pytest.raises(ValueError, match="invalid_cursor"):
+        decode_content_cursor(
+            cursor,
+            revision=revision,
+            field="assistant_final_text",
+            count=2,
+        )
+
+
+def test_content_cursor_rejects_valid_integrity_at_out_of_range_index() -> None:
+    revision = "twrev1." + ("e" * 43)
+    cursor = content_cursor(
+        revision,
+        "assistant_final_text",
+        2,
+        start_char=20_000,
+        start_byte=40_000,
+    )
+
+    with pytest.raises(ValueError, match="invalid_cursor"):
+        decode_content_cursor(
+            cursor,
+            revision=revision,
+            field="assistant_final_text",
+            count=2,
+        )
+
+
+def test_v2_descriptor_and_page_payload_have_exact_lengths_and_cursor_progression() -> None:
+    turn_id = "turn-" + ("b" * 24)
+    user_text = "short"
+    final_text = ("😀" * 20_000) + "\r\n "
+    descriptor = build_turn_content_descriptor(turn_id, user_text, final_text)
+    revision = descriptor.content_revision
+    final_descriptor = descriptor.fields["assistant_final_text"]
+
+    assert descriptor.schema_version == 1
+    assert descriptor.known_incomplete is False
+    assert descriptor.fields["user_text"].inline is True
+    assert final_descriptor.inline is False
+    assert final_descriptor.char_length == len(final_text)
+    assert final_descriptor.byte_length == len(final_text.encode("utf-8"))
+    assert final_descriptor.first_cursor == content_cursor(
+        revision,
+        "assistant_final_text",
+        0,
+    )
+    first = build_turn_content_page(
+        turn_id,
+        revision,
+        "assistant_final_text",
+        final_text,
+    )
+    second = build_turn_content_page(
+        turn_id,
+        revision,
+        "assistant_final_text",
+        final_text,
+        cursor=first["next_cursor"],
+    )
+    assert first["index"] == 0
+    assert second["index"] == 1
+    assert first["text"] + second["text"] == final_text
+    assert first["segment_byte_length"] <= TURN_CONTENT_PAGE_MAX_UTF8_BYTES
+    assert second["segment_byte_length"] <= TURN_CONTENT_PAGE_MAX_UTF8_BYTES
+    assert first["total_char_length"] == second["total_char_length"] == len(final_text)
+    assert first["total_byte_length"] == second["total_byte_length"] == len(
+        final_text.encode("utf-8")
+    )
+
+
+def test_known_incomplete_projection_is_explicit_and_never_pageable_or_inline() -> None:
+    turn_id = "turn-" + ("c" * 24)
+    fragment = "legacy fragment\n[truncated]"
+
+    projection = project_turn_content(
+        turn_id,
+        None,
+        fragment,
+        final_state="known_incomplete",
+    )
+    descriptor = projection["content"]
+    final_descriptor = descriptor["fields"]["assistant_final_text"]
+    complete_revision = content_revision(
+        turn_id,
+        None,
+        fragment,
+        "absent",
+        "complete",
+    )
+
+    assert descriptor["known_incomplete"] is True
+    assert final_descriptor == {
+        "availability": "known_incomplete",
+        "inline": False,
+        "char_length": len(fragment),
+        "byte_length": len(fragment.encode("utf-8")),
+        "page_count": 0,
+        "first_cursor": None,
+    }
+    assert "assistant_final_text" not in projection
+    assert projection["assistant_final_preview"] == fragment
+    assert descriptor["content_revision"] != complete_revision
+
+
+def test_turn_list_v2_adds_content_descriptors_without_changing_v1_default() -> None:
+    snapshot = Snapshot(
+        host_id="turn-list-v2-host",
+        updated_at="2026-01-01T00:00:00+00:00",
+        workers=[Worker(id="worker-list-v2", name="List v2", status="active")],
+    )
+
+    legacy = turns_payload_from_snapshot(snapshot)
+    version_two = turns_payload_from_snapshot(snapshot, schema_version=2)
+
+    assert legacy["schema_version"] == 1
+    assert "content" not in legacy["turns"][0]
+    assert version_two["schema_version"] == 2
+    assert version_two["turns"][0]["content"]["schema_version"] == 1
+    assert version_two["turns"][0]["content"]["known_incomplete"] is False
+    assert version_two["turns"][0]["content"]["fields"] == {
+        "user_text": {
+            "availability": "absent",
+            "inline": False,
+            "char_length": 0,
+            "byte_length": 0,
+            "page_count": 0,
+            "first_cursor": None,
+        },
+        "assistant_final_text": {
+            "availability": "absent",
+            "inline": False,
+            "char_length": 0,
+            "byte_length": 0,
+            "page_count": 0,
+            "first_cursor": None,
+        },
+    }
+    with pytest.raises(ValueError, match="unsupported_turn_schema_version"):
+        turns_payload_from_snapshot(snapshot, schema_version=3)

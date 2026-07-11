@@ -37,6 +37,7 @@ from tendwire.daemon_api import (
     DaemonProtocolError,
     TendwireDaemonAPI,
     UnixSocketJSONServer,
+    MAX_RESPONSE_BYTES,
 )
 from tendwire.local_state import LocalStateError, LocalStateErrorCode
 from tendwire.store.sqlite import (
@@ -192,6 +193,86 @@ def test_daemon_api_required_methods_are_public_safe() -> None:
     assert calls[0]["tty"] == "sentinel-private-tty"
     assert "sentinel-private" not in json.dumps(command_response)
     _assert_no_public_json_forbidden(command_response)
+
+
+def test_daemon_api_versions_turn_list_and_preserves_exact_content_page() -> None:
+    turn_calls: list[int] = []
+    page_calls: list[dict[str, Any]] = []
+    page_text = "\n  " + ("α" * 20_000) + "  \r\n"
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: Snapshot(host_id="daemon-host"),
+        get_health=lambda: {"schema_version": 1, "status": "ok"},
+        submit_command=lambda _params: {},
+        get_turns=lambda *, schema_version: turn_calls.append(schema_version)
+        or {
+            "schema_version": schema_version,
+            "turns": [
+                {
+                    "id": "turn-public",
+                    "assistant_final_text": "\n exact inline  ",
+                    "content": {
+                        "schema_version": 1,
+                        "content_revision": "twrev1.public",
+                        "known_incomplete": False,
+                        "fields": {
+                            "assistant_final_text": {
+                                "availability": "complete",
+                                "inline": True,
+                            }
+                        },
+                    },
+                }
+            ],
+        },
+        get_turn_content=lambda params: page_calls.append(dict(params))
+        or {
+            "schema_version": 1,
+            "ok": True,
+            "status": "ok",
+            "turn_id": "turn-public",
+            "content_revision": "twrev1.public",
+            "field": "assistant_final_text",
+            "availability": "complete",
+            "segment_id": "twseg1.public",
+            "index": 0,
+            "count": 1,
+            "text": page_text,
+            "segment_char_length": len(page_text),
+            "segment_byte_length": len(page_text.encode("utf-8")),
+            "total_char_length": len(page_text),
+            "total_byte_length": len(page_text.encode("utf-8")),
+            "next_cursor": None,
+        },
+    )
+
+    listed = api.dispatch({"method": "turn.list", "params": {"schema_version": 2}})
+    page = api.dispatch(
+        {
+            "method": "turn.content.get",
+            "params": {
+                "schema_version": 1,
+                "turn_id": "turn-public",
+                "content_revision": "twrev1.public",
+                "field": "assistant_final_text",
+            },
+        }
+    )
+    unsupported = api.dispatch({"method": "turn.list", "params": {"schema_version": 3}})
+
+    assert listed["result"]["schema_version"] == 2
+    assert listed["result"]["turns"][0]["assistant_final_text"] == "\n exact inline  "
+    assert turn_calls == [2]
+    assert page["result"]["text"] == page_text
+    assert page_calls == [
+        {
+            "schema_version": 1,
+            "turn_id": "turn-public",
+            "content_revision": "twrev1.public",
+            "field": "assistant_final_text",
+        }
+    ]
+    assert unsupported["ok"] is False
+    assert unsupported["error"]["code"] == "unsupported_schema"
 
 
 def test_daemon_api_protocol_errors_do_not_echo_private_request_names() -> None:
@@ -2011,6 +2092,45 @@ def test_daemon_server_survives_client_disconnect_during_response(tmp_path: Path
         assert response is not None
         assert response["ok"] is True
         assert response["result"]["pong"] is True
+        assert thread.is_alive()
+    finally:
+        server.close()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+
+
+def test_daemon_bounds_oversized_response_and_keeps_serving(tmp_path: Path) -> None:
+    socket_path = tmp_path / "bounded-response.sock"
+
+    def dispatch(request: dict[str, Any]) -> dict[str, Any]:
+        if request.get("method") == "oversized":
+            # Numeric JSON avoids making the guard test depend on text-redaction cost.
+            return {
+                "ok": True,
+                "result": {"items": list(range(250_000))},
+            }
+        return {"ok": True, "result": {"pong": True}}
+
+    server = UnixSocketJSONServer(
+        socket_path,
+        dispatch,
+        accept_timeout_seconds=0.05,
+    )
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 2
+        while not server.listening and time.monotonic() < deadline:
+            time.sleep(0.01)
+        oversized = DaemonAPIClient(socket_path, timeout_seconds=10).request("oversized")
+        ping = DaemonAPIClient(socket_path, timeout_seconds=2).request("ping")
+
+        assert oversized["ok"] is False
+        assert oversized["error"]["code"] == "response_too_large"
+        assert oversized["error"]["details"] == {"max_response_bytes": MAX_RESPONSE_BYTES}
+        assert ping["ok"] is True
+        assert ping["result"]["pong"] is True
         assert thread.is_alive()
     finally:
         server.close()

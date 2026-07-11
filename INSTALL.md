@@ -170,6 +170,57 @@ ordinary load, upgrade, or recovery shortcut:
 Restore the coherent recovery set instead whenever continuity is meant to
 survive.
 
+## Compatible Tendwire/Herdres Pair and Copy-First Dry Check
+
+Goal 05B is a paired producer/consumer contract. Install or upgrade Tendwire
+with a Herdres revision that explicitly supports all of the following together:
+
+- Tendwire SQLite store schema v7;
+- `turn.list` schema v2 with per-turn content descriptor schema v1 and bounded
+  1,000-character previews;
+- schema-v1 `turn.content.get` with linear opaque-cursor traversal and a
+  49,152-byte UTF-8 page ceiling;
+- range-only schema-v1 `connector.prepare` actions `begin`, `part`, `commit`,
+  and explicit `recover`, plus the existing lease/ACK boundary; and
+- failed-plan generation, retained contiguous ACKed prefix, fresh-suffix
+  recovery, request-ID idempotency, and recovery-audit semantics.
+
+Do not upgrade only one side and infer compatibility from short inline turns.
+An older schema-v1-only consumer receives `upgrade_required` as soon as a long
+or known-incomplete field makes the legacy projection unsafe. A compatible
+Herdres consumer requests turn-list schema v2, accepts descriptor schema v1,
+retrieves only complete non-inline fields, isolates known-incomplete turns, and
+uses Tendwire's neutral range plans without making direct Herdr calls.
+
+Before the first candidate reconciliation against existing state, preserve the
+coherent stopped-writer checkpoint described above. Copy both state files of
+interest again for the dry check, and point the candidates only at those
+scratch files. Never point the first check at live state:
+
+```sh
+# Run from the compatible Herdres checkout after all writers are confirmed stopped.
+tendwire_db="${TENDWIRE_DB_PATH:-$HOME/.local/share/tendwire/tendwire.db}"
+herdres_state="${HERDR_TELEGRAM_TOPICS_STATE:-$HOME/.local/share/herdres/state.json}"
+scratch_db="${tendwire_db}.pre-goal05b-check"
+scratch_state="${herdres_state}.pre-goal05b-check"
+cp -p -- "$tendwire_db" "$scratch_db"
+cp -p -- "$herdres_state" "$scratch_state"
+TENDWIRE_DB_PATH="$scratch_db" \
+  HERDR_TELEGRAM_TOPICS_STATE="$scratch_state" \
+  HERDRES_TENDWIRE_MODE=source \
+  ./herdres.py tendwire source-smoke --with-outbox
+```
+
+Keep both the untouched paired checkpoint and the scratch files private. The
+dry result must succeed with turn-list schema version `2`, content descriptor
+schema version `1`, and `direct_herdr_calls=0`. It must not save the copied
+Herdres state or send/edit provider messages. If it fails, leave live state
+untouched, retain the checkpoint, and investigate; do not edit state, copy
+public handles, delete individual identity files, rotate continuity identity,
+or recover a failed presentation plan speculatively. These checks establish
+pair compatibility and rollback readiness only; they do not deploy, restart,
+or migrate live state.
+
 ## Verification
 
 ```bash
@@ -200,7 +251,7 @@ python3 -m py_compile $(git ls-files '*.py')
 python3 -m pytest -q
 tendwire doctor --json
 tendwire snapshot --json --store --db-path ~/.local/share/tendwire/tendwire.db
-tendwire turns --json
+tendwire turns --schema-version 2 --json
 tendwire pending --json
 tendwire attention --json
 tendwire store status --db-path ~/.local/share/tendwire/tendwire.db
@@ -223,10 +274,12 @@ commands unless the operator explicitly asks for an external restart.
 
 ## Rollback
 
-Tendwire does not own Telegram delivery state. To roll back a Herdres source-mode
-deployment, switch Herdres to `HERDRES_TENDWIRE_MODE=enrich` or
-`HERDRES_TENDWIRE_MODE=off`, restart Herdres services, and leave Tendwire running
-or stop `tendwired.service` after clients have stopped using it.
+Tendwire and source-only Herdres must be rolled back as a compatible code pair,
+by selecting reviewed matching branches or release tags and reinstalling them;
+an `off` or `enrich` environment toggle is not a substitute for pair
+compatibility or state recovery. Stop Herdres consumers before Tendwire when an
+operator performs the coordinated rollback, and do not allow either revision
+to write live state until its supported schemas and recovery actions match.
 
 For a state rollback, stop Herdres consumers and Tendwire, then restore the
 complete untouched pre-upgrade checkpoint: the Tendwire database, all three

@@ -536,12 +536,80 @@ targets, socket paths, raw target values, private bindings, session IDs, private
 fingerprints, raw command payloads, argv/env/stdout/stderr, raw terminal
 controls, tokens, or secrets.
 
-`turns --json` prints a schema-v1 wrapper with `host_id`, `updated_at`,
-`content_fingerprint`, public-safe `backend_health`, and `turns`. Each turn has
-`schema_version`, deterministic `id`, `host_id`, `worker_id`, optional
-`worker_fingerprint`, optional `space_id`, canonical `status`, bounded `kind`,
-optional `title`/`summary`/timestamps, `source`, optional
-`origin_command_id`, deterministic `fingerprint`, and sanitized `meta`.
+### Turn-list schema negotiation and content paging
+
+`turns --json --schema-version 2` and daemon `turn.list` with
+`{"schema_version":2}` return the schema-v2 turn-list wrapper. Each turn keeps
+the neutral identity/status metadata above and adds a schema-v1 `content`
+descriptor:
+
+```json
+{
+  "schema_version": 1,
+  "content_revision": "twrev1.<opaque>",
+  "known_incomplete": false,
+  "fields": {
+    "user_text": {
+      "availability": "complete",
+      "inline": true,
+      "char_length": 12,
+      "byte_length": 12,
+      "page_count": 1,
+      "first_cursor": null
+    },
+    "assistant_final_text": {
+      "availability": "complete",
+      "inline": false,
+      "char_length": 20000,
+      "byte_length": 20000,
+      "page_count": 1,
+      "first_cursor": "twcur1.<opaque>"
+    }
+  }
+}
+```
+
+The two descriptor fields are exactly `user_text` and
+`assistant_final_text`. Their `availability` is exactly `absent`, `complete`,
+or `known_incomplete`; lengths are exact character and UTF-8 byte counts.
+Complete fields of at most 12,000 characters remain inline. A longer complete
+field is not copied into the list: the turn contains only a `user_preview` or
+`assistant_final_preview` of at most 1,000 characters and the descriptor makes
+it pageable. `known_incomplete` means Tendwire inherited content that was
+already irrecoverably truncated; it is preview-only, with `inline=false`,
+`page_count=0`, and `first_cursor=null`. Consumers must isolate that field or
+turn and continue processing eligible turns rather than presenting its preview
+as a complete final.
+
+Schema v1 remains a compatibility view only while every present canonical field
+is complete and inline. If any present field is long or known incomplete, a v1
+request fails clearly with `schema_version=1`, `ok=false`,
+`status=upgrade_required`, and `required_turn_schema_version=2`; the CLI exits
+nonzero instead of returning a lossy v1 turn. Consumers that support v2 can
+remain lazy: only a field with `availability=complete`, `inline=false`, and a
+non-null `first_cursor` is eligible for page retrieval.
+
+The daemon method `turn.content.get` and CLI command
+`tendwire turn content get` expose one content page at a time. The exact daemon
+parameters are `schema_version: 1`, `turn_id`, `content_revision`, `field`
+(`user_text` or `assistant_final_text`), and optional `cursor`. Omit `cursor`
+or pass null for page zero; thereafter pass only the previous response's opaque
+`next_cursor`. A cursor is integrity-bound to the revision, field, segment
+index, and exact character/byte start, so malformed coordinates, a modified
+cursor, or a cross-field or cross-revision cursor fails with `invalid_cursor`.
+
+Each successful page contains only `schema_version=1`, `turn_id`,
+`content_revision`, `field`, `availability=complete`, opaque `segment_id`,
+zero-based `index`, `count`, exact `text`, `segment_char_length`,
+`segment_byte_length`, `total_char_length`, `total_byte_length`, and nullable
+`next_cursor`. Page text
+is at most 49,152 UTF-8 bytes and never splits a code point. Concatenating pages
+in `first_cursor`/`next_cursor` order reproduces the exact sanitized canonical
+field. Paging is deliberately linear: Tendwire reads each page directly from
+the one canonical SQLite value and does not store independently editable page
+copies.
+
+### Pending interactions
 
 `pending --json` prints a schema-v1 wrapper with `host_id`, `updated_at`,
 `content_fingerprint`, public-safe `backend_health`, and
@@ -560,6 +628,14 @@ actions; generic waiting or pending worker status alone does not create a
 pending interaction.
 
 ## SQLite store
+
+The current store schema is version 7 (`PRAGMA user_version=7`). Migration is
+idempotent and transactional: schema v6 introduced immutable canonical turn
+content revisions and backfilled legacy rows, marking a legacy
+`[truncated]` value `known_incomplete` rather than claiming recovery; schema v7
+adds presentation-plan generations, failed-plan lineage, and an immutable
+recovery audit. It does not reconstruct bytes that were absent from the legacy
+store.
 
 The optional SQLite store keeps canonical snapshot JSON blobs in the `snapshots`
 table and maintains Tendwire-local operational tables for attention lifecycle,
@@ -607,9 +683,9 @@ deleting or updating rows.
 ## Neutral connector outbox boundary
 
 Tendwire exposes a Tendwire-only connector delivery boundary above the SQLite
-store. The public daemon methods are `connector.poll`, `connector.ack`,
-`connector.fail`, `connector.defer`, and the operational helper
-`connector.reclaim`. The matching JSON-only CLI hook is:
+store. The public daemon methods are `connector.prepare`, `connector.poll`,
+`connector.ack`, `connector.fail`, `connector.defer`, and the operational
+helper `connector.reclaim`. The matching JSON-only CLI hook is:
 
 ```bash
 tendwire connector poll --name attention --limit 10 --lease-seconds 60 --db-path /path/to/tendwire.db
@@ -629,6 +705,66 @@ responses use `schema_version`, `ok`, `status`, `host_id`, `name`, `items`,
 pane/session/terminal identifiers, socket paths, target values,
 Telegram/chat/topic/message IDs, tokens, or connector-specific delivery
 internals.
+
+### Ordered range-only final plans
+
+`connector.prepare` is the schema-v1 planning surface for the neutral
+`turn-final` queue. It stores canonical coordinate ranges, never copied content
+text or provider presentation data. Requests are exact objects with no
+additional fields:
+
+- `begin`:
+  `schema_version`, `action="begin"`, `name="turn-final"`, `turn_id`,
+  `content_revision`, `presentation_version`, and `part_count` from 1 through
+  10,000.
+- `part`:
+  `schema_version`, `action="part"`, `name="turn-final"`, `plan_token`,
+  zero-based `ordinal`, and one through 64 `spans`. Every span has exactly
+  `field`, `start_char`, and `end_char`; `field` is `user_text` or
+  `assistant_final_text`, and the range is nonempty and half-open.
+- `commit`:
+  `schema_version`, `action="commit"`, `name="turn-final"`, and `plan_token`.
+- `recover`:
+  `schema_version`, `action="recover"`, `name="turn-final"`,
+  `failed_plan_token`, and `request_id`.
+
+`begin`, `part`, and `commit` are idempotent for identical input. Commit accepts
+only every declared ordinal with exact, contiguous, ordered coverage of the
+selected complete canonical fields, then atomically materializes ordered
+neutral `upsert` jobs followed by any required reverse-order `retire` jobs.
+Consumers fetch text lazily through `turn.content.get` from each job's ranges;
+the plan itself contains no stored page or provider-specific message copy.
+
+`recover` is an explicit, one-shot operator action, not an automatic retry
+loop. It applies only to the latest failed generation for the still-current
+immutable content revision, after at least one recorded delivery attempt. The
+failed source plan, its outbox rows, and its delivery receipts remain unchanged.
+Tendwire retains the contiguous explicitly ACKed prefix, creates a fresh plan
+token and next generation for only the unfinished suffix, and preserves ordered
+continuity through the predecessor job key. A delivered item after a gap, a
+leased suffix, a superseded revision, a nonfailed plan, or a competing
+generation fails closed.
+
+The recovery `request_id` is a provider-neutral idempotency key of 1 through
+128 ASCII letters, digits, `.`, `_`, or `-`. Repeating the same request ID with
+the same failed plan returns the same recovery with
+`idempotent_replay=true`; reusing it for another failed plan returns
+`request_conflict`, and a second request for an already recovered generation
+returns `plan_conflict`. A successful recovery response is deliberately bounded
+to exactly `schema_version`, `ok`, `status` (`recovered`),
+`failed_plan_token`, `plan_token`, `generation`, `content_revision`, `state`
+(`active`), `acknowledged_prefix_count`, `executable_job_count`,
+`retained_failed_job_count`, `prior_attempt_count`, and
+`idempotent_replay`. Schema v7 records the request, source/recovered plan,
+generation, retained prefix, fresh suffix, failed-job count, prior attempts,
+and outcome in one immutable recovery audit row.
+
+Only an explicit `connector.ack` proves a delivered prefix. A provider may have
+accepted an operation even when its success receipt was lost; that state is
+delivery-uncertain and no connector can promise perfect exactly-once external
+effects. Recovery therefore reports and preserves Tendwire's durable evidence
+without claiming that an unacknowledged provider operation definitely had no
+effect.
 
 `connector.poll` atomically leases due `connector_outbox` rows for one `name`
 and returns opaque per-attempt refs. A live lease prevents duplicate polling.

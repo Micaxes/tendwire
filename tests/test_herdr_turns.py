@@ -5,16 +5,27 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+import pytest
 from pathlib import Path
 from typing import Any
 
 from tendwire.backends import herdr_turns
 from tendwire.backends.herdr_turns import refresh_structured_turn_content
 from tendwire.config import Config
-from tendwire.core.models import WorkerBinding
+from tendwire.core.models import WorkerBinding, sanitize_canonical_turn_text
 from tendwire.core.projector import project_from_raw
-from tendwire.core.turns import is_internal_automation_turn_payload
-from tendwire.store.sqlite import init_store, save_snapshot, turns_payload_from_store, upsert_worker_bindings
+from tendwire.core.turns import (
+    TURN_CONTENT_PAGE_MAX_UTF8_BYTES,
+    TURN_STREAM_TEXT_MAX_CHARS,
+    is_internal_automation_turn_payload,
+)
+from tendwire.store import sqlite as store_sqlite
+from tendwire.store.sqlite import (
+    init_store,
+    save_snapshot,
+    turns_payload_from_store,
+    upsert_worker_bindings,
+)
 
 
 def test_refresh_structured_turn_content_uses_private_binding_without_public_leak(
@@ -1039,3 +1050,326 @@ def test_omp_file_progress_rejects_invalid_worktree_gitdir_file(
 
     assert content is not None
     assert content["assistant_stream_text"] == "step 1 · read file"
+
+
+def _prepare_pane_turn_store(
+    tmp_path: Path,
+    *,
+    herdr_bin: str = "herdr",
+) -> tuple[Config, Any]:
+    db_path = tmp_path / "turns.db"
+    config = Config(
+        host_id="turn-host",
+        db_path=db_path,
+        herdr_bin=herdr_bin,
+        herdr_timeout_seconds=10,
+    )
+    snapshot = project_from_raw(
+        config,
+        workers=[{"id": "worker-1", "name": "codex", "status": "active", "space_id": "space-1"}],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    worker = snapshot.workers[0]
+    upsert_worker_bindings(
+        db_path,
+        [
+            WorkerBinding(
+                host_id=config.host_id,
+                worker_id=worker.id,
+                worker_fingerprint=worker.fingerprint,
+                backend="herdr",
+                target_kind="agent_id",
+                target_value="private-agent",
+                turn_target_kind="pane_id",
+                turn_target_value="private-pane",
+                sendable=True,
+                observed_at="2026-07-11T00:00:00+00:00",
+                expires_at="9999-12-31T23:59:59+00:00",
+                private_fingerprint="private-binding",
+            )
+        ],
+    )
+    return config, snapshot
+
+
+def _pane_turn_payload(
+    *,
+    user_text: str | None,
+    final_text: str | None,
+    stream_text: str | None = None,
+    complete: bool = True,
+    source_turn_id: str = "source-turn-long",
+) -> dict[str, Any]:
+    return {
+        "result": {
+            "turn": {
+                "available": True,
+                "user_text": user_text,
+                "assistant_final_text": final_text,
+                "assistant_stream_text": stream_text,
+                "complete": complete,
+                "has_open_turn": not complete,
+                "source_turn_id": source_turn_id,
+            }
+        }
+    }
+
+
+def _current_content_turn(
+    config: Config,
+    snapshot: Any,
+) -> tuple[dict[str, Any], str]:
+    payload = turns_payload_from_store(
+        config.db_path,
+        config.host_id,
+        snapshot=snapshot,
+        schema_version=2,
+    )
+    turn = next(
+        item
+        for item in payload["turns"]
+        if (item.get("content") or {}).get("content_revision")
+    )
+    return turn, str(turn["content"]["content_revision"])
+
+
+def _reconstruct_turn_field(
+    config: Config,
+    *,
+    turn_id: str,
+    revision: str,
+    field: str,
+) -> str:
+    cursor: str | None = None
+    pages: list[dict[str, Any]] = []
+    while True:
+        page = store_sqlite.get_turn_content(
+            config.db_path,
+            config.host_id,
+            turn_id=turn_id,
+            content_revision=revision,
+            field=field,
+            cursor=cursor,
+            schema_version=1,
+        )
+        assert page["availability"] == "complete"
+        assert page["index"] == len(pages)
+        pages.append(page)
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    assert all(page["count"] == len(pages) for page in pages)
+    assert all(
+        len(str(page["text"]).encode("utf-8")) <= TURN_CONTENT_PAGE_MAX_UTF8_BYTES
+        for page in pages
+    )
+    return "".join(str(page["text"]) for page in pages)
+
+
+@pytest.mark.parametrize("content_size", [20_000, 1024 * 1024 + 257])
+def test_wrapper_adapter_round_trips_unbounded_authoritative_content(
+    tmp_path: Path,
+    monkeypatch,
+    content_size: int,
+) -> None:
+    adapter = tmp_path / "long_turn_adapter.py"
+    adapter.write_text(
+        r"""#!/usr/bin/env python3
+import json
+import os
+
+size = int(os.environ["TENDWIRE_TEST_TURN_SIZE"])
+prompt = "  Prompt ﬁ\n" + ("p" * size) + "\u200b\x00\n"
+final = "\n# Final\n" + ("f" * size) + "\u200b\x00  "
+print(json.dumps({"result": {"turn": {
+    "available": True,
+    "user_text": prompt,
+    "assistant_final_text": final,
+    "assistant_stream_text": None,
+    "complete": True,
+    "has_open_turn": False,
+    "source_turn_id": "source-turn-long",
+}}}))
+""",
+        encoding="utf-8",
+    )
+    adapter.chmod(0o700)
+    monkeypatch.setenv("TENDWIRE_TEST_TURN_SIZE", str(content_size))
+    config, snapshot = _prepare_pane_turn_store(tmp_path, herdr_bin=str(adapter))
+
+    result = refresh_structured_turn_content(config)
+    turn, revision = _current_content_turn(config, snapshot)
+    expected_prompt = sanitize_canonical_turn_text(
+        "  Prompt ﬁ\n" + ("p" * content_size) + "\u200b\x00\n"
+    )
+    expected_final = sanitize_canonical_turn_text(
+        "\n# Final\n" + ("f" * content_size) + "\u200b\x00  "
+    )
+    serialized_source = json.dumps(
+        _pane_turn_payload(
+            user_text="  Prompt ﬁ\n" + ("p" * content_size) + "\u200b\x00\n",
+            final_text="\n# Final\n" + ("f" * content_size) + "\u200b\x00  ",
+        )
+    ).encode("utf-8")
+    assert len(serialized_source) > content_size * 2
+
+    assert result == {"ok": True, "status": "ok", "updated": 1, "attempted": 1}
+    assert expected_prompt is not None
+    assert expected_final is not None
+    assert _reconstruct_turn_field(
+        config,
+        turn_id=turn["id"],
+        revision=revision,
+        field="user_text",
+    ) == expected_prompt
+    assert _reconstruct_turn_field(
+        config,
+        turn_id=turn["id"],
+        revision=revision,
+        field="assistant_final_text",
+    ) == expected_final
+
+
+def test_refresh_keeps_only_a_rolling_bounded_stream(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config, snapshot = _prepare_pane_turn_store(tmp_path)
+    stream = "".join(str(index % 10) for index in range(TURN_STREAM_TEXT_MAX_CHARS + 137))
+    monkeypatch.setattr(
+        herdr_turns.subprocess,
+        "run",
+        _run_returning(
+            _pane_turn_payload(
+                user_text="stream this turn",
+                final_text=None,
+                stream_text=stream,
+                complete=False,
+            )
+        ),
+    )
+
+    assert refresh_structured_turn_content(config)["updated"] == 1
+    turn, _revision = _current_content_turn(config, snapshot)
+
+    assert turn["assistant_stream_text"] == stream[-TURN_STREAM_TEXT_MAX_CHARS:]
+    assert len(turn["assistant_stream_text"]) == TURN_STREAM_TEXT_MAX_CHARS
+
+
+def test_empty_later_observation_does_not_erase_authoritative_final(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config, snapshot = _prepare_pane_turn_store(tmp_path)
+    final_text = "authoritative final"
+    observations = iter(
+        [
+            _pane_turn_payload(user_text="prompt", final_text=final_text),
+            _pane_turn_payload(user_text="", final_text=""),
+        ]
+    )
+    monkeypatch.setattr(
+        herdr_turns.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps(next(observations)),
+            stderr="",
+        ),
+    )
+
+    assert refresh_structured_turn_content(config)["updated"] == 1
+    first_turn, first_revision = _current_content_turn(config, snapshot)
+    second_result = refresh_structured_turn_content(config)
+    second_turn, second_revision = _current_content_turn(config, snapshot)
+
+    assert second_result["updated"] == 0
+    assert second_turn["id"] == first_turn["id"]
+    assert second_revision == first_revision
+    assert _reconstruct_turn_field(
+        config,
+        turn_id=second_turn["id"],
+        revision=second_revision,
+        field="assistant_final_text",
+    ) == final_text
+
+
+def test_identical_source_turn_observation_is_a_revision_noop(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config, snapshot = _prepare_pane_turn_store(tmp_path)
+    payload = _pane_turn_payload(user_text="same prompt", final_text="same final")
+    monkeypatch.setattr(herdr_turns.subprocess, "run", _run_returning(payload))
+
+    assert refresh_structured_turn_content(config)["updated"] == 1
+    first_turn, first_revision = _current_content_turn(config, snapshot)
+    with sqlite3.connect(config.db_path) as conn:
+        first_count = conn.execute(
+            "SELECT COUNT(*) FROM turn_content_revisions WHERE host_id = ? AND turn_id = ?",
+            (config.host_id, first_turn["id"]),
+        ).fetchone()[0]
+
+    assert refresh_structured_turn_content(config)["updated"] == 0
+    second_turn, second_revision = _current_content_turn(config, snapshot)
+    with sqlite3.connect(config.db_path) as conn:
+        second_count = conn.execute(
+            "SELECT COUNT(*) FROM turn_content_revisions WHERE host_id = ? AND turn_id = ?",
+            (config.host_id, second_turn["id"]),
+        ).fetchone()[0]
+
+    assert second_turn["id"] == first_turn["id"]
+    assert second_revision == first_revision
+    assert second_count == first_count
+
+
+def test_complete_reobservation_recovers_known_incomplete_source_turn(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config, snapshot = _prepare_pane_turn_store(tmp_path)
+    fragment = ("legacy fragment " * 900)[:11_988] + "\n[truncated]"
+    complete_final = fragment.removesuffix("\n[truncated]") + " recovered authoritative suffix"
+    first_payload = _pane_turn_payload(user_text="recover this", final_text=fragment)
+    complete_payload = _pane_turn_payload(user_text="recover this", final_text=complete_final)
+    monkeypatch.setattr(herdr_turns.subprocess, "run", _run_returning(first_payload))
+
+    assert refresh_structured_turn_content(config)["updated"] == 1
+    turn, incomplete_revision = _current_content_turn(config, snapshot)
+    with sqlite3.connect(config.db_path) as conn:
+        conn.execute(
+            """
+            UPDATE turn_content_revisions
+            SET final_state = 'known_incomplete'
+            WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+            """,
+            (config.host_id, turn["id"], incomplete_revision),
+        )
+        conn.commit()
+
+    monkeypatch.setattr(herdr_turns.subprocess, "run", _run_returning(complete_payload))
+    assert refresh_structured_turn_content(config)["updated"] == 1
+    recovered_turn, recovered_revision = _current_content_turn(config, snapshot)
+    with sqlite3.connect(config.db_path) as conn:
+        revisions = conn.execute(
+            """
+            SELECT content_revision, final_state, is_current
+            FROM turn_content_revisions
+            WHERE host_id = ? AND turn_id = ?
+            ORDER BY created_at, content_revision
+            """,
+            (config.host_id, turn["id"]),
+        ).fetchall()
+
+    assert recovered_turn["id"] == turn["id"]
+    assert recovered_revision != incomplete_revision
+    assert (incomplete_revision, "known_incomplete", 0) in revisions
+    assert (recovered_revision, "complete", 1) in revisions
+    assert _reconstruct_turn_field(
+        config,
+        turn_id=recovered_turn["id"],
+        revision=recovered_revision,
+        field="assistant_final_text",
+    ) == complete_final

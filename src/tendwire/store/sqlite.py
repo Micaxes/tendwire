@@ -39,6 +39,7 @@ from ..core.models import (
     WorkerBinding,
     normalize_severity,
     separate_duplicate_worker_bindings,
+    sanitize_canonical_turn_text,
     sanitize_public_mapping,
     sanitize_public_value,
     stable_fingerprint,
@@ -46,7 +47,19 @@ from ..core.models import (
 )
 from ..core.turns import (
     Turn,
+    TURN_CONTENT_PAGE_MAX_UTF8_BYTES,
+    TURN_CONTENT_PREVIEW_MAX_CHARS,
+    TURN_LIST_SCHEMA_VERSION,
+    TURN_TEXT_MAX_CHARS,
+    ContentCursorPosition,
+    content_cursor,
+    content_revision,
+    content_segment_id,
+    decode_content_cursor,
     is_internal_automation_turn_payload,
+    project_persisted_turn_content,
+    project_turn_content,
+    segment_canonical_text,
     pending_from_snapshot,
     turns_from_snapshot,
     turns_payload_from_snapshot,
@@ -54,7 +67,7 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 5
+STORE_SCHEMA_VERSION = 7
 ATTENTION_LIFECYCLE_OPEN = "open"
 ATTENTION_LIFECYCLE_RESOLVED = "resolved"
 ATTENTION_RESOLVED_REASON_GONE = "gone"
@@ -69,6 +82,44 @@ _ATTENTION_SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 class SnapshotObservationContext:
     authority: Literal["none", "positive", "complete"] = "none"
     observed_at: str | None = None
+
+@dataclass
+class TurnContentWorkCounters:
+    """Deterministic canonical bytes and SQL work observed by list/page operations."""
+
+    list_sql_queries: int = 0
+    list_descriptor_rows: int = 0
+    list_preview_chars_examined: int = 0
+    list_inline_chars_examined: int = 0
+    page_sql_queries: int = 0
+    page_blob_reads: int = 0
+    page_bytes_examined: int = 0
+    page_chars_examined: int = 0
+    max_response_utf8_bytes: int = 0
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "list_sql_queries": self.list_sql_queries,
+            "list_descriptor_rows": self.list_descriptor_rows,
+            "list_preview_chars_examined": self.list_preview_chars_examined,
+            "list_inline_chars_examined": self.list_inline_chars_examined,
+            "page_sql_queries": self.page_sql_queries,
+            "page_blob_reads": self.page_blob_reads,
+            "page_bytes_examined": self.page_bytes_examined,
+            "page_chars_examined": self.page_chars_examined,
+            "max_response_utf8_bytes": self.max_response_utf8_bytes,
+        }
+
+
+def _record_response_size(
+    counters: TurnContentWorkCounters | None,
+    payload: Mapping[str, Any],
+) -> None:
+    if counters is not None:
+        counters.max_response_utf8_bytes = max(
+            counters.max_response_utf8_bytes,
+            len(_canonical_json(payload).encode("utf-8")),
+        )
 
 CREATE_SNAPSHOTS_TABLE = """
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -210,6 +261,179 @@ CREATE TABLE IF NOT EXISTS turns (
     PRIMARY KEY (host_id, turn_id)
 );
 """
+
+CREATE_TURN_CONTENT_REVISIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS turn_content_revisions (
+    host_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    content_revision TEXT NOT NULL,
+    user_text TEXT,
+    assistant_final_text TEXT,
+    user_state TEXT NOT NULL
+        CHECK (user_state IN ('absent', 'complete', 'known_incomplete')),
+    final_state TEXT NOT NULL
+        CHECK (final_state IN ('absent', 'complete', 'known_incomplete')),
+    user_char_length INTEGER NOT NULL CHECK (user_char_length >= 0),
+    user_byte_length INTEGER NOT NULL CHECK (user_byte_length >= 0),
+    final_char_length INTEGER NOT NULL CHECK (final_char_length >= 0),
+    final_byte_length INTEGER NOT NULL CHECK (final_byte_length >= 0),
+    user_page_count INTEGER NOT NULL CHECK (user_page_count >= 0),
+    final_page_count INTEGER NOT NULL CHECK (final_page_count >= 0),
+    is_current INTEGER NOT NULL CHECK (is_current IN (0, 1)),
+    created_at TEXT NOT NULL,
+    superseded_at TEXT,
+    PRIMARY KEY (host_id, turn_id, content_revision),
+    FOREIGN KEY (host_id, turn_id)
+        REFERENCES turns(host_id, turn_id) ON DELETE RESTRICT
+);
+"""
+
+CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE = """
+CREATE TABLE IF NOT EXISTS turn_content_page_boundaries (
+    host_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    content_revision TEXT NOT NULL,
+    field TEXT NOT NULL
+        CHECK (field IN ('user_text', 'assistant_final_text')),
+    page_index INTEGER NOT NULL CHECK (page_index >= 0),
+    start_char INTEGER NOT NULL CHECK (start_char >= 0),
+    start_byte INTEGER NOT NULL CHECK (start_byte >= 0),
+    PRIMARY KEY (
+        host_id,
+        turn_id,
+        content_revision,
+        field,
+        page_index
+    ),
+    UNIQUE (
+        host_id,
+        turn_id,
+        content_revision,
+        field,
+        start_char
+    ),
+    UNIQUE (
+        host_id,
+        turn_id,
+        content_revision,
+        field,
+        start_byte
+    ),
+    FOREIGN KEY (host_id, turn_id, content_revision)
+        REFERENCES turn_content_revisions(host_id, turn_id, content_revision)
+        ON DELETE CASCADE
+);
+"""
+
+CREATE_TURN_CONTENT_REVISION_INDEXES = (
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_turn_content_current "
+        "ON turn_content_revisions(host_id, turn_id) WHERE is_current = 1"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_turn_content_cleanup "
+        "ON turn_content_revisions(host_id, is_current, superseded_at)"
+    ),
+)
+
+CREATE_TURN_PRESENTATION_PLANS_TABLE = """
+CREATE TABLE IF NOT EXISTS turn_presentation_plans (
+    id INTEGER PRIMARY KEY,
+    host_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    plan_token TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    content_revision TEXT NOT NULL,
+    presentation_version TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 1 CHECK (generation >= 1),
+    part_count INTEGER NOT NULL CHECK (part_count > 0),
+    state TEXT NOT NULL
+        CHECK (state IN (
+            'preparing',
+            'waiting_predecessor',
+            'active',
+            'completed',
+            'superseded',
+            'failed'
+        )),
+    replaces_plan_token TEXT,
+    recovers_plan_token TEXT,
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    completed_at TEXT,
+    UNIQUE (host_id, name, plan_token),
+    UNIQUE (
+        host_id,
+        name,
+        turn_id,
+        content_revision,
+        presentation_version,
+        generation
+    ),
+    FOREIGN KEY (host_id, turn_id, content_revision)
+        REFERENCES turn_content_revisions(host_id, turn_id, content_revision)
+        ON DELETE RESTRICT
+);
+"""
+
+CREATE_TURN_PRESENTATION_JOBS_TABLE = """
+CREATE TABLE IF NOT EXISTS turn_presentation_jobs (
+    id INTEGER PRIMARY KEY,
+    plan_id INTEGER NOT NULL,
+    sequence_index INTEGER NOT NULL CHECK (sequence_index >= 0),
+    operation TEXT NOT NULL CHECK (operation IN ('upsert', 'retire')),
+    part_ordinal INTEGER NOT NULL CHECK (part_ordinal >= 0),
+    spans_json TEXT NOT NULL,
+    outbox_id INTEGER UNIQUE,
+    created_at TEXT NOT NULL,
+    UNIQUE (plan_id, sequence_index),
+    UNIQUE (plan_id, operation, part_ordinal),
+    FOREIGN KEY (plan_id) REFERENCES turn_presentation_plans(id) ON DELETE CASCADE,
+    FOREIGN KEY (outbox_id) REFERENCES connector_outbox(id) ON DELETE RESTRICT
+);
+"""
+
+CREATE_TURN_PRESENTATION_RECOVERIES_TABLE = """
+CREATE TABLE IF NOT EXISTS turn_presentation_recoveries (
+    id INTEGER PRIMARY KEY,
+    host_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    failed_plan_id INTEGER NOT NULL,
+    recovered_plan_id INTEGER NOT NULL,
+    failed_plan_token TEXT NOT NULL,
+    recovered_plan_token TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation >= 2),
+    source_job_count INTEGER NOT NULL CHECK (source_job_count > 0),
+    delivered_prefix_count INTEGER NOT NULL CHECK (delivered_prefix_count >= 0),
+    fresh_job_count INTEGER NOT NULL CHECK (fresh_job_count > 0),
+    retained_failed_job_count INTEGER NOT NULL CHECK (retained_failed_job_count > 0),
+    prior_attempt_count INTEGER NOT NULL CHECK (prior_attempt_count > 0),
+    outcome TEXT NOT NULL CHECK (outcome = 'recovered'),
+    created_at TEXT NOT NULL,
+    UNIQUE (host_id, name, request_id),
+    UNIQUE (failed_plan_id),
+    FOREIGN KEY (failed_plan_id)
+        REFERENCES turn_presentation_plans(id) ON DELETE RESTRICT,
+    FOREIGN KEY (recovered_plan_id)
+        REFERENCES turn_presentation_plans(id) ON DELETE RESTRICT
+);
+"""
+
+CREATE_TURN_PRESENTATION_INDEXES = (
+    (
+        "CREATE INDEX IF NOT EXISTS idx_turn_presentation_jobs_plan_sequence "
+        "ON turn_presentation_jobs(plan_id, sequence_index)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_turn_presentation_jobs_outbox "
+        "ON turn_presentation_jobs(outbox_id)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_turn_presentation_recoveries_recovered "
+        "ON turn_presentation_recoveries(recovered_plan_id)"
+    ),
+)
 
 CREATE_PENDING_INTERACTIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS pending_interactions (
@@ -901,6 +1125,17 @@ def _connector_reclaim_expired_leases_conn(
                     _CONNECTOR_LEASE_STATUS,
                 ),
             )
+            terminal_status = (
+                _CONNECTOR_SUPERSEDED_OUTBOX_STATUS
+                if terminal_after_lease
+                else "queued"
+            )
+            _update_presentation_plan_after_outbox_conn(
+                conn,
+                outbox_id=int(outbox_id),
+                outbox_status=terminal_status,
+                now=now,
+            )
         reclaimed += 1
     return reclaimed
 
@@ -952,6 +1187,12 @@ def _connector_exhaust_retryable_conn(
             "{}",
             *params,
         ],
+    )
+    _mark_exhausted_presentation_plans_conn(
+        conn,
+        host_id=str(host_id),
+        name=str(name) if name is not None else None,
+        now=str(now),
     )
     return int(cursor.rowcount or 0)
 
@@ -1067,6 +1308,1567 @@ def exhaust_connector_retries(
         "updated": int(updated),
     })
 
+_TURN_FINAL_NAME = "turn-final"
+_PRESENTATION_SCHEMA_VERSION = 1
+_PRESENTATION_MAX_PARTS = 10_000
+_PRESENTATION_MAX_SPANS_PER_PART = 64
+_PRESENTATION_SEQUENCE_WIDTH = 6
+_PRESENTATION_FIELDS = ("user_text", "assistant_final_text")
+_PRESENTATION_FIELD_RANK = {
+    field: index for index, field in enumerate(_PRESENTATION_FIELDS)
+}
+_PRESENTATION_TOKEN_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
+_PRESENTATION_LABEL_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
+
+def _valid_presentation_opaque(value: Any, prefix: str) -> bool:
+    if not isinstance(value, str) or not value.startswith(prefix):
+        return False
+    body = value[len(prefix) :]
+    return bool(body) and all(char in _PRESENTATION_TOKEN_CHARS for char in body)
+
+
+def _valid_presentation_label(value: Any, *, prefix: str | None = None) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 128:
+        return False
+    if prefix is not None and not value.startswith(prefix):
+        return False
+    if any(char not in _PRESENTATION_LABEL_CHARS for char in value):
+        return False
+    return sanitize_public_value(value, backend_neutral=True) == value
+
+
+
+
+def _presentation_plan_token(
+    *,
+    host_id: str,
+    name: str,
+    turn_id: str,
+    content_revision_value: str,
+    presentation_version: str,
+    part_count: int,
+) -> str:
+    digest = stable_fingerprint(
+        {
+            "domain": "tendwire.connector.prepare.v1",
+            "host_id": str(host_id),
+            "name": str(name),
+            "turn_id": str(turn_id),
+            "content_revision": str(content_revision_value),
+            "presentation_version": str(presentation_version),
+            "part_count": int(part_count),
+        },
+        length=64,
+    )
+    return f"twplan1.{digest}"
+
+
+def _presentation_recovery_token(
+    *,
+    host_id: str,
+    name: str,
+    failed_plan_token: str,
+    request_id: str,
+    generation: int,
+) -> str:
+    digest = stable_fingerprint(
+        {
+            "domain": "tendwire.connector.prepare.recover.v1",
+            "host_id": str(host_id),
+            "name": str(name),
+            "failed_plan_token": str(failed_plan_token),
+            "request_id": str(request_id),
+            "generation": int(generation),
+        },
+        length=64,
+    )
+    return f"twplan1.{digest}"
+
+
+def _restore_presentation_tokens(
+    sanitized: dict[str, Any],
+    original: Mapping[str, Any],
+) -> dict[str, Any]:
+    for key in (
+        "plan_token",
+        "replaces_plan_token",
+        "recovers_plan_token",
+        "failed_plan_token",
+        "recovered_plan_token",
+    ):
+        value = original.get(key)
+        if value is None and key in original:
+            sanitized[key] = None
+        elif (
+            isinstance(value, str)
+            and value.startswith("twplan1.")
+            and value[8:]
+            and all(char.isalnum() or char in "-_" for char in value[8:])
+        ):
+            sanitized[key] = value
+    return sanitized
+
+
+def _presentation_response(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return _restore_presentation_tokens(
+        dict(sanitize_public_value(dict(payload))),
+        payload,
+    )
+
+
+def _presentation_error(
+    status: str,
+    *,
+    host_id: str,
+    name: str,
+    plan_token: str | None = None,
+    failed_plan_token: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": _PRESENTATION_SCHEMA_VERSION,
+        "ok": False,
+        "status": str(status),
+        "host_id": str(host_id),
+        "name": str(name),
+        "error": {
+            "code": str(status),
+            "message": "presentation plan request could not be applied",
+        },
+    }
+    if plan_token is not None:
+        payload["plan_token"] = str(plan_token)
+    if failed_plan_token is not None:
+        payload["failed_plan_token"] = str(failed_plan_token)
+    return _presentation_response(payload)
+
+
+def _current_presentation_revision_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    content_revision_value: str,
+) -> tuple[Any | None, str | None]:
+    row = conn.execute(
+        """
+        SELECT
+            user_state,
+            final_state,
+            user_char_length,
+            final_char_length,
+            is_current
+        FROM turn_content_revisions
+        WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+        """,
+        (str(host_id), str(turn_id), str(content_revision_value)),
+    ).fetchone()
+    if row is None:
+        return None, "content_revision_not_found"
+    if int(row[4] or 0) != 1:
+        return row, "revision_conflict"
+    states = (str(row[0]), str(row[1]))
+    if "known_incomplete" in states or "complete" not in states:
+        return row, "content_known_incomplete"
+    return row, None
+
+
+def _presentation_plan_row_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    name: str,
+    plan_token: str,
+) -> Any | None:
+    return conn.execute(
+        """
+        SELECT
+            id,
+            turn_id,
+            content_revision,
+            presentation_version,
+            part_count,
+            state,
+            replaces_plan_token,
+            generation,
+            recovers_plan_token
+        FROM turn_presentation_plans
+        WHERE host_id = ? AND name = ? AND plan_token = ?
+        """,
+        (str(host_id), str(name), str(plan_token)),
+    ).fetchone()
+
+
+def _presentation_accepted_parts_conn(
+    conn: sqlite3.Connection,
+    plan_id: int,
+) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM turn_presentation_jobs
+        WHERE plan_id = ? AND operation = 'upsert'
+        """,
+        (int(plan_id),),
+    ).fetchone()
+    return int(row[0] or 0)
+
+
+def prepare_connector_plan_begin(
+    db_path: Path,
+    host_id: str,
+    *,
+    name: str,
+    turn_id: str,
+    content_revision: str,
+    presentation_version: str,
+    part_count: int,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Idempotently begin one bounded range-only presentation plan."""
+    if not _sqlite_store_exists(db_path):
+        return _presentation_error(
+            "store_unavailable",
+            host_id=host_id,
+            name=name,
+        )
+    if (
+        str(name) != _TURN_FINAL_NAME
+        or isinstance(part_count, bool)
+        or not isinstance(part_count, int)
+        or part_count < 1
+        or part_count > _PRESENTATION_MAX_PARTS
+        or not _valid_presentation_label(turn_id, prefix="turn-")
+        or not _valid_presentation_opaque(content_revision, "twrev1.")
+        or not _valid_presentation_label(presentation_version)
+    ):
+        return _presentation_error("invalid_params", host_id=host_id, name=name)
+    count = part_count
+    token = _presentation_plan_token(
+        host_id=str(host_id),
+        name=str(name),
+        turn_id=str(turn_id),
+        content_revision_value=str(content_revision),
+        presentation_version=str(presentation_version),
+        part_count=count,
+    )
+    created_at = _connector_now(now)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _, revision_error = _current_presentation_revision_conn(
+                conn,
+                host_id=str(host_id),
+                turn_id=str(turn_id),
+                content_revision_value=str(content_revision),
+            )
+            if revision_error is not None:
+                conn.rollback()
+                return _presentation_error(
+                    revision_error,
+                    host_id=host_id,
+                    name=name,
+                )
+            existing = conn.execute(
+                """
+                SELECT
+                    id,
+                    plan_token,
+                    part_count,
+                    state,
+                    turn_id,
+                    content_revision,
+                    presentation_version
+                FROM turn_presentation_plans
+                WHERE host_id = ?
+                  AND name = ?
+                  AND turn_id = ?
+                  AND content_revision = ?
+                  AND presentation_version = ?
+                  AND generation = 1
+                """,
+                (
+                    str(host_id),
+                    str(name),
+                    str(turn_id),
+                    str(content_revision),
+                    str(presentation_version),
+                ),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    int(existing[2]) != count
+                    or str(existing[1]) != token
+                    or str(existing[4]) != str(turn_id)
+                    or str(existing[5]) != str(content_revision)
+                    or str(existing[6]) != str(presentation_version)
+                ):
+                    conn.rollback()
+                    return _presentation_error(
+                        "plan_conflict",
+                        host_id=host_id,
+                        name=name,
+                    )
+                accepted = _presentation_accepted_parts_conn(conn, int(existing[0]))
+                conn.commit()
+                return _presentation_response(
+                    {
+                        "schema_version": _PRESENTATION_SCHEMA_VERSION,
+                        "ok": True,
+                        "status": "ok",
+                        "host_id": str(host_id),
+                        "name": str(name),
+                        "plan_token": token,
+                        "state": str(existing[3]),
+                        "part_count": count,
+                        "accepted_parts": accepted,
+                        "generation": 1,
+                    }
+                )
+            cursor = conn.execute(
+                """
+                INSERT INTO turn_presentation_plans (
+                    host_id,
+                    name,
+                    plan_token,
+                    turn_id,
+                    content_revision,
+                    presentation_version,
+                    generation,
+                    part_count,
+                    state,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, 'preparing', ?)
+                """,
+                (
+                    str(host_id),
+                    str(name),
+                    token,
+                    str(turn_id),
+                    str(content_revision),
+                    str(presentation_version),
+                    count,
+                    created_at,
+                ),
+            )
+            plan_id = int(cursor.lastrowid)
+            conn.commit()
+            return _presentation_response(
+                {
+                    "schema_version": _PRESENTATION_SCHEMA_VERSION,
+                    "ok": True,
+                    "status": "ok",
+                    "host_id": str(host_id),
+                    "name": str(name),
+                    "plan_token": token,
+                    "state": "preparing",
+                    "part_count": count,
+                    "accepted_parts": 0,
+                    "generation": 1,
+                }
+            )
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def _validate_presentation_spans(
+    spans: Iterable[Mapping[str, Any]],
+    *,
+    revision_row: Any,
+) -> list[dict[str, Any]] | None:
+    normalized: list[dict[str, Any]] = []
+    prior_rank = -1
+    prior_end_by_field: dict[str, int] = {}
+    states = {
+        "user_text": str(revision_row[0]),
+        "assistant_final_text": str(revision_row[1]),
+    }
+    lengths = {
+        "user_text": int(revision_row[2] or 0),
+        "assistant_final_text": int(revision_row[3] or 0),
+    }
+    for raw in spans:
+        if not isinstance(raw, Mapping):
+            return None
+        field = str(raw.get("field") or "")
+        start = raw.get("start_char")
+        end = raw.get("end_char")
+        if (
+            field not in _PRESENTATION_FIELD_RANK
+            or states[field] != "complete"
+            or isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, int)
+            or not isinstance(end, int)
+            or start < 0
+            or end <= start
+            or end > lengths[field]
+        ):
+            return None
+        rank = _PRESENTATION_FIELD_RANK[field]
+        if rank < prior_rank or start < prior_end_by_field.get(field, 0):
+            return None
+        prior_rank = rank
+        prior_end_by_field[field] = end
+        normalized.append(
+            {
+                "field": field,
+                "start_char": int(start),
+                "end_char": int(end),
+            }
+        )
+    if not normalized or len(normalized) > _PRESENTATION_MAX_SPANS_PER_PART:
+        return None
+    return normalized
+
+
+def prepare_connector_plan_part(
+    db_path: Path,
+    host_id: str,
+    *,
+    name: str,
+    plan_token: str,
+    ordinal: int,
+    spans: Iterable[Mapping[str, Any]],
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Idempotently stage one ordinal's bounded canonical coordinate ranges."""
+    if not _sqlite_store_exists(db_path):
+        return _presentation_error(
+            "store_unavailable",
+            host_id=host_id,
+            name=name,
+            plan_token=plan_token,
+        )
+    if (
+        str(name) != _TURN_FINAL_NAME
+        or not _valid_presentation_opaque(plan_token, "twplan1.")
+        or isinstance(ordinal, bool)
+        or not isinstance(ordinal, int)
+        or not isinstance(spans, list | tuple)
+        or not spans
+        or len(spans) > _PRESENTATION_MAX_SPANS_PER_PART
+    ):
+        return _presentation_error(
+            "invalid_params",
+            host_id=host_id,
+            name=name,
+        )
+    created_at = _connector_now(now)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            plan = _presentation_plan_row_conn(
+                conn,
+                host_id=str(host_id),
+                name=str(name),
+                plan_token=str(plan_token),
+            )
+            if plan is None:
+                conn.rollback()
+                return _presentation_error(
+                    "plan_not_found",
+                    host_id=host_id,
+                    name=name,
+                    plan_token=plan_token,
+                )
+            plan_id = int(plan[0])
+            part_count = int(plan[4])
+            if ordinal < 0 or ordinal >= part_count:
+                conn.rollback()
+                return _presentation_error(
+                    "invalid_params",
+                    host_id=host_id,
+                    name=name,
+                    plan_token=plan_token,
+                )
+            revision_row = conn.execute(
+                """
+                SELECT
+                    user_state,
+                    final_state,
+                    user_char_length,
+                    final_char_length,
+                    is_current
+                FROM turn_content_revisions
+                WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+                """,
+                (str(host_id), str(plan[1]), str(plan[2])),
+            ).fetchone()
+            if revision_row is None:
+                conn.rollback()
+                return _presentation_error(
+                    "content_revision_not_found",
+                    host_id=host_id,
+                    name=name,
+                    plan_token=plan_token,
+                )
+            normalized = _validate_presentation_spans(spans, revision_row=revision_row)
+            if normalized is None:
+                conn.rollback()
+                return _presentation_error(
+                    "invalid_params",
+                    host_id=host_id,
+                    name=name,
+                    plan_token=plan_token,
+                )
+            encoded = _canonical_json(normalized)
+            existing = conn.execute(
+                """
+                SELECT spans_json
+                FROM turn_presentation_jobs
+                WHERE plan_id = ? AND operation = 'upsert' AND part_ordinal = ?
+                """,
+                (plan_id, int(ordinal)),
+            ).fetchone()
+            if existing is not None:
+                if str(existing[0]) != encoded:
+                    conn.rollback()
+                    return _presentation_error(
+                        "plan_conflict",
+                        host_id=host_id,
+                        name=name,
+                        plan_token=plan_token,
+                    )
+            elif str(plan[5]) != "preparing":
+                conn.rollback()
+                return _presentation_error(
+                    "plan_conflict",
+                    host_id=host_id,
+                    name=name,
+                    plan_token=plan_token,
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO turn_presentation_jobs (
+                        plan_id,
+                        sequence_index,
+                        operation,
+                        part_ordinal,
+                        spans_json,
+                        created_at
+                    ) VALUES (?, ?, 'upsert', ?, ?, ?)
+                    """,
+                    (
+                        plan_id,
+                        int(ordinal),
+                        int(ordinal),
+                        encoded,
+                        created_at,
+                    ),
+                )
+            accepted = _presentation_accepted_parts_conn(conn, plan_id)
+            conn.commit()
+            return _presentation_response(
+                {
+                    "schema_version": _PRESENTATION_SCHEMA_VERSION,
+                    "ok": True,
+                    "status": "ok",
+                    "host_id": str(host_id),
+                    "name": str(name),
+                    "plan_token": str(plan_token),
+                    "ordinal": int(ordinal),
+                    "accepted_parts": accepted,
+                }
+            )
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def _presentation_exact_coverage(
+    staged_rows: Iterable[Any],
+    *,
+    revision_row: Any,
+) -> bool:
+    states = {
+        "user_text": str(revision_row[0]),
+        "assistant_final_text": str(revision_row[1]),
+    }
+    lengths = {
+        "user_text": int(revision_row[2] or 0),
+        "assistant_final_text": int(revision_row[3] or 0),
+    }
+    cursors: dict[str, int] = {}
+    last_rank = -1
+    for row in staged_rows:
+        spans = json.loads(str(row[2]))
+        for span in spans:
+            field = str(span["field"])
+            start = int(span["start_char"])
+            end = int(span["end_char"])
+            rank = _PRESENTATION_FIELD_RANK[field]
+            if rank < last_rank:
+                return False
+            if rank > last_rank and last_rank >= 0:
+                prior_field = _PRESENTATION_FIELDS[last_rank]
+                if cursors.get(prior_field, 0) != lengths[prior_field]:
+                    return False
+            if states[field] != "complete" or start != cursors.get(field, 0):
+                return False
+            cursors[field] = end
+            last_rank = rank
+    return bool(cursors) and all(
+        end == lengths[field] for field, end in cursors.items()
+    )
+
+
+def _materialize_connector_plan_job_conn(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: int,
+    job_id: int,
+    host_id: str,
+    name: str,
+    delivery_key: str,
+    payload: Mapping[str, Any],
+    created_at: str,
+) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO connector_outbox (
+            host_id,
+            connector,
+            delivery_key,
+            status,
+            payload_json,
+            private_state_json,
+            created_at,
+            updated_at,
+            next_attempt_at
+        ) VALUES (?, ?, ?, 'queued', ?, '{}', ?, ?, NULL)
+        """,
+        (
+            str(host_id),
+            str(name),
+            str(delivery_key),
+            _canonical_json(dict(payload)),
+            str(created_at),
+            str(created_at),
+        ),
+    )
+    outbox_id = int(cursor.lastrowid)
+    conn.execute(
+        """
+        UPDATE turn_presentation_jobs
+        SET outbox_id = ?
+        WHERE id = ? AND plan_id = ? AND outbox_id IS NULL
+        """,
+        (outbox_id, int(job_id), int(plan_id)),
+    )
+    return outbox_id
+
+
+def _mark_obsolete_presentation_plans_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    name: str,
+    turn_id: str,
+    keep_plan_id: int,
+    now: str,
+) -> bool:
+    obsolete = conn.execute(
+        """
+        SELECT id
+        FROM turn_presentation_plans
+        WHERE host_id = ?
+          AND name = ?
+          AND turn_id = ?
+          AND id != ?
+          AND state IN ('preparing', 'waiting_predecessor', 'active', 'completed')
+        """,
+        (str(host_id), str(name), str(turn_id), int(keep_plan_id)),
+    ).fetchall()
+    obsolete_ids = [int(row[0]) for row in obsolete]
+    if not obsolete_ids:
+        return False
+    placeholders = ",".join("?" for _ in obsolete_ids)
+    conn.execute(
+        f"""
+        UPDATE turn_presentation_plans
+        SET state = 'superseded'
+        WHERE id IN ({placeholders})
+        """,
+        obsolete_ids,
+    )
+    conn.execute(
+        f"""
+        UPDATE connector_outbox
+        SET status = 'superseded',
+            next_attempt_at = NULL,
+            updated_at = ?
+        WHERE id IN (
+            SELECT outbox_id
+            FROM turn_presentation_jobs
+            WHERE plan_id IN ({placeholders}) AND outbox_id IS NOT NULL
+        )
+          AND status IN ('queued', 'retry', 'deferred')
+        """,
+        (str(now), *obsolete_ids),
+    )
+    leased = conn.execute(
+        f"""
+        SELECT outbox.id, outbox.private_state_json
+        FROM connector_outbox AS outbox
+        JOIN turn_presentation_jobs AS jobs ON jobs.outbox_id = outbox.id
+        WHERE jobs.plan_id IN ({placeholders}) AND outbox.status = 'leased'
+        """,
+        obsolete_ids,
+    ).fetchall()
+    for outbox_id, private_state_json in leased:
+        state = _json_object(private_state_json)
+        state["terminal_after_lease"] = True
+        conn.execute(
+            "UPDATE connector_outbox SET private_state_json = ? WHERE id = ?",
+            (_canonical_json(state), int(outbox_id)),
+        )
+    return bool(leased)
+
+
+def _activate_waiting_presentation_plans_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    name: str,
+    now: str,
+) -> int:
+    cursor = conn.execute(
+        """
+        UPDATE turn_presentation_plans AS waiting
+        SET state = 'active', activated_at = COALESCE(activated_at, ?)
+        WHERE waiting.host_id = ?
+          AND waiting.name = ?
+          AND waiting.state = 'waiting_predecessor'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM turn_presentation_plans AS older
+              JOIN turn_presentation_jobs AS jobs ON jobs.plan_id = older.id
+              JOIN connector_outbox AS outbox ON outbox.id = jobs.outbox_id
+              WHERE older.host_id = waiting.host_id
+                AND older.name = waiting.name
+                AND older.turn_id = waiting.turn_id
+                AND older.id != waiting.id
+                AND outbox.status = 'leased'
+          )
+        """,
+        (str(now), str(host_id), str(name)),
+    )
+    return int(cursor.rowcount or 0)
+
+
+def _update_presentation_plan_after_outbox_conn(
+    conn: sqlite3.Connection,
+    *,
+    outbox_id: int,
+    outbox_status: str,
+    now: str,
+) -> None:
+    plan = conn.execute(
+        """
+        SELECT plans.id, plans.host_id, plans.name, plans.state
+        FROM turn_presentation_jobs AS jobs
+        JOIN turn_presentation_plans AS plans ON plans.id = jobs.plan_id
+        WHERE jobs.outbox_id = ?
+        """,
+        (int(outbox_id),),
+    ).fetchone()
+    if plan is not None:
+        plan_id = int(plan[0])
+        if outbox_status == _CONNECTOR_EXHAUSTED_OUTBOX_STATUS and str(plan[3]) in {
+            "active",
+            "waiting_predecessor",
+        }:
+            conn.execute(
+                """
+                UPDATE turn_presentation_plans
+                SET state = 'failed'
+                WHERE id = ?
+                """,
+                (plan_id,),
+            )
+        elif outbox_status == _CONNECTOR_TERMINAL_OUTBOX_STATUS and str(plan[3]) == "active":
+            remaining = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM turn_presentation_jobs AS jobs
+                JOIN connector_outbox AS outbox ON outbox.id = jobs.outbox_id
+                WHERE jobs.plan_id = ? AND outbox.status != 'delivered'
+                """,
+                (plan_id,),
+            ).fetchone()
+            if int(remaining[0] or 0) == 0:
+                conn.execute(
+                    """
+                    UPDATE turn_presentation_plans
+                    SET state = 'completed', completed_at = COALESCE(completed_at, ?)
+                    WHERE id = ? AND state = 'active'
+                    """,
+                    (str(now), plan_id),
+                )
+        _activate_waiting_presentation_plans_conn(
+            conn,
+            host_id=str(plan[1]),
+            name=str(plan[2]),
+            now=str(now),
+        )
+
+
+def _mark_exhausted_presentation_plans_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    name: str | None,
+    now: str,
+) -> None:
+    params: list[Any] = [str(host_id)]
+    connector_clause = ""
+    if name is not None:
+        connector_clause = "AND plans.name = ?"
+        params.append(str(name))
+    conn.execute(
+        f"""
+        UPDATE turn_presentation_plans AS plans
+        SET state = 'failed'
+        WHERE plans.host_id = ?
+          {connector_clause}
+          AND plans.state IN ('active', 'waiting_predecessor')
+          AND EXISTS (
+              SELECT 1
+              FROM turn_presentation_jobs AS jobs
+              JOIN connector_outbox AS outbox ON outbox.id = jobs.outbox_id
+              WHERE jobs.plan_id = plans.id AND outbox.status = 'dead_letter'
+          )
+        """,
+        params,
+    )
+
+
+def prepare_connector_plan_commit(
+    db_path: Path,
+    host_id: str,
+    *,
+    name: str,
+    plan_token: str,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Atomically validate exact coverage and materialize one plan's ordered jobs."""
+    if not _sqlite_store_exists(db_path):
+        return _presentation_error(
+            "store_unavailable",
+            host_id=host_id,
+            name=name,
+            plan_token=plan_token,
+        )
+    if (
+        str(name) != _TURN_FINAL_NAME
+        or not _valid_presentation_opaque(plan_token, "twplan1.")
+    ):
+        return _presentation_error(
+            "invalid_params",
+            host_id=host_id,
+            name=name,
+        )
+    current_time = _connector_now(now)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            plan = _presentation_plan_row_conn(
+                conn,
+                host_id=str(host_id),
+                name=str(name),
+                plan_token=str(plan_token),
+            )
+            if plan is None:
+                conn.rollback()
+                return _presentation_error(
+                    "plan_not_found",
+                    host_id=host_id,
+                    name=name,
+                    plan_token=plan_token,
+                )
+            plan_id = int(plan[0])
+            plan_state = str(plan[5])
+            job_count_row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM turn_presentation_jobs
+                WHERE plan_id = ? AND outbox_id IS NOT NULL
+                """,
+                (plan_id,),
+            ).fetchone()
+            materialized_job_count = int(job_count_row[0] or 0)
+            if materialized_job_count > 0:
+                conn.commit()
+                return _presentation_response(
+                    {
+                        "schema_version": _PRESENTATION_SCHEMA_VERSION,
+                        "ok": True,
+                        "status": "ok",
+                        "host_id": str(host_id),
+                        "name": str(name),
+                        "plan_token": str(plan_token),
+                        "state": plan_state,
+                        "job_count": materialized_job_count,
+                        "generation": int(plan[7]),
+                    }
+                )
+            if plan_state != "preparing":
+                conn.rollback()
+                return _presentation_error(
+                    "plan_conflict",
+                    host_id=host_id,
+                    name=name,
+                    plan_token=plan_token,
+                )
+            revision_row, revision_error = _current_presentation_revision_conn(
+                conn,
+                host_id=str(host_id),
+                turn_id=str(plan[1]),
+                content_revision_value=str(plan[2]),
+            )
+            if revision_error is not None or revision_row is None:
+                conn.rollback()
+                return _presentation_error(
+                    revision_error or "revision_conflict",
+                    host_id=host_id,
+                    name=name,
+                    plan_token=plan_token,
+                )
+            staged = conn.execute(
+                """
+                SELECT id, part_ordinal, spans_json
+                FROM turn_presentation_jobs
+                WHERE plan_id = ? AND operation = 'upsert'
+                ORDER BY part_ordinal
+                """,
+                (plan_id,),
+            ).fetchall()
+            expected_count = int(plan[4])
+            if (
+                len(staged) != expected_count
+                or [int(row[1]) for row in staged] != list(range(expected_count))
+                or not _presentation_exact_coverage(staged, revision_row=revision_row)
+            ):
+                conn.rollback()
+                return _presentation_error(
+                    "plan_incomplete",
+                    host_id=host_id,
+                    name=name,
+                    plan_token=plan_token,
+                )
+            predecessor = conn.execute(
+                """
+                SELECT id, plan_token
+                FROM turn_presentation_plans
+                WHERE host_id = ?
+                  AND name = ?
+                  AND turn_id = ?
+                  AND id != ?
+                  AND activated_at IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (str(host_id), str(name), str(plan[1]), plan_id),
+            ).fetchone()
+            replaces_token = str(predecessor[1]) if predecessor is not None else None
+            completed_baseline = conn.execute(
+                """
+                SELECT COALESCE(MAX(id), 0)
+                FROM turn_presentation_plans
+                WHERE host_id = ?
+                  AND name = ?
+                  AND turn_id = ?
+                  AND id != ?
+                  AND completed_at IS NOT NULL
+                """,
+                (str(host_id), str(name), str(plan[1]), plan_id),
+            ).fetchone()
+            baseline_id = int(completed_baseline[0] or 0)
+            footprint = conn.execute(
+                """
+                SELECT COALESCE(MAX(part_count), 0)
+                FROM turn_presentation_plans
+                WHERE host_id = ?
+                  AND name = ?
+                  AND turn_id = ?
+                  AND id != ?
+                  AND activated_at IS NOT NULL
+                  AND id >= ?
+                """,
+                (
+                    str(host_id),
+                    str(name),
+                    str(plan[1]),
+                    plan_id,
+                    baseline_id,
+                ),
+            ).fetchone()
+            prior_part_count = int(footprint[0] or 0)
+            common = {
+                "schema_version": _PRESENTATION_SCHEMA_VERSION,
+                "plan_token": str(plan_token),
+                "content_revision": str(plan[2]),
+                "presentation_version": str(plan[3]),
+                "part_count": expected_count,
+                "replaces_plan_token": replaces_token,
+            }
+            for job_id, part_ordinal, spans_json in staged:
+                sequence = int(part_ordinal)
+                payload = {
+                    **common,
+                    "operation": "upsert",
+                    "sequence_index": sequence,
+                    "part_ordinal": int(part_ordinal),
+                    "spans": json.loads(str(spans_json)),
+                }
+                _materialize_connector_plan_job_conn(
+                    conn,
+                    plan_id=plan_id,
+                    job_id=int(job_id),
+                    host_id=str(host_id),
+                    name=str(name),
+                    delivery_key=(
+                        f"{name}:{plan_token}:"
+                        f"{sequence:0{_PRESENTATION_SEQUENCE_WIDTH}d}"
+                    ),
+                    payload=payload,
+                    created_at=current_time,
+                )
+            sequence = expected_count
+            for old_ordinal in range(prior_part_count - 1, expected_count - 1, -1):
+                cursor = conn.execute(
+                    """
+                    INSERT INTO turn_presentation_jobs (
+                        plan_id,
+                        sequence_index,
+                        operation,
+                        part_ordinal,
+                        spans_json,
+                        created_at
+                    ) VALUES (?, ?, 'retire', ?, '[]', ?)
+                    """,
+                    (plan_id, sequence, int(old_ordinal), current_time),
+                )
+                payload = {
+                    **common,
+                    "operation": "retire",
+                    "sequence_index": sequence,
+                    "part_ordinal": int(old_ordinal),
+                    "spans": [],
+                }
+                _materialize_connector_plan_job_conn(
+                    conn,
+                    plan_id=plan_id,
+                    job_id=int(cursor.lastrowid),
+                    host_id=str(host_id),
+                    name=str(name),
+                    delivery_key=(
+                        f"{name}:{plan_token}:"
+                        f"{sequence:0{_PRESENTATION_SEQUENCE_WIDTH}d}"
+                    ),
+                    payload=payload,
+                    created_at=current_time,
+                )
+                sequence += 1
+            leased_predecessor = _mark_obsolete_presentation_plans_conn(
+                conn,
+                host_id=str(host_id),
+                name=str(name),
+                turn_id=str(plan[1]),
+                keep_plan_id=plan_id,
+                now=current_time,
+            )
+            next_state = "waiting_predecessor" if leased_predecessor else "active"
+            conn.execute(
+                """
+                UPDATE turn_presentation_plans
+                SET state = ?,
+                    replaces_plan_token = ?,
+                    activated_at = CASE WHEN ? = 'active' THEN ? ELSE NULL END
+                WHERE id = ? AND state = 'preparing'
+                """,
+                (
+                    next_state,
+                    replaces_token,
+                    next_state,
+                    current_time,
+                    plan_id,
+                ),
+            )
+            conn.commit()
+            return _presentation_response(
+                {
+                    "schema_version": _PRESENTATION_SCHEMA_VERSION,
+                    "ok": True,
+                    "status": "ok",
+                    "host_id": str(host_id),
+                    "name": str(name),
+                    "plan_token": str(plan_token),
+                    "state": next_state,
+                    "job_count": sequence,
+                    "generation": int(plan[7]),
+                }
+            )
+        except Exception:
+            conn.rollback()
+            raise
+
+
+
+def _presentation_recovery_result(
+    *,
+    failed_plan_token: str,
+    plan_token: str,
+    generation: int,
+    content_revision: str,
+    acknowledged_prefix_count: int,
+    executable_job_count: int,
+    retained_failed_job_count: int,
+    prior_attempt_count: int,
+    idempotent_replay: bool,
+) -> dict[str, Any]:
+    return _presentation_response(
+        {
+            "schema_version": _PRESENTATION_SCHEMA_VERSION,
+            "ok": True,
+            "status": "recovered",
+            "failed_plan_token": str(failed_plan_token),
+            "plan_token": str(plan_token),
+            "generation": int(generation),
+            "content_revision": str(content_revision),
+            "state": "active",
+            "acknowledged_prefix_count": int(acknowledged_prefix_count),
+            "executable_job_count": int(executable_job_count),
+            "retained_failed_job_count": int(retained_failed_job_count),
+            "prior_attempt_count": int(prior_attempt_count),
+            "idempotent_replay": bool(idempotent_replay),
+        }
+    )
+
+
+def prepare_connector_plan_recover(
+    db_path: Path,
+    host_id: str,
+    *,
+    name: str,
+    failed_plan_token: str,
+    request_id: str,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Explicitly replace one failed immutable plan with its unfinished suffix."""
+    if not _sqlite_store_exists(db_path):
+        return _presentation_error(
+            "store_unavailable",
+            host_id=host_id,
+            name=name,
+            failed_plan_token=failed_plan_token,
+        )
+    if (
+        str(name) != _TURN_FINAL_NAME
+        or not _valid_presentation_opaque(failed_plan_token, "twplan1.")
+        or not _valid_presentation_label(request_id)
+    ):
+        return _presentation_error(
+            "invalid_params",
+            host_id=host_id,
+            name=name,
+            failed_plan_token=failed_plan_token,
+        )
+    current_time = _connector_now(now)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            prior_request = conn.execute(
+                """
+                SELECT
+                    audit.failed_plan_token,
+                    audit.recovered_plan_token,
+                    audit.generation,
+                    plans.content_revision,
+                    audit.delivered_prefix_count,
+                    audit.fresh_job_count,
+                    audit.retained_failed_job_count,
+                    audit.prior_attempt_count
+                FROM turn_presentation_recoveries AS audit
+                JOIN turn_presentation_plans AS plans
+                  ON plans.id = audit.recovered_plan_id
+                WHERE audit.host_id = ? AND audit.name = ? AND audit.request_id = ?
+                """,
+                (str(host_id), str(name), str(request_id)),
+            ).fetchone()
+            if prior_request is not None:
+                if str(prior_request[0]) != str(failed_plan_token):
+                    conn.rollback()
+                    return _presentation_error(
+                        "request_conflict",
+                        host_id=host_id,
+                        name=name,
+                        failed_plan_token=failed_plan_token,
+                    )
+                conn.commit()
+                return _presentation_recovery_result(
+                    failed_plan_token=str(prior_request[0]),
+                    plan_token=str(prior_request[1]),
+                    generation=int(prior_request[2]),
+                    content_revision=str(prior_request[3]),
+                    acknowledged_prefix_count=int(prior_request[4]),
+                    executable_job_count=int(prior_request[5]),
+                    retained_failed_job_count=int(prior_request[6]),
+                    prior_attempt_count=int(prior_request[7]),
+                    idempotent_replay=True,
+                )
+            failed = conn.execute(
+                """
+                SELECT
+                    id,
+                    turn_id,
+                    content_revision,
+                    presentation_version,
+                    generation,
+                    part_count,
+                    state
+                FROM turn_presentation_plans
+                WHERE host_id = ? AND name = ? AND plan_token = ?
+                """,
+                (str(host_id), str(name), str(failed_plan_token)),
+            ).fetchone()
+            if failed is None:
+                conn.rollback()
+                return _presentation_error(
+                    "plan_not_found",
+                    host_id=host_id,
+                    name=name,
+                    failed_plan_token=failed_plan_token,
+                )
+            if str(failed[6]) != "failed":
+                conn.rollback()
+                return _presentation_error(
+                    "plan_not_failed",
+                    host_id=host_id,
+                    name=name,
+                    failed_plan_token=failed_plan_token,
+                )
+            _, revision_error = _current_presentation_revision_conn(
+                conn,
+                host_id=str(host_id),
+                turn_id=str(failed[1]),
+                content_revision_value=str(failed[2]),
+            )
+            if revision_error is not None:
+                conn.rollback()
+                return _presentation_error(
+                    revision_error,
+                    host_id=host_id,
+                    name=name,
+                    failed_plan_token=failed_plan_token,
+                )
+            latest_generation = conn.execute(
+                """
+                SELECT MAX(generation)
+                FROM turn_presentation_plans
+                WHERE host_id = ?
+                  AND name = ?
+                  AND turn_id = ?
+                  AND content_revision = ?
+                  AND presentation_version = ?
+                """,
+                (
+                    str(host_id),
+                    str(name),
+                    str(failed[1]),
+                    str(failed[2]),
+                    str(failed[3]),
+                ),
+            ).fetchone()
+            if int(latest_generation[0] or 0) != int(failed[4]):
+                conn.rollback()
+                return _presentation_error(
+                    "plan_conflict",
+                    host_id=host_id,
+                    name=name,
+                    failed_plan_token=failed_plan_token,
+                )
+            inherited_audit = conn.execute(
+                """
+                SELECT
+                    delivered_prefix_count,
+                    retained_failed_job_count,
+                    prior_attempt_count
+                FROM turn_presentation_recoveries
+                WHERE recovered_plan_id = ?
+                """,
+                (int(failed[0]),),
+            ).fetchone()
+            inherited_prefix_count = (
+                int(inherited_audit[0]) if inherited_audit is not None else 0
+            )
+            inherited_failed_count = (
+                int(inherited_audit[1]) if inherited_audit is not None else 0
+            )
+            inherited_attempt_count = (
+                int(inherited_audit[2]) if inherited_audit is not None else 0
+            )
+            source_jobs = conn.execute(
+                """
+                SELECT
+                    jobs.sequence_index,
+                    jobs.operation,
+                    jobs.part_ordinal,
+                    jobs.spans_json,
+                    outbox.delivery_key,
+                    outbox.status,
+                    outbox.payload_json
+                FROM turn_presentation_jobs AS jobs
+                JOIN connector_outbox AS outbox ON outbox.id = jobs.outbox_id
+                WHERE jobs.plan_id = ?
+                ORDER BY jobs.sequence_index
+                """,
+                (int(failed[0]),),
+            ).fetchall()
+            if (
+                not source_jobs
+                or [int(row[0]) for row in source_jobs]
+                != list(
+                    range(
+                        inherited_prefix_count,
+                        inherited_prefix_count + len(source_jobs),
+                    )
+                )
+            ):
+                conn.rollback()
+                return _presentation_error(
+                    "plan_conflict",
+                    host_id=host_id,
+                    name=name,
+                    failed_plan_token=failed_plan_token,
+                )
+            local_acknowledged_count = 0
+            for source_job in source_jobs:
+                if str(source_job[5]) != "delivered":
+                    break
+                local_acknowledged_count += 1
+            acknowledged_prefix_count = (
+                inherited_prefix_count + local_acknowledged_count
+            )
+            suffix = source_jobs[local_acknowledged_count:]
+            retained_failed_job_count = inherited_failed_count + sum(
+                str(row[5]) == "dead_letter" for row in suffix
+            )
+            if (
+                not suffix
+                or retained_failed_job_count <= inherited_failed_count
+                or any(str(row[5]) in {"delivered", "leased"} for row in suffix)
+            ):
+                conn.rollback()
+                return _presentation_error(
+                    "plan_conflict",
+                    host_id=host_id,
+                    name=name,
+                    failed_plan_token=failed_plan_token,
+                )
+            current_attempt_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM connector_deliveries AS deliveries
+                    JOIN turn_presentation_jobs AS jobs
+                      ON jobs.outbox_id = deliveries.outbox_id
+                    WHERE jobs.plan_id = ?
+                    """,
+                    (int(failed[0]),),
+                ).fetchone()[0]
+                or 0
+            )
+            prior_attempt_count = inherited_attempt_count + current_attempt_count
+            if current_attempt_count < 1:
+                conn.rollback()
+                return _presentation_error(
+                    "plan_conflict",
+                    host_id=host_id,
+                    name=name,
+                    failed_plan_token=failed_plan_token,
+                )
+            generation = int(failed[4]) + 1
+            recovered_token = _presentation_recovery_token(
+                host_id=str(host_id),
+                name=str(name),
+                failed_plan_token=str(failed_plan_token),
+                request_id=str(request_id),
+                generation=generation,
+            )
+            plan_cursor = conn.execute(
+                """
+                INSERT INTO turn_presentation_plans (
+                    host_id,
+                    name,
+                    plan_token,
+                    turn_id,
+                    content_revision,
+                    presentation_version,
+                    generation,
+                    part_count,
+                    state,
+                    replaces_plan_token,
+                    recovers_plan_token,
+                    created_at,
+                    activated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+                """,
+                (
+                    str(host_id),
+                    str(name),
+                    recovered_token,
+                    str(failed[1]),
+                    str(failed[2]),
+                    str(failed[3]),
+                    generation,
+                    int(failed[5]),
+                    str(failed_plan_token),
+                    str(failed_plan_token),
+                    current_time,
+                    current_time,
+                ),
+            )
+            recovered_plan_id = int(plan_cursor.lastrowid)
+            common = {
+                "schema_version": _PRESENTATION_SCHEMA_VERSION,
+                "plan_token": recovered_token,
+                "content_revision": str(failed[2]),
+                "presentation_version": str(failed[3]),
+                "part_count": int(failed[5]),
+                "replaces_plan_token": str(failed_plan_token),
+            }
+            if local_acknowledged_count:
+                common["predecessor_job_key"] = str(
+                    source_jobs[local_acknowledged_count - 1][4]
+                )
+            elif inherited_prefix_count:
+                inherited_payload = _json_object(source_jobs[0][6])
+                predecessor_job_key = str(
+                    inherited_payload.get("predecessor_job_key") or ""
+                )
+                if not predecessor_job_key:
+                    conn.rollback()
+                    return _presentation_error(
+                        "plan_conflict",
+                        host_id=host_id,
+                        name=name,
+                        failed_plan_token=failed_plan_token,
+                    )
+                common["predecessor_job_key"] = predecessor_job_key
+            for (
+                sequence_index,
+                operation,
+                part_ordinal,
+                spans_json,
+                _key,
+                _status,
+                _payload_json,
+            ) in suffix:
+                job_cursor = conn.execute(
+                    """
+                    INSERT INTO turn_presentation_jobs (
+                        plan_id,
+                        sequence_index,
+                        operation,
+                        part_ordinal,
+                        spans_json,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        recovered_plan_id,
+                        int(sequence_index),
+                        str(operation),
+                        int(part_ordinal),
+                        str(spans_json),
+                        current_time,
+                    ),
+                )
+                payload = {
+                    **common,
+                    "operation": str(operation),
+                    "sequence_index": int(sequence_index),
+                    "part_ordinal": int(part_ordinal),
+                    "spans": json.loads(str(spans_json)),
+                }
+                _materialize_connector_plan_job_conn(
+                    conn,
+                    plan_id=recovered_plan_id,
+                    job_id=int(job_cursor.lastrowid),
+                    host_id=str(host_id),
+                    name=str(name),
+                    delivery_key=(
+                        f"{name}:{recovered_token}:"
+                        f"{int(sequence_index):0{_PRESENTATION_SEQUENCE_WIDTH}d}"
+                    ),
+                    payload=payload,
+                    created_at=current_time,
+                )
+            conn.execute(
+                """
+                INSERT INTO turn_presentation_recoveries (
+                    host_id,
+                    name,
+                    request_id,
+                    failed_plan_id,
+                    recovered_plan_id,
+                    failed_plan_token,
+                    recovered_plan_token,
+                    generation,
+                    source_job_count,
+                    delivered_prefix_count,
+                    fresh_job_count,
+                    retained_failed_job_count,
+                    prior_attempt_count,
+                    outcome,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'recovered', ?)
+                """,
+                (
+                    str(host_id),
+                    str(name),
+                    str(request_id),
+                    int(failed[0]),
+                    recovered_plan_id,
+                    str(failed_plan_token),
+                    recovered_token,
+                    generation,
+                    len(source_jobs),
+                    acknowledged_prefix_count,
+                    len(suffix),
+                    retained_failed_job_count,
+                    prior_attempt_count,
+                    current_time,
+                ),
+            )
+            conn.commit()
+            return _presentation_recovery_result(
+                failed_plan_token=str(failed_plan_token),
+                plan_token=recovered_token,
+                generation=generation,
+                content_revision=str(failed[2]),
+                acknowledged_prefix_count=acknowledged_prefix_count,
+                executable_job_count=len(suffix),
+                retained_failed_job_count=retained_failed_job_count,
+                prior_attempt_count=prior_attempt_count,
+                idempotent_replay=False,
+            )
+        except Exception:
+            conn.rollback()
+            raise
+
 
 def poll_connector_outbox(
     db_path: Path,
@@ -1110,19 +2912,54 @@ def poll_connector_outbox(
                     max_attempts=max_attempts,
                     now=current_time,
                 )
+                _mark_exhausted_presentation_plans_conn(
+                    conn,
+                    host_id=str(host_id),
+                    name=str(name),
+                    now=current_time,
+                )
             rows = conn.execute(
                 """
                 SELECT
-                    id,
-                    delivery_key,
-                    payload_json,
-                    private_state_json
-                FROM connector_outbox
-                WHERE host_id = ?
-                  AND connector = ?
-                  AND status IN ('queued', 'deferred', 'retry')
-                  AND (next_attempt_at IS NULL OR next_attempt_at = '' OR next_attempt_at <= ?)
-                ORDER BY id
+                    outbox.id,
+                    outbox.delivery_key,
+                    outbox.payload_json,
+                    outbox.private_state_json
+                FROM connector_outbox AS outbox
+                WHERE outbox.host_id = ?
+                  AND outbox.connector = ?
+                  AND outbox.status IN ('queued', 'deferred', 'retry')
+                  AND (
+                      outbox.next_attempt_at IS NULL
+                      OR outbox.next_attempt_at = ''
+                      OR outbox.next_attempt_at <= ?
+                  )
+                  AND (
+                      NOT EXISTS (
+                          SELECT 1
+                          FROM turn_presentation_jobs AS linked
+                          WHERE linked.outbox_id = outbox.id
+                      )
+                      OR EXISTS (
+                          SELECT 1
+                          FROM turn_presentation_jobs AS current_job
+                          JOIN turn_presentation_plans AS current_plan
+                            ON current_plan.id = current_job.plan_id
+                          WHERE current_job.outbox_id = outbox.id
+                            AND current_plan.state = 'active'
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM turn_presentation_jobs AS predecessor
+                                JOIN connector_outbox AS predecessor_outbox
+                                  ON predecessor_outbox.id = predecessor.outbox_id
+                                WHERE predecessor.plan_id = current_job.plan_id
+                                  AND predecessor.sequence_index
+                                      < current_job.sequence_index
+                                  AND predecessor_outbox.status != 'delivered'
+                            )
+                      )
+                  )
+                ORDER BY outbox.id
                 LIMIT ?
                 """,
                 (str(host_id), str(name), current_time, row_limit),
@@ -1226,9 +3063,12 @@ def poll_connector_outbox(
                         "leased_until": lease_expires_at,
                         "ref": public_ref,
                         "available_at": current_time,
-                        "payload": sanitize_public_mapping(
+                        "payload": _restore_presentation_tokens(
+                            sanitize_public_mapping(
+                                _json_object(row[2]),
+                                backend_neutral=True,
+                            ),
                             _json_object(row[2]),
-                            backend_neutral=True,
                         ),
                     }
                 )
@@ -1236,14 +3076,24 @@ def poll_connector_outbox(
         except Exception:
             conn.rollback()
             raise
-    return sanitize_public_value({
+    result = dict(sanitize_public_value({
         "schema_version": 1,
         "ok": True,
         "status": "ok",
         "host_id": str(host_id),
         "name": str(name),
         "items": items,
-    })
+    }))
+    sanitized_items = result.get("items")
+    if isinstance(sanitized_items, list):
+        for sanitized_item, original_item in zip(sanitized_items, items, strict=True):
+            if not isinstance(sanitized_item, dict):
+                continue
+            sanitized_payload = sanitized_item.get("payload")
+            original_payload = original_item.get("payload")
+            if isinstance(sanitized_payload, dict) and isinstance(original_payload, Mapping):
+                _restore_presentation_tokens(sanitized_payload, original_payload)
+    return result
 
 
 def _connector_validate_live_ref_conn(
@@ -1411,6 +3261,12 @@ def _connector_update_ref(
                                 int(sibling_id),
                             ),
                         )
+                _update_presentation_plan_after_outbox_conn(
+                    conn,
+                    outbox_id=outbox_id,
+                    outbox_status=_CONNECTOR_TERMINAL_OUTBOX_STATUS,
+                    now=current_time,
+                )
                 conn.commit()
                 return _connector_response(
                     ok=True,
@@ -1474,6 +3330,12 @@ def _connector_update_ref(
                     _connector_private_clear_current(row[9]),
                     int(outbox_id),
                 ),
+            )
+            _update_presentation_plan_after_outbox_conn(
+                conn,
+                outbox_id=outbox_id,
+                outbox_status=outbox_status,
+                now=current_time,
             )
             conn.commit()
             return _connector_response(
@@ -2086,6 +3948,54 @@ def _turn_payload_is_prune_protected(payload_json: Any) -> bool:
     )
 
 
+def _delete_turn_if_unreferenced_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    turn_id: str,
+) -> bool:
+    """Delete one whole historical turn only when no durable delivery reference remains."""
+    protected = conn.execute(
+        """
+        SELECT 1
+        FROM turn_content_revisions AS revisions
+        WHERE revisions.host_id = ? AND revisions.turn_id = ?
+          AND (
+              EXISTS (
+                  SELECT 1
+                  FROM turn_presentation_plans AS plans
+                  WHERE plans.host_id = revisions.host_id
+                    AND plans.turn_id = revisions.turn_id
+                    AND plans.content_revision = revisions.content_revision
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM connector_outbox AS outbox
+                  WHERE outbox.host_id = revisions.host_id
+                    AND outbox.connector = ?
+                    AND json_valid(outbox.payload_json)
+                    AND json_extract(
+                        outbox.payload_json,
+                        '$.content_revision'
+                    ) = revisions.content_revision
+              )
+          )
+        LIMIT 1
+        """,
+        (str(host_id), str(turn_id), _TURN_FINAL_NAME),
+    ).fetchone()
+    if protected is not None:
+        return False
+    conn.execute(
+        "DELETE FROM turn_content_revisions WHERE host_id = ? AND turn_id = ?",
+        (str(host_id), str(turn_id)),
+    )
+    cursor = conn.execute(
+        "DELETE FROM turns WHERE host_id = ? AND turn_id = ?",
+        (str(host_id), str(turn_id)),
+    )
+    return cursor.rowcount > 0
+
+
 def _prune_turn_projection(
     conn: sqlite3.Connection,
     host_id: str,
@@ -2114,10 +4024,7 @@ def _prune_turn_projection(
     for turn_id, payload_json in rows:
         if _turn_payload_is_prune_protected(payload_json):
             continue
-        conn.execute(
-            "DELETE FROM turns WHERE host_id = ? AND turn_id = ?",
-            (str(host_id), str(turn_id)),
-        )
+        _delete_turn_if_unreferenced_conn(conn, str(host_id), str(turn_id))
 
 
 def _attention_id_from_item(item: Mapping[str, Any]) -> str:
@@ -2912,6 +4819,13 @@ def _upsert_snapshot_projections(
                 observed_at,
                 _canonical_json(item),
             ),
+        )
+        _ensure_payload_turn_content_revision_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=turn_id,
+            payload=item,
+            observed_at=str(observed_at) if observed_at else None,
         )
     _prune_turn_projection(conn, host_id, turn_ids)
 
@@ -3889,6 +5803,483 @@ def _migrate_v4_to_v5_conn(conn: sqlite3.Connection) -> None:
         raise
 
 
+_LEGACY_TRUNCATION_MARKER = "\n[truncated]"
+
+
+def _legacy_canonical_field(value: Any) -> tuple[str | None, str]:
+    text = sanitize_canonical_turn_text(value)
+    if text is None or text == "":
+        return None, "absent"
+    state = "known_incomplete" if text.endswith(_LEGACY_TRUNCATION_MARKER) else "complete"
+    return text, state
+
+
+def _insert_turn_content_page_boundaries_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    content_revision_value: str,
+    field: str,
+    segments: Iterable[Any],
+) -> None:
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO turn_content_page_boundaries (
+            host_id,
+            turn_id,
+            content_revision,
+            field,
+            page_index,
+            start_char,
+            start_byte
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            (
+                str(host_id),
+                str(turn_id),
+                str(content_revision_value),
+                str(field),
+                int(segment.index),
+                int(segment.start_char),
+                int(segment.start_byte),
+            )
+            for segment in segments
+        ),
+    )
+
+
+def _insert_turn_content_revision_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    user_text: str | None,
+    assistant_final_text: str | None,
+    user_state: str,
+    final_state: str,
+    created_at: str,
+    is_current: bool = True,
+) -> str:
+    revision = content_revision(
+        str(turn_id),
+        user_text,
+        assistant_final_text,
+        user_state,
+        final_state,
+    )
+    user_segments = segment_canonical_text(user_text or "") if user_state == "complete" else ()
+    final_segments = (
+        segment_canonical_text(assistant_final_text or "")
+        if final_state == "complete"
+        else ()
+    )
+    conn.execute(
+        """
+        INSERT INTO turn_content_revisions (
+            host_id, turn_id, content_revision, user_text, assistant_final_text,
+            user_state, final_state, user_char_length, user_byte_length,
+            final_char_length, final_byte_length, user_page_count,
+            final_page_count, is_current, created_at, superseded_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        ON CONFLICT(host_id, turn_id, content_revision) DO NOTHING
+        """,
+        (
+            str(host_id),
+            str(turn_id),
+            revision,
+            user_text,
+            assistant_final_text,
+            user_state,
+            final_state,
+            len(user_text or ""),
+            len((user_text or "").encode("utf-8")),
+            len(assistant_final_text or ""),
+            len((assistant_final_text or "").encode("utf-8")),
+            len(user_segments),
+            len(final_segments),
+            int(bool(is_current)),
+            str(created_at),
+        ),
+    )
+    _insert_turn_content_page_boundaries_conn(
+        conn,
+        host_id=str(host_id),
+        turn_id=str(turn_id),
+        content_revision_value=revision,
+        field="user_text",
+        segments=user_segments,
+    )
+    _insert_turn_content_page_boundaries_conn(
+        conn,
+        host_id=str(host_id),
+        turn_id=str(turn_id),
+        content_revision_value=revision,
+        field="assistant_final_text",
+        segments=final_segments,
+    )
+    return revision
+
+
+def _backfill_legacy_turn_content_conn(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT host_id, turn_id, observed_at, payload_json
+        FROM turns
+        ORDER BY host_id, turn_id
+        """
+    ).fetchall()
+    for host_id, turn_id, observed_at, payload_json in rows:
+        try:
+            payload = json.loads(str(payload_json or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        user_text, user_state = _legacy_canonical_field(payload.get("user_text"))
+        final_text, final_state = _legacy_canonical_field(
+            payload.get("assistant_final_text")
+        )
+        if user_state != "absent" or final_state != "absent":
+            _insert_turn_content_revision_conn(
+                conn,
+                host_id=str(host_id),
+                turn_id=str(turn_id),
+                user_text=user_text,
+                assistant_final_text=final_text,
+                user_state=user_state,
+                final_state=final_state,
+                created_at=str(observed_at or "1970-01-01T00:00:00+00:00"),
+            )
+        for key in (
+            "user_text",
+            "assistant_final_text",
+            "user_preview",
+            "assistant_final_preview",
+            "content",
+        ):
+            payload.pop(key, None)
+        encoded = _canonical_json(payload)
+        conn.execute(
+            """
+            UPDATE turns
+            SET payload_json = ?, fingerprint = ?
+            WHERE host_id = ? AND turn_id = ?
+            """,
+            (
+                encoded,
+                stable_fingerprint(payload),
+                str(host_id),
+                str(turn_id),
+            ),
+        )
+
+
+def _ensure_payload_turn_content_revision_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    payload: Mapping[str, Any],
+    observed_at: str | None,
+) -> bool:
+    current = conn.execute(
+        """
+        SELECT 1
+        FROM turn_content_revisions
+        WHERE host_id = ? AND turn_id = ? AND is_current = 1
+        LIMIT 1
+        """,
+        (str(host_id), str(turn_id)),
+    ).fetchone()
+    if current is not None:
+        return False
+    user_text = sanitize_canonical_turn_text(payload.get("user_text"))
+    final_text = sanitize_canonical_turn_text(
+        payload.get("assistant_final_text")
+    )
+    if user_text == "":
+        user_text = None
+    if final_text == "":
+        final_text = None
+    user_state = "complete" if user_text else "absent"
+    final_state = "complete" if final_text else "absent"
+    if user_state == "absent" and final_state == "absent":
+        return _ensure_absent_turn_content_revision_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=str(turn_id),
+            observed_at=observed_at,
+        )
+    _insert_turn_content_revision_conn(
+        conn,
+        host_id=str(host_id),
+        turn_id=str(turn_id),
+        user_text=user_text,
+        assistant_final_text=final_text,
+        user_state=user_state,
+        final_state=final_state,
+        created_at=str(observed_at or "1970-01-01T00:00:00+00:00"),
+    )
+    return True
+
+
+def _ensure_absent_turn_content_revision_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    observed_at: str | None,
+) -> bool:
+    current = conn.execute(
+        """
+        SELECT 1
+        FROM turn_content_revisions
+        WHERE host_id = ? AND turn_id = ? AND is_current = 1
+        LIMIT 1
+        """,
+        (str(host_id), str(turn_id)),
+    ).fetchone()
+    if current is not None:
+        return False
+    revision = _insert_turn_content_revision_conn(
+        conn,
+        host_id=str(host_id),
+        turn_id=str(turn_id),
+        user_text=None,
+        assistant_final_text=None,
+        user_state="absent",
+        final_state="absent",
+        created_at=str(observed_at or "1970-01-01T00:00:00+00:00"),
+    )
+    cursor = conn.execute(
+        """
+        UPDATE turn_content_revisions
+        SET is_current = 1, superseded_at = NULL
+        WHERE host_id = ?
+          AND turn_id = ?
+          AND content_revision = ?
+          AND NOT EXISTS (
+              SELECT 1
+              FROM turn_content_revisions AS current_revision
+              WHERE current_revision.host_id = ?
+                AND current_revision.turn_id = ?
+                AND current_revision.is_current = 1
+          )
+        """,
+        (
+            str(host_id),
+            str(turn_id),
+            revision,
+            str(host_id),
+            str(turn_id),
+        ),
+    )
+    return bool(cursor.rowcount)
+
+
+def _backfill_missing_turn_content_revisions_conn(
+    conn: sqlite3.Connection,
+) -> int:
+    """Give every stored turn one stable authoritative v2 content descriptor."""
+    repaired = 0
+    cursor = conn.execute(
+        """
+        SELECT turns.host_id, turns.turn_id, turns.observed_at
+        FROM turns
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM turn_content_revisions AS revisions
+            WHERE revisions.host_id = turns.host_id
+              AND revisions.turn_id = turns.turn_id
+              AND revisions.is_current = 1
+        )
+        ORDER BY turns.host_id, turns.turn_id
+        """
+    )
+    while True:
+        rows = cursor.fetchmany(500)
+        if not rows:
+            return repaired
+        for host_id, turn_id, observed_at in rows:
+            if _ensure_absent_turn_content_revision_conn(
+                conn,
+                host_id=str(host_id),
+                turn_id=str(turn_id),
+                observed_at=str(observed_at) if observed_at else None,
+            ):
+                repaired += 1
+
+
+def _rebuild_v6_presentation_plans_conn(conn: sqlite3.Connection) -> None:
+    """Rebuild the two bounded plan tables with generation-aware v7 keys."""
+    conn.execute(
+        """
+        CREATE TABLE turn_presentation_plans_v7 (
+            id INTEGER PRIMARY KEY,
+            host_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            plan_token TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            content_revision TEXT NOT NULL,
+            presentation_version TEXT NOT NULL,
+            generation INTEGER NOT NULL DEFAULT 1 CHECK (generation >= 1),
+            part_count INTEGER NOT NULL CHECK (part_count > 0),
+            state TEXT NOT NULL
+                CHECK (state IN (
+                    'preparing',
+                    'waiting_predecessor',
+                    'active',
+                    'completed',
+                    'superseded',
+                    'failed'
+                )),
+            replaces_plan_token TEXT,
+            recovers_plan_token TEXT,
+            created_at TEXT NOT NULL,
+            activated_at TEXT,
+            completed_at TEXT,
+            UNIQUE (host_id, name, plan_token),
+            UNIQUE (
+                host_id,
+                name,
+                turn_id,
+                content_revision,
+                presentation_version,
+                generation
+            ),
+            FOREIGN KEY (host_id, turn_id, content_revision)
+                REFERENCES turn_content_revisions(host_id, turn_id, content_revision)
+                ON DELETE RESTRICT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO turn_presentation_plans_v7 (
+            id, host_id, name, plan_token, turn_id, content_revision,
+            presentation_version, generation, part_count, state,
+            replaces_plan_token, recovers_plan_token, created_at,
+            activated_at, completed_at
+        )
+        SELECT
+            id, host_id, name, plan_token, turn_id, content_revision,
+            presentation_version, 1, part_count, state,
+            replaces_plan_token, NULL, created_at, activated_at, completed_at
+        FROM turn_presentation_plans
+        ORDER BY id
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE turn_presentation_jobs_v7 (
+            id INTEGER PRIMARY KEY,
+            plan_id INTEGER NOT NULL,
+            sequence_index INTEGER NOT NULL CHECK (sequence_index >= 0),
+            operation TEXT NOT NULL CHECK (operation IN ('upsert', 'retire')),
+            part_ordinal INTEGER NOT NULL CHECK (part_ordinal >= 0),
+            spans_json TEXT NOT NULL,
+            outbox_id INTEGER UNIQUE,
+            created_at TEXT NOT NULL,
+            UNIQUE (plan_id, sequence_index),
+            UNIQUE (plan_id, operation, part_ordinal),
+            FOREIGN KEY (plan_id)
+                REFERENCES turn_presentation_plans_v7(id) ON DELETE CASCADE,
+            FOREIGN KEY (outbox_id)
+                REFERENCES connector_outbox(id) ON DELETE RESTRICT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO turn_presentation_jobs_v7 (
+            id, plan_id, sequence_index, operation, part_ordinal,
+            spans_json, outbox_id, created_at
+        )
+        SELECT
+            id, plan_id, sequence_index, operation, part_ordinal,
+            spans_json, outbox_id, created_at
+        FROM turn_presentation_jobs
+        ORDER BY id
+        """
+    )
+    conn.execute("DROP TABLE turn_presentation_jobs")
+    conn.execute("DROP TABLE turn_presentation_plans")
+    conn.execute(
+        "ALTER TABLE turn_presentation_plans_v7 RENAME TO turn_presentation_plans"
+    )
+    conn.execute(
+        "ALTER TABLE turn_presentation_jobs_v7 RENAME TO turn_presentation_jobs"
+    )
+
+
+def _migrate_v6_to_v7_conn(conn: sqlite3.Connection) -> None:
+    """Atomically add explicit failed-plan generations and immutable recovery audit."""
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= 7:
+        return
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= 7:
+            if owns_transaction:
+                conn.commit()
+            return
+        conn.execute(CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE)
+        _backfill_missing_turn_content_revisions_conn(conn)
+        _backfill_missing_turn_content_page_boundaries_conn(conn)
+        plan_columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(turn_presentation_plans)"
+            ).fetchall()
+        }
+        if "generation" not in plan_columns:
+            _rebuild_v6_presentation_plans_conn(conn)
+        conn.execute(CREATE_TURN_PRESENTATION_RECOVERIES_TABLE)
+        for statement in CREATE_TURN_PRESENTATION_INDEXES:
+            conn.execute(statement)
+        conn.execute("PRAGMA user_version = 7")
+        if owns_transaction:
+            conn.commit()
+    except Exception:
+        if owns_transaction:
+            conn.rollback()
+        raise
+
+
+def _migrate_v5_to_v6_conn(conn: sqlite3.Connection) -> None:
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= 6:
+        return
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= 6:
+            if owns_transaction:
+                conn.commit()
+            return
+        conn.execute(CREATE_TURN_CONTENT_REVISIONS_TABLE)
+        conn.execute(CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE)
+        for statement in CREATE_TURN_CONTENT_REVISION_INDEXES:
+            conn.execute(statement)
+        conn.execute(CREATE_TURN_PRESENTATION_PLANS_TABLE)
+        conn.execute(CREATE_TURN_PRESENTATION_JOBS_TABLE)
+        conn.execute(CREATE_TURN_PRESENTATION_RECOVERIES_TABLE)
+        for statement in CREATE_TURN_PRESENTATION_INDEXES:
+            conn.execute(statement)
+        _backfill_legacy_turn_content_conn(conn)
+        _backfill_missing_turn_content_revisions_conn(conn)
+        conn.execute("PRAGMA user_version = 6")
+        if owns_transaction:
+            conn.commit()
+    except Exception:
+        if owns_transaction:
+            conn.rollback()
+        raise
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     entered_with_transaction = conn.in_transaction
     conn.execute(CREATE_SNAPSHOTS_TABLE)
@@ -3922,12 +6313,23 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     if (
         not entered_with_transaction
         and conn.in_transaction
-        and int(conn.execute("PRAGMA user_version").fetchone()[0]) < 5
+        and int(conn.execute("PRAGMA user_version").fetchone()[0]) < STORE_SCHEMA_VERSION
     ):
         conn.commit()
     _migrate_v4_to_v5_conn(conn)
     conn.execute(CREATE_ATTENTION_LIFECYCLES_TABLE)
     for statement in CREATE_ATTENTION_LIFECYCLE_INDEXES:
+        conn.execute(statement)
+    _migrate_v5_to_v6_conn(conn)
+    _migrate_v6_to_v7_conn(conn)
+    conn.execute(CREATE_TURN_CONTENT_REVISIONS_TABLE)
+    conn.execute(CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE)
+    for statement in CREATE_TURN_CONTENT_REVISION_INDEXES:
+        conn.execute(statement)
+    conn.execute(CREATE_TURN_PRESENTATION_PLANS_TABLE)
+    conn.execute(CREATE_TURN_PRESENTATION_JOBS_TABLE)
+    conn.execute(CREATE_TURN_PRESENTATION_RECOVERIES_TABLE)
+    for statement in CREATE_TURN_PRESENTATION_INDEXES:
         conn.execute(statement)
 
 
@@ -3935,6 +6337,8 @@ def init_store(db_path: Path) -> None:
     """Initialize or migrate the sqlite store to the current schema."""
     with _connect(db_path, prepare=True) as conn:
         _ensure_schema(conn)
+        _backfill_missing_turn_content_revisions_conn(conn)
+        _backfill_missing_turn_content_page_boundaries_conn(conn)
 
 
 def store_status(db_path: Path, host_id: str) -> dict[str, Any]:
@@ -4074,6 +6478,20 @@ def tail_event_metadata(
     })
 
 
+_TURN_CONTENT_MAINTENANCE_BATCH = 100
+_TURN_CONTENT_MAINTENANCE_BATCH_MAX = 1_000
+_TURN_CONTENT_TERMINAL_PLAN_STATES = frozenset(
+    {"completed", "superseded", "failed"}
+)
+_TURN_CONTENT_TERMINAL_OUTBOX_STATES = frozenset(
+    {
+        _CONNECTOR_TERMINAL_OUTBOX_STATUS,
+        _CONNECTOR_EXHAUSTED_OUTBOX_STATUS,
+        _CONNECTOR_SUPERSEDED_OUTBOX_STATUS,
+    }
+)
+
+
 def cleanup_event_retention(
     db_path: Path,
     host_id: str,
@@ -4133,6 +6551,508 @@ def cleanup_event_retention(
     })
 
 
+def _turn_content_retention_candidates_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    cutoff_at: str,
+    batch_size: int,
+) -> list[tuple[str, int]]:
+    rows = conn.execute(
+        """
+        SELECT candidate_type, candidate_id
+        FROM (
+            SELECT
+                'plan' AS candidate_type,
+                plans.id AS candidate_id,
+                CASE
+                    WHEN plans.state = 'preparing' THEN plans.created_at
+                    ELSE COALESCE(
+                        plans.completed_at,
+                        plans.activated_at,
+                        plans.created_at
+                    )
+                END AS eligible_at
+            FROM turn_presentation_plans AS plans
+            WHERE plans.host_id = :host_id
+              AND (
+                  (
+                      plans.state = 'preparing'
+                      AND plans.created_at < :cutoff_at
+                  )
+                  OR (
+                      plans.state IN ('completed', 'superseded', 'failed')
+                      AND COALESCE(
+                          plans.completed_at,
+                          plans.activated_at,
+                          plans.created_at
+                      ) < :cutoff_at
+                  )
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM turn_presentation_plans AS replacement
+                  WHERE replacement.host_id = plans.host_id
+                    AND replacement.name = plans.name
+                    AND replacement.turn_id = plans.turn_id
+                    AND replacement.replaces_plan_token = plans.plan_token
+                    AND replacement.state IN (
+                        'preparing',
+                        'waiting_predecessor',
+                        'active'
+                    )
+              )
+              AND (
+                  plans.state = 'preparing'
+                  OR plans.activated_at IS NULL
+                  OR plans.id < COALESCE(
+                      (
+                          SELECT MAX(completed.id)
+                          FROM turn_presentation_plans AS completed
+                          WHERE completed.host_id = plans.host_id
+                            AND completed.name = plans.name
+                            AND completed.turn_id = plans.turn_id
+                            AND completed.completed_at IS NOT NULL
+                      ),
+                      0
+                  )
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM turn_presentation_jobs AS jobs
+                  LEFT JOIN connector_outbox AS outbox
+                    ON outbox.id = jobs.outbox_id
+                  LEFT JOIN connector_deliveries AS deliveries
+                    ON deliveries.outbox_id = outbox.id
+                  WHERE jobs.plan_id = plans.id
+                    AND (
+                        (
+                            outbox.id IS NOT NULL
+                            AND (
+                                plans.state = 'preparing'
+                                OR outbox.status NOT IN (
+                                    'delivered',
+                                    'dead_letter',
+                                    'superseded'
+                                )
+                                OR outbox.updated_at IS NULL
+                                OR outbox.updated_at >= :cutoff_at
+                            )
+                        )
+                        OR (
+                            deliveries.id IS NOT NULL
+                            AND (
+                                deliveries.status = 'leased'
+                                OR COALESCE(
+                                    deliveries.delivered_at,
+                                    deliveries.created_at
+                                ) >= :cutoff_at
+                            )
+                        )
+                    )
+              )
+            UNION ALL
+            SELECT
+                'revision' AS candidate_type,
+                revisions.rowid AS candidate_id,
+                revisions.superseded_at AS eligible_at
+            FROM turn_content_revisions AS revisions
+            WHERE revisions.host_id = :host_id
+              AND revisions.is_current = 0
+              AND revisions.superseded_at IS NOT NULL
+              AND revisions.superseded_at < :cutoff_at
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM turn_presentation_plans AS plans
+                  WHERE plans.host_id = revisions.host_id
+                    AND plans.turn_id = revisions.turn_id
+                    AND plans.content_revision = revisions.content_revision
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM connector_outbox AS outbox
+                  WHERE outbox.host_id = revisions.host_id
+                    AND outbox.connector = :turn_final_name
+                    AND json_valid(outbox.payload_json)
+                    AND json_extract(
+                        outbox.payload_json,
+                        '$.content_revision'
+                    ) = revisions.content_revision
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM turns
+                  WHERE turns.host_id = revisions.host_id
+                    AND turns.turn_id = revisions.turn_id
+                    AND json_valid(turns.payload_json)
+                    AND (
+                        json_extract(
+                            turns.payload_json,
+                            '$.content_revision'
+                        ) = revisions.content_revision
+                        OR json_extract(
+                            turns.payload_json,
+                            '$.content.content_revision'
+                        ) = revisions.content_revision
+                    )
+              )
+        )
+        ORDER BY eligible_at, candidate_type, candidate_id
+        LIMIT :batch_size
+        """,
+        {
+            "host_id": str(host_id),
+            "cutoff_at": str(cutoff_at),
+            "turn_final_name": _TURN_FINAL_NAME,
+            "batch_size": int(batch_size),
+        },
+    ).fetchall()
+    return [(str(row[0]), int(row[1])) for row in rows]
+
+
+def _terminal_plan_reference_reason_conn(
+    conn: sqlite3.Connection,
+    *,
+    plan: sqlite3.Row | tuple[Any, ...],
+    cutoff_at: str,
+) -> str | None:
+    plan_id = int(plan[0])
+    host_id = str(plan[1])
+    name = str(plan[2])
+    plan_token = str(plan[3])
+    turn_id = str(plan[4])
+    state = str(plan[5])
+    activated_at = plan[7]
+    if state == "preparing":
+        unexpected_anchor = conn.execute(
+            """
+            SELECT 1
+            FROM turn_presentation_jobs AS jobs
+            LEFT JOIN connector_outbox AS outbox ON outbox.id = jobs.outbox_id
+            LEFT JOIN connector_deliveries AS deliveries
+              ON deliveries.outbox_id = outbox.id
+            WHERE jobs.plan_id = ?
+              AND (jobs.outbox_id IS NOT NULL OR deliveries.id IS NOT NULL)
+            LIMIT 1
+            """,
+            (plan_id,),
+        ).fetchone()
+        return "reference" if unexpected_anchor is not None else None
+    if state not in _TURN_CONTENT_TERMINAL_PLAN_STATES:
+        return "reference"
+    live_replacement = conn.execute(
+        """
+        SELECT 1
+        FROM turn_presentation_plans
+        WHERE host_id = ? AND name = ? AND turn_id = ?
+          AND replaces_plan_token = ?
+          AND state IN ('preparing', 'waiting_predecessor', 'active')
+        LIMIT 1
+        """,
+        (host_id, name, turn_id, plan_token),
+    ).fetchone()
+    if live_replacement is not None:
+        return "replacement"
+    latest_completed = conn.execute(
+        """
+        SELECT COALESCE(MAX(id), 0)
+        FROM turn_presentation_plans
+        WHERE host_id = ? AND name = ? AND turn_id = ?
+          AND completed_at IS NOT NULL
+        """,
+        (host_id, name, turn_id),
+    ).fetchone()
+    baseline_id = int(latest_completed[0] or 0)
+    if activated_at is not None and (baseline_id == 0 or plan_id >= baseline_id):
+        return "failed_prefix_or_current_baseline"
+    anchors = conn.execute(
+        """
+        SELECT
+            outbox.id,
+            outbox.status,
+            outbox.updated_at,
+            deliveries.id,
+            deliveries.status,
+            COALESCE(deliveries.delivered_at, deliveries.created_at)
+        FROM turn_presentation_jobs AS jobs
+        LEFT JOIN connector_outbox AS outbox ON outbox.id = jobs.outbox_id
+        LEFT JOIN connector_deliveries AS deliveries
+          ON deliveries.outbox_id = outbox.id
+        WHERE jobs.plan_id = ?
+        """,
+        (plan_id,),
+    ).fetchall()
+    for outbox_id, outbox_status, updated_at, delivery_id, delivery_status, audit_at in anchors:
+        if outbox_id is not None and (
+            str(outbox_status) not in _TURN_CONTENT_TERMINAL_OUTBOX_STATES
+            or not updated_at
+            or str(updated_at) >= str(cutoff_at)
+        ):
+            return "outbox"
+        if delivery_id is not None and (
+            str(delivery_status) == _CONNECTOR_LEASE_STATUS
+            or not audit_at
+            or str(audit_at) >= str(cutoff_at)
+        ):
+            return "delivery"
+    return None
+
+
+def _delete_retained_plan_conn(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: int,
+) -> dict[str, int]:
+    outbox_ids = [
+        int(row[0])
+        for row in conn.execute(
+            """
+            SELECT outbox_id
+            FROM turn_presentation_jobs
+            WHERE plan_id = ? AND outbox_id IS NOT NULL
+            """,
+            (int(plan_id),),
+        ).fetchall()
+    ]
+    deliveries_deleted = 0
+    outbox_deleted = 0
+    if outbox_ids:
+        placeholders = ",".join("?" for _ in outbox_ids)
+        deliveries_deleted = int(
+            conn.execute(
+                f"DELETE FROM connector_deliveries WHERE outbox_id IN ({placeholders})",
+                outbox_ids,
+            ).rowcount
+            or 0
+        )
+    jobs_deleted = int(
+        conn.execute(
+            "DELETE FROM turn_presentation_jobs WHERE plan_id = ?",
+            (int(plan_id),),
+        ).rowcount
+        or 0
+    )
+    if outbox_ids:
+        placeholders = ",".join("?" for _ in outbox_ids)
+        outbox_deleted = int(
+            conn.execute(
+                f"DELETE FROM connector_outbox WHERE id IN ({placeholders})",
+                outbox_ids,
+            ).rowcount
+            or 0
+        )
+    plan_deleted = int(
+        conn.execute(
+            "DELETE FROM turn_presentation_plans WHERE id = ?",
+            (int(plan_id),),
+        ).rowcount
+        or 0
+    )
+    return {
+        "plans": plan_deleted,
+        "jobs": jobs_deleted,
+        "queue_anchors": outbox_deleted,
+        "attempts": deliveries_deleted,
+    }
+
+
+def _delete_superseded_revision_conn(
+    conn: sqlite3.Connection,
+    *,
+    revision_rowid: int,
+    host_id: str,
+    cutoff_at: str,
+) -> bool:
+    cursor = conn.execute(
+        """
+        DELETE FROM turn_content_revisions AS revisions
+        WHERE revisions.rowid = ?
+          AND revisions.host_id = ?
+          AND revisions.is_current = 0
+          AND revisions.superseded_at IS NOT NULL
+          AND revisions.superseded_at < ?
+          AND NOT EXISTS (
+              SELECT 1
+              FROM turn_presentation_plans AS plans
+              WHERE plans.host_id = revisions.host_id
+                AND plans.turn_id = revisions.turn_id
+                AND plans.content_revision = revisions.content_revision
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM connector_outbox AS outbox
+              WHERE outbox.host_id = revisions.host_id
+                AND outbox.connector = ?
+                AND json_valid(outbox.payload_json)
+                AND json_extract(
+                    outbox.payload_json,
+                    '$.content_revision'
+                ) = revisions.content_revision
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM turns
+              WHERE turns.host_id = revisions.host_id
+                AND turns.turn_id = revisions.turn_id
+                AND json_valid(turns.payload_json)
+                AND (
+                    json_extract(
+                        turns.payload_json,
+                        '$.content_revision'
+                    ) = revisions.content_revision
+                    OR json_extract(
+                        turns.payload_json,
+                        '$.content.content_revision'
+                    ) = revisions.content_revision
+                )
+          )
+        """,
+        (
+            int(revision_rowid),
+            str(host_id),
+            str(cutoff_at),
+            _TURN_FINAL_NAME,
+        ),
+    )
+    return bool(cursor.rowcount)
+
+
+def cleanup_turn_content_retention(
+    db_path: Path,
+    host_id: str,
+    *,
+    retention_days: int,
+    now: str | None = None,
+    dry_run: bool = False,
+    batch_size: int = _TURN_CONTENT_MAINTENANCE_BATCH,
+) -> dict[str, Any]:
+    """Remove old presentation anchors, then superseded canonical revisions, in one bounded batch."""
+    days = max(1, int(retention_days))
+    bounded_batch = max(
+        1,
+        min(int(batch_size), _TURN_CONTENT_MAINTENANCE_BATCH_MAX),
+    )
+    cutoff_at = _utc_cutoff(retention_days=days, now=now)
+    empty_counts = {
+        "plans": 0,
+        "jobs": 0,
+        "queue_anchors": 0,
+        "attempts": 0,
+        "revisions": 0,
+    }
+    if not _sqlite_store_exists(db_path):
+        return sanitize_public_value({
+            "schema_version": 1,
+            "ok": False,
+            "status": "store_unavailable",
+            "host_id": str(host_id),
+            "dry_run": bool(dry_run),
+            "retention_days": days,
+            "cutoff_at": cutoff_at,
+            "batch_size": bounded_batch,
+            "examined": 0,
+            "deleted": 0,
+            "skipped_reference": 0,
+            "deleted_rows": empty_counts,
+        })
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        candidates = _turn_content_retention_candidates_conn(
+            conn,
+            host_id=str(host_id),
+            cutoff_at=cutoff_at,
+            batch_size=bounded_batch,
+        )
+    deleted_rows = dict(empty_counts)
+    skipped_reference = 0
+    deleted = 0
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for candidate_type, candidate_id in candidates:
+                if candidate_type == "plan":
+                    plan = conn.execute(
+                        """
+                        SELECT
+                            id, host_id, name, plan_token, turn_id, state,
+                            created_at, activated_at, completed_at
+                        FROM turn_presentation_plans
+                        WHERE id = ? AND host_id = ?
+                          AND (
+                              (state = 'preparing' AND created_at < ?)
+                              OR (
+                                  state IN ('completed', 'superseded', 'failed')
+                                  AND COALESCE(
+                                      completed_at,
+                                      activated_at,
+                                      created_at
+                                  ) < ?
+                              )
+                          )
+                        """,
+                        (
+                            int(candidate_id),
+                            str(host_id),
+                            cutoff_at,
+                            cutoff_at,
+                        ),
+                    ).fetchone()
+                    if plan is None:
+                        skipped_reference += 1
+                        continue
+                    if _terminal_plan_reference_reason_conn(
+                        conn,
+                        plan=plan,
+                        cutoff_at=cutoff_at,
+                    ) is not None:
+                        skipped_reference += 1
+                        continue
+                    plan_counts = _delete_retained_plan_conn(
+                        conn,
+                        plan_id=int(candidate_id),
+                    )
+                    if not plan_counts["plans"]:
+                        skipped_reference += 1
+                        continue
+                    deleted += 1
+                    for key, count in plan_counts.items():
+                        deleted_rows[key] += int(count)
+                    continue
+                if _delete_superseded_revision_conn(
+                    conn,
+                    revision_rowid=int(candidate_id),
+                    host_id=str(host_id),
+                    cutoff_at=cutoff_at,
+                ):
+                    deleted += 1
+                    deleted_rows["revisions"] += 1
+                else:
+                    skipped_reference += 1
+            if dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return sanitize_public_value({
+        "schema_version": 1,
+        "ok": True,
+        "status": "ok",
+        "host_id": str(host_id),
+        "dry_run": bool(dry_run),
+        "retention_days": days,
+        "cutoff_at": cutoff_at,
+        "stale_preparing_before": cutoff_at,
+        "batch_size": bounded_batch,
+        "examined": len(candidates),
+        "deleted": deleted,
+        "skipped_reference": skipped_reference,
+        "deleted_rows": deleted_rows,
+    })
+
+
 def run_store_maintenance(
     db_path: Path,
     host_id: str,
@@ -4141,6 +7061,7 @@ def run_store_maintenance(
     max_outbox_attempts: int,
     now: str | None = None,
     dry_run: bool = False,
+    content_batch_size: int = _TURN_CONTENT_MAINTENANCE_BATCH,
 ) -> dict[str, Any]:
     """Run bounded host-scoped store maintenance and return public-safe counts."""
     retention = cleanup_event_retention(
@@ -4157,7 +7078,19 @@ def run_store_maintenance(
         now=now,
         dry_run=dry_run,
     )
-    ok = bool(retention.get("ok")) and bool(outbox.get("ok"))
+    turn_content = cleanup_turn_content_retention(
+        db_path,
+        host_id,
+        retention_days=retention_days,
+        now=now,
+        dry_run=dry_run,
+        batch_size=content_batch_size,
+    )
+    ok = (
+        bool(retention.get("ok"))
+        and bool(outbox.get("ok"))
+        and bool(turn_content.get("ok"))
+    )
     return sanitize_public_value({
         "schema_version": 1,
         "ok": ok,
@@ -4172,6 +7105,34 @@ def run_store_maintenance(
         "outbox": {
             "max_attempts": int(outbox.get("max_attempts") or max_outbox_attempts),
             "updated": int(outbox.get("updated") or 0),
+        },
+        "turn_content": {
+            "dry_run": bool(turn_content.get("dry_run")),
+            "retention_days": int(
+                turn_content.get("retention_days") or retention_days
+            ),
+            "cutoff_at": turn_content.get("cutoff_at"),
+            "stale_preparing_before": turn_content.get(
+                "stale_preparing_before"
+            ),
+            "batch_size": int(
+                turn_content.get("batch_size") or content_batch_size
+            ),
+            "examined": int(turn_content.get("examined") or 0),
+            "deleted": int(turn_content.get("deleted") or 0),
+            "skipped_reference": int(
+                turn_content.get("skipped_reference") or 0
+            ),
+            "deleted_rows": dict(
+                turn_content.get("deleted_rows")
+                or {
+                    "plans": 0,
+                    "jobs": 0,
+                    "queue_anchors": 0,
+                    "attempts": 0,
+                    "revisions": 0,
+                }
+            ),
         },
     })
 
@@ -4329,6 +7290,192 @@ def prune_backend_pending(db_path: Path | str, host_id: str, live_worker_ids: It
         return len(stale)
 
 
+def _current_turn_content_rows_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    worker_id: str,
+) -> list[tuple[Any, dict[str, Any], dict[str, Any] | None]]:
+    rows = conn.execute(
+        """
+        SELECT
+            turns.turn_id,
+            turns.payload_json,
+            revisions.content_revision,
+            revisions.user_text,
+            revisions.assistant_final_text,
+            revisions.user_state,
+            revisions.final_state
+        FROM turns
+        LEFT JOIN turn_content_revisions AS revisions
+          ON revisions.host_id = turns.host_id
+         AND revisions.turn_id = turns.turn_id
+         AND revisions.is_current = 1
+        WHERE turns.host_id = ? AND turns.worker_id = ?
+        """,
+        (str(host_id), str(worker_id)),
+    ).fetchall()
+    decoded: list[tuple[Any, dict[str, Any], dict[str, Any] | None]] = []
+    for (
+        turn_id,
+        payload_json,
+        revision,
+        user_text,
+        final_text,
+        user_state,
+        final_state,
+    ) in rows:
+        try:
+            loaded = json.loads(str(payload_json or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            loaded = {}
+        payload = sanitize_public_mapping(loaded) if isinstance(loaded, Mapping) else {}
+        current = (
+            {
+                "content_revision": str(revision),
+                "user_text": user_text,
+                "assistant_final_text": final_text,
+                "user_state": str(user_state),
+                "final_state": str(final_state),
+            }
+            if revision is not None
+            else None
+        )
+        decoded.append((turn_id, payload, current))
+    return decoded
+
+
+def _turn_with_current_content(
+    payload: Mapping[str, Any],
+    current: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    merged = dict(payload)
+    if current is not None:
+        merged["user_text"] = current.get("user_text")
+        merged["assistant_final_text"] = current.get("assistant_final_text")
+    return merged
+
+
+def _source_turn_matches(payload: Mapping[str, Any], incoming_source_turn: str) -> bool:
+    stored = str(payload.get("source_turn_id") or "").strip()
+    if not stored or not incoming_source_turn:
+        return False
+    candidate = Turn.from_dict({**dict(payload), "source_turn_id": incoming_source_turn})
+    return candidate.source_turn_id == stored
+
+
+def _merge_canonical_field(
+    incoming: str | None,
+    current_text: Any,
+    current_state: Any,
+) -> tuple[str | None, str]:
+    if incoming is None or incoming == "":
+        state = str(current_state or "absent")
+        if state not in {"absent", "complete", "known_incomplete"}:
+            state = "absent"
+        return (
+            str(current_text) if current_text is not None and state != "absent" else None,
+            state,
+        )
+    return incoming, "complete"
+
+
+def _retain_authoritative_completion(
+    metadata: Mapping[str, Any],
+    current: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    merged = dict(metadata)
+    if current is None or str(current.get("final_state") or "") != "complete":
+        return merged
+    if merged.get("complete") is False:
+        merged.pop("complete", None)
+    if merged.get("has_open_turn") is True:
+        merged.pop("has_open_turn", None)
+    return merged
+
+
+def _replace_current_turn_content_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    current: Mapping[str, Any] | None,
+    incoming_user: str | None,
+    incoming_final: str | None,
+    current_time: str,
+) -> bool:
+    user_text, user_state = _merge_canonical_field(
+        incoming_user,
+        current.get("user_text") if current else None,
+        current.get("user_state") if current else None,
+    )
+    final_text, final_state = _merge_canonical_field(
+        incoming_final,
+        current.get("assistant_final_text") if current else None,
+        current.get("final_state") if current else None,
+    )
+    if user_state == "absent" and final_state == "absent":
+        return False
+    revision = content_revision(
+        str(turn_id),
+        user_text,
+        final_text,
+        user_state,
+        final_state,
+    )
+    if current is not None and str(current.get("content_revision") or "") == revision:
+        return False
+    conn.execute(
+        """
+        UPDATE turn_content_revisions
+        SET is_current = 0, superseded_at = ?
+        WHERE host_id = ? AND turn_id = ? AND is_current = 1
+        """,
+        (current_time, str(host_id), str(turn_id)),
+    )
+    existing = conn.execute(
+        """
+        SELECT 1
+        FROM turn_content_revisions
+        WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+        """,
+        (str(host_id), str(turn_id), revision),
+    ).fetchone()
+    if existing is None:
+        _insert_turn_content_revision_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=str(turn_id),
+            user_text=user_text,
+            assistant_final_text=final_text,
+            user_state=user_state,
+            final_state=final_state,
+            created_at=current_time,
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE turn_content_revisions
+            SET is_current = 1, superseded_at = NULL
+            WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+            """,
+            (str(host_id), str(turn_id), revision),
+        )
+    return True
+
+
+def _strip_canonical_turn_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    lightweight = dict(payload)
+    for key in (
+        "user_text",
+        "assistant_final_text",
+        "user_preview",
+        "assistant_final_preview",
+        "content",
+    ):
+        lightweight.pop(key, None)
+    return lightweight
+
+
 def merge_turn_content(
     db_path: Path,
     host_id: str,
@@ -4337,75 +7484,109 @@ def merge_turn_content(
     *,
     observed_at: str | None = None,
 ) -> int:
-    """Merge bounded public structured-turn content into host-scoped turn rows."""
+    """Atomically merge authoritative turn content into immutable canonical revisions."""
     if not _sqlite_store_exists(db_path):
         return 0
-    clean_content = sanitize_public_mapping(
-        {key: content.get(key) for key in _TURN_CONTENT_FIELDS if key in content}
-    )
-    if not clean_content:
-        return 0
-    if is_internal_automation_turn_payload(clean_content):
+    if not any(key in content for key in _TURN_CONTENT_FIELDS):
         return 0
     current_time = observed_at or utc_timestamp()
-    updated = 0
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
-        rows = conn.execute(
-            """
-            SELECT turn_id, payload_json
-            FROM turns
-            WHERE host_id = ? AND worker_id = ?
-            """,
-            (str(host_id), str(worker_id)),
-        ).fetchall()
-        if not rows:
-            return 0
-        decoded_rows: list[tuple[Any, dict[str, Any]]] = []
-        for turn_id, payload_json in rows:
-            try:
-                payload = sanitize_public_mapping(json.loads(str(payload_json or "{}")))
-            except json.JSONDecodeError:
-                payload = {}
-            decoded_rows.append((turn_id, payload))
-        incoming_source_turn = str(clean_content.get("source_turn_id") or "").strip()
-        exact_source_rows = [
-            (row_turn_id, row_payload)
-            for row_turn_id, row_payload in decoded_rows
-            if incoming_source_turn
-            and str(row_payload.get("source_turn_id") or "").strip() == incoming_source_turn
-        ]
-        base_turn_id, base_payload = max(
-            decoded_rows,
-            key=lambda row: _turn_merge_score(row[1], clean_content),
-        )
         conn.execute("BEGIN IMMEDIATE")
         try:
+            incoming_user = (
+                sanitize_canonical_turn_text(content.get("user_text"))
+                if "user_text" in content
+                else None
+            )
+            incoming_final = (
+                sanitize_canonical_turn_text(content.get("assistant_final_text"))
+                if "assistant_final_text" in content
+                else None
+            )
+            clean_content = sanitize_public_mapping(
+                {
+                    key: content.get(key)
+                    for key in _TURN_CONTENT_FIELDS
+                    if key in content
+                    and key not in {"user_text", "assistant_final_text"}
+                }
+            )
+            automation_probe = {
+                **clean_content,
+                "user_text": incoming_user,
+                "assistant_final_text": incoming_final,
+            }
+            if is_internal_automation_turn_payload(automation_probe):
+                conn.rollback()
+                return 0
+            rows = _current_turn_content_rows_conn(conn, host_id, worker_id)
+            if not rows:
+                conn.rollback()
+                return 0
+            incoming_source_turn = str(clean_content.get("source_turn_id") or "").strip()
+            exact_source_rows = [
+                row
+                for row in rows
+                if incoming_source_turn
+                and _source_turn_matches(row[1], incoming_source_turn)
+            ]
+            scored_rows = [
+                (
+                    turn_id,
+                    payload,
+                    current,
+                    _turn_with_current_content(payload, current),
+                )
+                for turn_id, payload, current in rows
+            ]
+            base_turn_id, base_payload, base_current, base_view = max(
+                scored_rows,
+                key=lambda row: _turn_merge_score(row[3], automation_probe),
+            )
+            changed = False
             if exact_source_rows:
-                # Same backend turn observed again: update its dedicated row.
-                turn_id, payload = exact_source_rows[0]
-                payload.update(clean_content)
-                _update_turn_row(conn, host_id, turn_id, payload, current_time)
-                updated += 1
+                turn_id, payload, current = exact_source_rows[0]
+                payload.update(_retain_authoritative_completion(clean_content, current))
+                metadata_changed = _update_turn_row(
+                    conn,
+                    host_id,
+                    turn_id,
+                    payload,
+                    current_time,
+                )
+                revision_changed = _replace_current_turn_content_conn(
+                    conn,
+                    host_id=str(host_id),
+                    turn_id=str(turn_id),
+                    current=current,
+                    incoming_user=incoming_user,
+                    incoming_final=incoming_final,
+                    current_time=current_time,
+                )
+                revision_repaired = _ensure_absent_turn_content_revision_conn(
+                    conn,
+                    host_id=str(host_id),
+                    turn_id=str(turn_id),
+                    observed_at=current_time,
+                )
+                changed = metadata_changed or revision_changed or revision_repaired
             elif incoming_source_turn:
-                # A new backend turn: mint a dedicated row with its own public
-                # identity instead of overwriting the worker's evolving row —
-                # otherwise every conversation turn shares one public turn id
-                # and downstream deliveries silently edit one old message.
                 seed = {
                     key: base_payload.get(key)
                     for key in _TURN_IDENTITY_SEED_FIELDS
                     if base_payload.get(key) is not None
                 }
                 if seed.get("origin_command_id") and not _turn_content_matches_origin(
-                    base_payload,
-                    clean_content,
+                    base_view,
+                    automation_probe,
                 ):
                     seed.pop("origin_command_id", None)
                     if str(seed.get("source") or "") == "command":
                         seed["source"] = "snapshot"
                 seed.update(clean_content)
-                item = sanitize_public_mapping(Turn.from_dict(seed).to_dict())
+                item = _strip_canonical_turn_payload(Turn.from_dict(seed).to_dict())
+                turn_id = str(item.get("id") or "unknown")
                 conn.execute(
                     """
                     INSERT INTO turns (
@@ -4423,7 +7604,7 @@ def merge_turn_content(
                     """,
                     (
                         str(host_id),
-                        str(item.get("id") or "unknown"),
+                        turn_id,
                         str(item.get("worker_id") or worker_id),
                         item.get("worker_fingerprint"),
                         item.get("space_id"),
@@ -4436,29 +7617,65 @@ def merge_turn_content(
                         _canonical_json(item),
                     ),
                 )
+                _replace_current_turn_content_conn(
+                    conn,
+                    host_id=str(host_id),
+                    turn_id=turn_id,
+                    current=None,
+                    incoming_user=incoming_user,
+                    incoming_final=incoming_final,
+                    current_time=current_time,
+                )
+                _ensure_absent_turn_content_revision_conn(
+                    conn,
+                    host_id=str(host_id),
+                    turn_id=str(turn_id),
+                    observed_at=current_time,
+                )
                 if not str(base_payload.get("source_turn_id") or "").strip():
-                    # The worker's evolving row donated its (now superseded)
-                    # text to per-turn rows; clear it so stale content cannot
-                    # resurface as a deliverable turn.
-                    base_changed = False
-                    for key in ("user_text", "assistant_final_text", "assistant_stream_text"):
-                        if base_payload.get(key):
-                            base_payload[key] = None
-                            base_changed = True
-                    if base_changed:
-                        _update_turn_row(conn, host_id, base_turn_id, base_payload, current_time)
+                    base_payload["assistant_stream_text"] = None
+                    _update_turn_row(
+                        conn,
+                        host_id,
+                        base_turn_id,
+                        base_payload,
+                        current_time,
+                    )
                 _prune_source_turn_history(conn, host_id, worker_id)
-                updated += 1
+                changed = True
             else:
-                turn_id, payload = base_turn_id, base_payload
-                payload.update(clean_content)
-                _update_turn_row(conn, host_id, turn_id, payload, current_time)
-                updated += 1
+                payload = dict(base_payload)
+                payload.update(
+                    _retain_authoritative_completion(clean_content, base_current)
+                )
+                metadata_changed = _update_turn_row(
+                    conn,
+                    host_id,
+                    base_turn_id,
+                    payload,
+                    current_time,
+                )
+                revision_changed = _replace_current_turn_content_conn(
+                    conn,
+                    host_id=str(host_id),
+                    turn_id=str(base_turn_id),
+                    current=base_current,
+                    incoming_user=incoming_user,
+                    incoming_final=incoming_final,
+                    current_time=current_time,
+                )
+                revision_repaired = _ensure_absent_turn_content_revision_conn(
+                    conn,
+                    host_id=str(host_id),
+                    turn_id=str(base_turn_id),
+                    observed_at=current_time,
+                )
+                changed = metadata_changed or revision_changed or revision_repaired
             conn.commit()
+            return int(changed)
         except Exception:
             conn.rollback()
             raise
-    return updated
 
 
 def _update_turn_row(
@@ -4467,8 +7684,26 @@ def _update_turn_row(
     turn_id: Any,
     payload: dict[str, Any],
     current_time: str,
-) -> None:
-    item = sanitize_public_mapping(Turn.from_dict(payload).to_dict())
+) -> bool:
+    item = _strip_canonical_turn_payload(Turn.from_dict(payload).to_dict())
+    encoded = _canonical_json(item)
+    row = conn.execute(
+        """
+        SELECT status, kind, updated_at, fingerprint, payload_json
+        FROM turns
+        WHERE host_id = ? AND turn_id = ?
+        """,
+        (str(host_id), str(turn_id)),
+    ).fetchone()
+    values = (
+        str(item.get("status") or "unknown"),
+        str(item.get("kind") or "unknown"),
+        item.get("updated_at") or (row[2] if row is not None else None) or current_time,
+        str(item.get("fingerprint") or ""),
+        encoded,
+    )
+    if row is not None and tuple(row) == values:
+        return False
     conn.execute(
         """
         UPDATE turns
@@ -4481,19 +7716,24 @@ def _update_turn_row(
         WHERE host_id = ? AND turn_id = ?
         """,
         (
-            str(item.get("status") or "unknown"),
-            str(item.get("kind") or "unknown"),
-            item.get("updated_at") or current_time,
-            str(item.get("fingerprint") or ""),
+            values[0],
+            values[1],
+            values[2],
+            values[3],
             current_time,
-            _canonical_json(item),
+            values[4],
             str(host_id),
             str(turn_id),
         ),
     )
+    return True
 
 
-def _prune_source_turn_history(conn: sqlite3.Connection, host_id: str, worker_id: str) -> None:
+def _prune_source_turn_history(
+    conn: sqlite3.Connection,
+    host_id: str,
+    worker_id: str,
+) -> None:
     rows = conn.execute(
         """
         SELECT turn_id, payload_json
@@ -4509,14 +7749,14 @@ def _prune_source_turn_history(conn: sqlite3.Connection, host_id: str, worker_id
             payload = json.loads(str(payload_json or "{}"))
         except json.JSONDecodeError:
             payload = {}
-        if not isinstance(payload, Mapping) or not str(payload.get("source_turn_id") or "").strip():
+        if not isinstance(payload, Mapping) or not str(
+            payload.get("source_turn_id") or ""
+        ).strip():
             continue
         kept += 1
-        if kept > _SOURCE_TURN_HISTORY_LIMIT:
-            conn.execute(
-                "DELETE FROM turns WHERE host_id = ? AND turn_id = ?",
-                (str(host_id), str(turn_id)),
-            )
+        if kept <= _SOURCE_TURN_HISTORY_LIMIT:
+            continue
+        _delete_turn_if_unreferenced_conn(conn, str(host_id), str(turn_id))
 
 
 def upsert_command_pending_turn(
@@ -4613,6 +7853,13 @@ def upsert_command_pending_turn(
                 _canonical_json(item),
             ),
         )
+        _ensure_payload_turn_content_revision_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=turn_id,
+            payload=item,
+            observed_at=current_time,
+        )
     return sanitize_public_mapping(item)
 
 
@@ -4621,48 +7868,257 @@ def turns_payload_from_store(
     host_id: str,
     *,
     snapshot: Snapshot | None = None,
+    schema_version: int = 1,
+    work_counters: TurnContentWorkCounters | None = None,
 ) -> dict[str, Any]:
-    """Return public turns from the store, preserving structured-turn content."""
+    """Return a negotiated bounded turn-list projection from canonical content."""
+    requested_schema = int(schema_version)
+    if requested_schema not in {1, TURN_LIST_SCHEMA_VERSION}:
+        return {
+            "schema_version": requested_schema,
+            "ok": False,
+            "status": "unsupported_turn_schema_version",
+            "required_turn_schema_version": TURN_LIST_SCHEMA_VERSION,
+        }
     if not _sqlite_store_exists(db_path):
         if snapshot is not None:
-            return sanitize_public_mapping(turns_payload_from_snapshot(snapshot))
-        return sanitize_public_mapping({
-            "schema_version": 1,
+            projected = turns_payload_from_snapshot(
+                snapshot,
+                schema_version=TURN_LIST_SCHEMA_VERSION,
+            )
+            if requested_schema == TURN_LIST_SCHEMA_VERSION:
+                return projected
+            incompatible = any(
+                field.get("availability") != "absent" and not field.get("inline")
+                for turn in projected.get("turns", [])
+                for field in (turn.get("content") or {}).get("fields", {}).values()
+            )
+            if incompatible:
+                return {
+                    "schema_version": 1,
+                    "ok": False,
+                    "status": "upgrade_required",
+                    "required_turn_schema_version": TURN_LIST_SCHEMA_VERSION,
+                }
+            projected["schema_version"] = 1
+            for turn in projected.get("turns", []):
+                turn["schema_version"] = 1
+                turn.pop("content", None)
+            return projected
+        return {
+            "schema_version": requested_schema,
             "host_id": str(host_id),
             "updated_at": None,
-            "content_fingerprint": stable_fingerprint({"host_id": str(host_id), "turns": []}),
+            "content_fingerprint": stable_fingerprint(
+                {"host_id": str(host_id), "turns": []}
+            ),
             "turns": [],
             "backend_health": [],
-        })
+        }
     with _connect(db_path) as conn:
         _ensure_schema(conn)
         rows = conn.execute(
             """
-            SELECT payload_json, observed_at
+            SELECT
+                turns.payload_json,
+                turns.observed_at,
+                turns.turn_id,
+                revisions.content_revision,
+                revisions.user_state,
+                revisions.user_char_length,
+                revisions.user_byte_length,
+                CASE WHEN revisions.user_state = 'complete'
+                     THEN revisions.user_page_count ELSE 0 END,
+                CASE
+                    WHEN revisions.user_state = 'complete'
+                     AND revisions.user_char_length BETWEEN 1 AND ?
+                    THEN revisions.user_text
+                END,
+                CASE
+                    WHEN revisions.user_state != 'absent'
+                     AND NOT (
+                         revisions.user_state = 'complete'
+                         AND revisions.user_char_length BETWEEN 1 AND ?
+                     )
+                    THEN substr(revisions.user_text, 1, ?)
+                END,
+                revisions.final_state,
+                revisions.final_char_length,
+                revisions.final_byte_length,
+                CASE WHEN revisions.final_state = 'complete'
+                     THEN revisions.final_page_count ELSE 0 END,
+                CASE
+                    WHEN revisions.final_state = 'complete'
+                     AND revisions.final_char_length BETWEEN 1 AND ?
+                    THEN revisions.assistant_final_text
+                END,
+                CASE
+                    WHEN revisions.final_state != 'absent'
+                     AND NOT (
+                         revisions.final_state = 'complete'
+                         AND revisions.final_char_length BETWEEN 1 AND ?
+                     )
+                    THEN substr(revisions.assistant_final_text, 1, ?)
+                END
             FROM turns
-            WHERE host_id = ?
-            ORDER BY worker_id, COALESCE(updated_at, observed_at, '') DESC, turn_id
+            LEFT JOIN turn_content_revisions AS revisions
+              ON revisions.host_id = turns.host_id
+             AND revisions.turn_id = turns.turn_id
+             AND revisions.is_current = 1
+            WHERE turns.host_id = ?
+            ORDER BY
+                turns.worker_id,
+                COALESCE(turns.updated_at, turns.observed_at, '') DESC,
+                turns.turn_id
             """,
-            (str(host_id),),
+            (
+                TURN_TEXT_MAX_CHARS,
+                TURN_TEXT_MAX_CHARS,
+                TURN_CONTENT_PREVIEW_MAX_CHARS,
+                TURN_TEXT_MAX_CHARS,
+                TURN_TEXT_MAX_CHARS,
+                TURN_CONTENT_PREVIEW_MAX_CHARS,
+                str(host_id),
+            ),
         ).fetchall()
-    if not rows:
-        if snapshot is not None:
-            return sanitize_public_mapping(turns_payload_from_snapshot(snapshot))
-        turns: list[dict[str, Any]] = []
-        updated_at = None
-    else:
-        turns = []
-        observed_values: list[str] = []
-        for payload_json, observed_at in rows:
-            try:
-                turn_payload = sanitize_public_mapping(json.loads(str(payload_json or "{}")))
-            except json.JSONDecodeError:
-                turn_payload = {}
-            if turn_payload and not is_internal_automation_turn_payload(turn_payload):
-                turns.append(sanitize_public_mapping(Turn.from_dict(turn_payload).to_dict()))
-            if observed_at:
-                observed_values.append(str(observed_at))
-        updated_at = max(observed_values) if observed_values else None
+        if work_counters is not None:
+            work_counters.list_sql_queries += 1
+            work_counters.list_descriptor_rows += len(rows)
+            work_counters.list_inline_chars_examined += sum(
+                len(value)
+                for row in rows
+                for value in (row[8], row[14])
+                if isinstance(value, str)
+            )
+            work_counters.list_preview_chars_examined += sum(
+                len(value)
+                for row in rows
+                for value in (row[9], row[15])
+                if isinstance(value, str)
+            )
+    if not rows and snapshot is not None:
+        projected = turns_payload_from_snapshot(
+            snapshot,
+            schema_version=TURN_LIST_SCHEMA_VERSION,
+        )
+        if requested_schema == TURN_LIST_SCHEMA_VERSION:
+            return projected
+        incompatible = any(
+            field.get("availability") != "absent" and not field.get("inline")
+            for turn in projected.get("turns", [])
+            for field in (turn.get("content") or {}).get("fields", {}).values()
+        )
+        if incompatible:
+            return {
+                "schema_version": 1,
+                "ok": False,
+                "status": "upgrade_required",
+                "required_turn_schema_version": TURN_LIST_SCHEMA_VERSION,
+            }
+        projected["schema_version"] = 1
+        for turn in projected.get("turns", []):
+            turn["schema_version"] = 1
+            turn.pop("content", None)
+        return projected
+    turns: list[dict[str, Any]] = []
+    observed_values: list[str] = []
+    incompatible_v1 = False
+    for (
+        payload_json,
+        observed_at,
+        turn_id,
+        revision,
+        user_state,
+        user_char_length,
+        user_byte_length,
+        user_page_count,
+        user_inline,
+        user_preview,
+        final_state,
+        final_char_length,
+        final_byte_length,
+        final_page_count,
+        final_inline,
+        final_preview,
+    ) in rows:
+        try:
+            loaded = json.loads(str(payload_json or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            loaded = {}
+        if not isinstance(loaded, Mapping):
+            loaded = {}
+        turn_payload = sanitize_public_mapping(loaded)
+        if turn_payload and not is_internal_automation_turn_payload(turn_payload):
+            serialized = Turn.from_dict(turn_payload).to_dict()
+            item = _strip_canonical_turn_payload(serialized)
+            if revision is not None:
+                projection = project_persisted_turn_content(
+                    str(revision),
+                    user_state=str(user_state),
+                    user_char_length=int(user_char_length),
+                    user_byte_length=int(user_byte_length),
+                    user_page_count=int(user_page_count),
+                    user_inline=user_inline,
+                    user_preview=user_preview,
+                    final_state=str(final_state),
+                    final_char_length=int(final_char_length),
+                    final_byte_length=int(final_byte_length),
+                    final_page_count=int(final_page_count),
+                    final_inline=final_inline,
+                    final_preview=final_preview,
+                )
+                fields = projection["content"]["fields"]
+                incompatible_v1 = incompatible_v1 or any(
+                    descriptor["availability"] != "absent"
+                    and not descriptor["inline"]
+                    for descriptor in fields.values()
+                )
+                item.update(projection)
+            else:
+                legacy_user, legacy_user_state = _legacy_canonical_field(
+                    serialized.get("user_text")
+                )
+                legacy_final, legacy_final_state = _legacy_canonical_field(
+                    serialized.get("assistant_final_text")
+                )
+                if requested_schema == TURN_LIST_SCHEMA_VERSION and (
+                    legacy_user_state != "absent" or legacy_final_state != "absent"
+                ):
+                    item.update(
+                        project_turn_content(
+                            str(turn_id),
+                            legacy_user,
+                            legacy_final,
+                            user_state=legacy_user_state,
+                            final_state=legacy_final_state,
+                        )
+                    )
+                elif requested_schema == 1:
+                    incompatible_v1 = incompatible_v1 or (
+                        legacy_user_state == "known_incomplete"
+                        or legacy_final_state == "known_incomplete"
+                    )
+                    if legacy_user_state == "complete":
+                        item["user_text"] = legacy_user
+                    if legacy_final_state == "complete":
+                        item["assistant_final_text"] = legacy_final
+            if requested_schema == 1:
+                item["schema_version"] = 1
+                item.pop("content", None)
+                item.pop("user_preview", None)
+                item.pop("assistant_final_preview", None)
+                item.setdefault("user_text", None)
+                item.setdefault("assistant_final_text", None)
+            turns.append(item)
+        if observed_at:
+            observed_values.append(str(observed_at))
+    if requested_schema == 1 and incompatible_v1:
+        return {
+            "schema_version": 1,
+            "ok": False,
+            "status": "upgrade_required",
+            "required_turn_schema_version": TURN_LIST_SCHEMA_VERSION,
+        }
     backend_health = sanitize_public_value(
         [health.to_dict() for health in snapshot.backend_health]
         if snapshot is not None
@@ -4670,13 +8126,17 @@ def turns_payload_from_store(
     )
     if not isinstance(backend_health, list):
         backend_health = []
-    payload = sanitize_public_mapping({
-        "schema_version": 1,
+    payload = {
+        "schema_version": requested_schema,
         "host_id": str(host_id),
-        "updated_at": updated_at or (snapshot.updated_at if snapshot is not None else None),
+        "updated_at": (
+            max(observed_values)
+            if observed_values
+            else (snapshot.updated_at if snapshot is not None else None)
+        ),
         "turns": turns,
         "backend_health": backend_health,
-    })
+    }
     payload["content_fingerprint"] = stable_fingerprint(
         {
             "schema_version": payload["schema_version"],
@@ -4685,7 +8145,479 @@ def turns_payload_from_store(
             "backend_health": payload["backend_health"],
         }
     )
-    return sanitize_public_mapping(payload)
+    _record_response_size(work_counters, payload)
+    return payload
+
+
+def _bounded_utf8_blob_page(raw: bytes) -> str:
+    """Decode the longest code-point-complete prefix of one bounded byte window."""
+    end = len(raw)
+    minimum = max(0, end - 3)
+    while end >= minimum:
+        try:
+            return raw[:end].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            if exc.end != end:
+                raise ValueError("invalid_canonical_utf8") from None
+            end -= 1
+    raise ValueError("invalid_canonical_utf8")
+
+
+def _ensure_turn_content_page_boundaries_conn(
+    conn: sqlite3.Connection,
+    *,
+    rowid: int,
+    host_id: str,
+    turn_id: str,
+    content_revision_value: str,
+    field: str,
+    column: str,
+    total_char_length: int,
+    total_byte_length: int,
+    page_count: int,
+    work_counters: TurnContentWorkCounters | None,
+) -> None:
+    existing_count = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM turn_content_page_boundaries
+            WHERE host_id = ?
+              AND turn_id = ?
+              AND content_revision = ?
+              AND field = ?
+            """,
+            (
+                str(host_id),
+                str(turn_id),
+                str(content_revision_value),
+                str(field),
+            ),
+        ).fetchone()[0]
+        or 0
+    )
+    if existing_count == page_count:
+        return
+    if existing_count:
+        raise ValueError("invalid_content_metadata")
+    blob = conn.blobopen(
+        "turn_content_revisions",
+        str(column),
+        int(rowid),
+        readonly=True,
+    )
+    try:
+        if len(blob) != total_byte_length:
+            raise ValueError("invalid_content_metadata")
+        start_byte = 0
+        start_char = 0
+        page_index = 0
+        while start_byte < total_byte_length:
+            blob.seek(start_byte)
+            raw = blob.read(
+                min(
+                    TURN_CONTENT_PAGE_MAX_UTF8_BYTES,
+                    total_byte_length - start_byte,
+                )
+            )
+            text = _bounded_utf8_blob_page(raw)
+            segment_byte_length = len(text.encode("utf-8"))
+            segment_char_length = len(text)
+            if (
+                not segment_byte_length
+                or segment_byte_length > TURN_CONTENT_PAGE_MAX_UTF8_BYTES
+            ):
+                raise ValueError("invalid_content_metadata")
+            conn.execute(
+                """
+                INSERT INTO turn_content_page_boundaries (
+                    host_id,
+                    turn_id,
+                    content_revision,
+                    field,
+                    page_index,
+                    start_char,
+                    start_byte
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(host_id),
+                    str(turn_id),
+                    str(content_revision_value),
+                    str(field),
+                    page_index,
+                    start_char,
+                    start_byte,
+                ),
+            )
+            page_index += 1
+            start_byte += segment_byte_length
+            start_char += segment_char_length
+            if work_counters is not None:
+                work_counters.page_blob_reads += 1
+                work_counters.page_bytes_examined += len(raw)
+                work_counters.page_chars_examined += segment_char_length
+        if (
+            page_index != page_count
+            or start_byte != total_byte_length
+            or start_char != total_char_length
+        ):
+            raise ValueError("invalid_content_metadata")
+    finally:
+        blob.close()
+
+
+def _backfill_missing_turn_content_page_boundaries_conn(
+    conn: sqlite3.Connection,
+) -> int:
+    """Stream complete legacy fields once and persist exact non-content boundaries."""
+    repaired_fields = 0
+    cursor = conn.execute(
+        """
+        SELECT
+            rowid,
+            host_id,
+            turn_id,
+            content_revision,
+            user_state,
+            user_char_length,
+            user_byte_length,
+            user_page_count,
+            final_state,
+            final_char_length,
+            final_byte_length,
+            final_page_count
+        FROM turn_content_revisions
+        WHERE (user_state = 'complete' AND user_page_count > 0)
+           OR (final_state = 'complete' AND final_page_count > 0)
+        ORDER BY host_id, turn_id, content_revision
+        """
+    )
+    while True:
+        rows = cursor.fetchmany(64)
+        if not rows:
+            return repaired_fields
+        for row in rows:
+            fields = (
+                (
+                    "user_text",
+                    "user_text",
+                    str(row[4]),
+                    int(row[5]),
+                    int(row[6]),
+                    int(row[7]),
+                ),
+                (
+                    "assistant_final_text",
+                    "assistant_final_text",
+                    str(row[8]),
+                    int(row[9]),
+                    int(row[10]),
+                    int(row[11]),
+                ),
+            )
+            for (
+                field,
+                column,
+                state,
+                total_char_length,
+                total_byte_length,
+                page_count,
+            ) in fields:
+                if state != "complete" or page_count < 1:
+                    continue
+                existing_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM turn_content_page_boundaries
+                        WHERE host_id = ?
+                          AND turn_id = ?
+                          AND content_revision = ?
+                          AND field = ?
+                        """,
+                        (
+                            str(row[1]),
+                            str(row[2]),
+                            str(row[3]),
+                            field,
+                        ),
+                    ).fetchone()[0]
+                    or 0
+                )
+                if existing_count == page_count:
+                    continue
+                if existing_count:
+                    conn.execute(
+                        """
+                        DELETE FROM turn_content_page_boundaries
+                        WHERE host_id = ?
+                          AND turn_id = ?
+                          AND content_revision = ?
+                          AND field = ?
+                        """,
+                        (
+                            str(row[1]),
+                            str(row[2]),
+                            str(row[3]),
+                            field,
+                        ),
+                    )
+                _ensure_turn_content_page_boundaries_conn(
+                    conn,
+                    rowid=int(row[0]),
+                    host_id=str(row[1]),
+                    turn_id=str(row[2]),
+                    content_revision_value=str(row[3]),
+                    field=field,
+                    column=column,
+                    total_char_length=total_char_length,
+                    total_byte_length=total_byte_length,
+                    page_count=page_count,
+                    work_counters=None,
+                )
+                repaired_fields += 1
+
+
+def get_turn_content(
+    db_path: Path,
+    host_id: str,
+    *,
+    turn_id: str,
+    content_revision: str,
+    field: str,
+    cursor: str | None = None,
+    schema_version: int = 1,
+    work_counters: TurnContentWorkCounters | None = None,
+) -> dict[str, Any]:
+    """Read one bounded page directly from the canonical SQLite value."""
+    if schema_version != 1:
+        return {
+            "schema_version": int(schema_version),
+            "ok": False,
+            "status": "unsupported_content_schema_version",
+            "required_content_schema_version": 1,
+        }
+    field_columns = {
+        "user_text": (1, 3, 4, 5, "user_text"),
+        "assistant_final_text": (2, 6, 7, 8, "assistant_final_text"),
+    }
+    if field not in field_columns:
+        return {"schema_version": 1, "ok": False, "status": "invalid_content_field"}
+    if not _sqlite_store_exists(db_path):
+        return {
+            "schema_version": 1,
+            "ok": False,
+            "status": "content_revision_not_found",
+        }
+    try:
+        with _connect(db_path) as conn:
+            _ensure_schema(conn)
+            row = conn.execute(
+                """
+                SELECT
+                    revisions.rowid,
+                    revisions.user_state,
+                    revisions.final_state,
+                    revisions.user_char_length,
+                    revisions.user_byte_length,
+                    revisions.user_page_count,
+                    revisions.final_char_length,
+                    revisions.final_byte_length,
+                    revisions.final_page_count,
+                    revisions.is_current,
+                    EXISTS (
+                        SELECT 1
+                        FROM turn_presentation_plans AS plans
+                        WHERE plans.host_id = revisions.host_id
+                          AND plans.turn_id = revisions.turn_id
+                          AND plans.content_revision = revisions.content_revision
+                    )
+                FROM turn_content_revisions AS revisions
+                WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+                """,
+                (str(host_id), str(turn_id), str(content_revision)),
+            ).fetchone()
+            if work_counters is not None:
+                work_counters.page_sql_queries += 1
+            if row is None or (not bool(row[9]) and not bool(row[10])):
+                return {
+                    "schema_version": 1,
+                    "ok": False,
+                    "status": "content_revision_not_found",
+                }
+            state_index, char_index, byte_index, count_index, column = field_columns[field]
+            availability = str(row[state_index])
+            if availability == "known_incomplete":
+                return {
+                    "schema_version": 1,
+                    "ok": False,
+                    "status": "content_known_incomplete",
+                }
+            total_char_length = int(row[char_index])
+            total_byte_length = int(row[byte_index])
+            count = int(row[count_index])
+            if (
+                availability != "complete"
+                or total_char_length < 1
+                or total_byte_length < 1
+                or count < 1
+            ):
+                return {
+                    "schema_version": 1,
+                    "ok": False,
+                    "status": "content_not_available",
+                }
+            position = (
+                ContentCursorPosition(
+                    index=0,
+                    segment_id=content_segment_id(content_revision, field, 0),
+                    start_char=0,
+                    start_byte=0,
+                )
+                if cursor is None
+                else decode_content_cursor(
+                    cursor,
+                    revision=content_revision,
+                    field=field,
+                    count=count,
+                )
+            )
+            _ensure_turn_content_page_boundaries_conn(
+                conn,
+                rowid=int(row[0]),
+                host_id=str(host_id),
+                turn_id=str(turn_id),
+                content_revision_value=str(content_revision),
+                field=str(field),
+                column=column,
+                total_char_length=total_char_length,
+                total_byte_length=total_byte_length,
+                page_count=count,
+                work_counters=work_counters,
+            )
+            expected_boundary = conn.execute(
+                """
+                SELECT start_char, start_byte
+                FROM turn_content_page_boundaries
+                WHERE host_id = ?
+                  AND turn_id = ?
+                  AND content_revision = ?
+                  AND field = ?
+                  AND page_index = ?
+                """,
+                (
+                    str(host_id),
+                    str(turn_id),
+                    str(content_revision),
+                    str(field),
+                    position.index,
+                ),
+            ).fetchone()
+            if expected_boundary is None:
+                raise ValueError("invalid_content_metadata")
+            if (
+                position.start_char != int(expected_boundary[0])
+                or position.start_byte != int(expected_boundary[1])
+            ):
+                raise ValueError("invalid_cursor")
+            blob = conn.blobopen(
+                "turn_content_revisions",
+                column,
+                int(row[0]),
+                readonly=True,
+            )
+            try:
+                if len(blob) != total_byte_length:
+                    raise ValueError("invalid_content_metadata")
+                blob.seek(position.start_byte)
+                raw = blob.read(
+                    min(
+                        TURN_CONTENT_PAGE_MAX_UTF8_BYTES,
+                        total_byte_length - position.start_byte,
+                    )
+                )
+            finally:
+                blob.close()
+            text = _bounded_utf8_blob_page(raw)
+            segment_byte_length = len(text.encode("utf-8"))
+            segment_char_length = len(text)
+            if not segment_byte_length or segment_byte_length > TURN_CONTENT_PAGE_MAX_UTF8_BYTES:
+                raise ValueError("invalid_content_metadata")
+            end_byte = position.start_byte + segment_byte_length
+            end_char = position.start_char + segment_char_length
+            has_next = position.index + 1 < count
+            if has_next:
+                next_boundary = conn.execute(
+                    """
+                    SELECT start_char, start_byte
+                    FROM turn_content_page_boundaries
+                    WHERE host_id = ?
+                      AND turn_id = ?
+                      AND content_revision = ?
+                      AND field = ?
+                      AND page_index = ?
+                    """,
+                    (
+                        str(host_id),
+                        str(turn_id),
+                        str(content_revision),
+                        str(field),
+                        position.index + 1,
+                    ),
+                ).fetchone()
+                if (
+                    next_boundary is None
+                    or end_char != int(next_boundary[0])
+                    or end_byte != int(next_boundary[1])
+                ):
+                    raise ValueError("invalid_content_metadata")
+            elif (
+                end_byte != total_byte_length
+                or end_char != total_char_length
+            ):
+                raise ValueError("invalid_content_metadata")
+            payload = {
+                "schema_version": 1,
+                "turn_id": str(turn_id),
+                "content_revision": str(content_revision),
+                "field": field,
+                "availability": "complete",
+                "segment_id": position.segment_id,
+                "index": position.index,
+                "count": count,
+                "text": text,
+                "segment_char_length": segment_char_length,
+                "segment_byte_length": segment_byte_length,
+                "total_char_length": total_char_length,
+                "total_byte_length": total_byte_length,
+                "next_cursor": (
+                    content_cursor(
+                        content_revision,
+                        field,
+                        position.index + 1,
+                        start_char=end_char,
+                        start_byte=end_byte,
+                    )
+                    if has_next
+                    else None
+                ),
+            }
+            if work_counters is not None:
+                work_counters.page_blob_reads += 1
+                work_counters.page_bytes_examined += len(raw)
+                work_counters.page_chars_examined += segment_char_length
+            _record_response_size(work_counters, payload)
+            return payload
+    except ValueError as exc:
+        status = "invalid_cursor" if str(exc) == "invalid_cursor" else "content_not_available"
+        return {"schema_version": 1, "ok": False, "status": status}
+    except sqlite3.Error:
+        return {
+            "schema_version": 1,
+            "ok": False,
+            "status": "content_not_available",
+        }
 
 
 def save_snapshot(

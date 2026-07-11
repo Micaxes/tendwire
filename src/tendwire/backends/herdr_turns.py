@@ -316,11 +316,11 @@ def _message_text(payload: Mapping[str, Any]) -> str:
                 continue
             text = item.get("text")
             if isinstance(text, str) and text.strip():
-                parts.append(text.strip())
-        return "\n".join(parts).strip()
+                parts.append(text)
+        return "\n".join(parts)
     text = payload.get("message")
     if isinstance(text, str):
-        return text.strip()
+        return text
     return ""
 
 
@@ -407,7 +407,7 @@ def _read_codex_session_turn(session_id: str) -> Mapping[str, Any] | None:
             continue
         if item.get("type") == "event_msg" and event_type == "task_complete":
             turn_id = _payload_turn_id(payload) or active_turn_id
-            final_text = str(payload.get("last_agent_message") or "").strip()
+            final_text = str(payload.get("last_agent_message") or "")
             if turn_id and final_text:
                 final_by_turn[turn_id] = final_text
                 complete_by_turn[turn_id] = True
@@ -841,13 +841,15 @@ def _apply_omp_progress_message(state: _OmpSessionState, message: Mapping[str, A
 def _omp_message_text(message: Mapping[str, Any]) -> str:
     content = message.get("content")
     if isinstance(content, str):
-        return content.strip()
+        return content
     if isinstance(content, list):
         return "\n".join(
-            str(item.get("text") or "").strip()
+            str(item.get("text") or "")
             for item in content
-            if isinstance(item, Mapping) and item.get("type") == "text" and str(item.get("text") or "").strip()
-        ).strip()
+            if isinstance(item, Mapping)
+            and item.get("type") == "text"
+            and str(item.get("text") or "").strip()
+        )
     return ""
 
 
