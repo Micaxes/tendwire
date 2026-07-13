@@ -333,6 +333,18 @@ CREATE_PR6_INDEXES = (
         "PRIMARY KEY (host_id, worker_id))"
     ),
     (
+        # A REAL structured decision (AskUserQuestion/ExitPlanMode) read from a pending-decision file
+        # and joined to a worker. Kept SEPARATE from backend_pending so the exact file-based decision
+        # is never clobbered/pruned by the screen-scraped backend_pending writer; get_pending prefers
+        # it over both backend_pending and the synthetic row.
+        "CREATE TABLE IF NOT EXISTS backend_decision ("
+        "host_id TEXT NOT NULL, "
+        "worker_id TEXT NOT NULL, "
+        "payload_json TEXT NOT NULL, "
+        "observed_at TEXT NOT NULL, "
+        "PRIMARY KEY (host_id, worker_id))"
+    ),
+    (
         "CREATE INDEX IF NOT EXISTS idx_attention_items_host_source "
         "ON attention_items(host_id, source)"
     ),
@@ -3265,6 +3277,86 @@ def prune_backend_pending(db_path: Path | str, host_id: str, live_worker_ids: It
         for worker_id in stale:
             conn.execute(
                 "DELETE FROM backend_pending WHERE host_id = ? AND worker_id = ?",
+                (host_id, worker_id),
+            )
+        return len(stale)
+
+
+def merge_backend_decision(
+    db_path: Path | str,
+    host_id: str,
+    worker_id: str,
+    decision: Mapping[str, Any] | None,
+) -> bool:
+    """Presence-sync one worker's structured decision (an AskUserQuestion/ExitPlanMode read from a
+    pending-decision file). ``decision=None`` prunes the row (the prompt was answered / the file is
+    gone). Separate table from backend_pending so the exact file-based decision is authoritative."""
+    if not Path(db_path).exists():
+        return False
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        if decision is None:
+            cur = conn.execute(
+                "DELETE FROM backend_decision WHERE host_id = ? AND worker_id = ?",
+                (host_id, worker_id),
+            )
+            return cur.rowcount > 0
+        payload = stable_json_dumps(dict(decision))
+        row = conn.execute(
+            "SELECT payload_json FROM backend_decision WHERE host_id = ? AND worker_id = ?",
+            (host_id, worker_id),
+        ).fetchone()
+        if row and row[0] == payload:
+            return False
+        conn.execute(
+            "INSERT INTO backend_decision (host_id, worker_id, payload_json, observed_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(host_id, worker_id) DO UPDATE SET payload_json = excluded.payload_json, "
+            "observed_at = excluded.observed_at",
+            (host_id, worker_id, payload, utc_timestamp()),
+        )
+        return True
+
+
+def list_backend_decision(db_path: Path | str, host_id: str) -> dict[str, dict[str, Any]]:
+    """worker_id -> normalized decision dict for every live file-based decision."""
+    out: dict[str, dict[str, Any]] = {}
+    if not Path(db_path).exists():
+        return out
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        for worker_id, payload_json in conn.execute(
+            "SELECT worker_id, payload_json FROM backend_decision WHERE host_id = ?",
+            (host_id,),
+        ).fetchall():
+            try:
+                payload = json.loads(payload_json)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict):
+                out[str(worker_id)] = payload
+    return out
+
+
+def prune_backend_decision(db_path: Path | str, host_id: str, live_worker_ids: Iterable[str]) -> int:
+    """Delete backend_decision rows whose worker no longer has a live binding (pane closed / worker
+    gone with a decision still open)."""
+    if not Path(db_path).exists():
+        return 0
+    live = {str(worker_id) for worker_id in live_worker_ids}
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        stored = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT worker_id FROM backend_decision WHERE host_id = ?",
+                (host_id,),
+            ).fetchall()
+        ]
+        stale = [worker_id for worker_id in stored if worker_id not in live]
+        for worker_id in stale:
+            conn.execute(
+                "DELETE FROM backend_decision WHERE host_id = ? AND worker_id = ?",
                 (host_id, worker_id),
             )
         return len(stale)

@@ -256,34 +256,40 @@ class TendwireDaemon:
         payload = dict(pending_payload_from_snapshot(snapshot))
         if self.config.db_path is None:
             return payload
-        from .store.sqlite import list_backend_pending
+        from .store.sqlite import list_backend_decision, list_backend_pending
 
+        decision = list_backend_decision(Path(self.config.db_path), self.config.host_id)
         backend = list_backend_pending(Path(self.config.db_path), self.config.host_id)
-        if not backend:
+        if not decision and not backend:
             return payload
         workers = {worker.id: worker for worker in snapshot.workers}
         # Build backend interactions first; only a worker whose interaction builds successfully
         # supersedes its synthetic row (atomic per worker — a build failure never drops both).
+        # Precedence: a file-based structured decision (backend_decision) wins over a screen-scraped
+        # backend_pending row, which wins over the synthetic snapshot row.
         built: dict[str, dict[str, Any]] = {}
-        for worker_id, pending in sorted(backend.items()):
-            worker = workers.get(worker_id)
-            try:
-                interaction = PendingInteraction.from_dict(
-                    {
-                        "host_id": self.config.host_id,
-                        "worker_id": worker_id,
-                        "question": pending.get("question"),
-                        "kind": pending.get("kind"),
-                        "choices": pending.get("choices") or [],
-                        "status": "open",
-                        "worker_fingerprint": worker.fingerprint if worker is not None else None,
-                        "space_id": worker.space_id if worker is not None else None,
-                        "meta": pending.get("meta") or {"source": "backend"},
-                    }
-                )
-            except Exception:
-                continue
-            built[worker_id] = interaction.to_dict()
+        for source in (decision, backend):
+            for worker_id, pending in sorted(source.items()):
+                if worker_id in built:
+                    continue
+                worker = workers.get(worker_id)
+                try:
+                    interaction = PendingInteraction.from_dict(
+                        {
+                            "host_id": self.config.host_id,
+                            "worker_id": worker_id,
+                            "question": pending.get("question"),
+                            "kind": pending.get("kind"),
+                            "choices": pending.get("choices") or [],
+                            "status": "open",
+                            "worker_fingerprint": worker.fingerprint if worker is not None else None,
+                            "space_id": worker.space_id if worker is not None else None,
+                            "meta": pending.get("meta") or {"source": "backend"},
+                        }
+                    )
+                except Exception:
+                    continue
+                built[worker_id] = interaction.to_dict()
         rows = [row for row in payload.get("pending_interactions", []) if row.get("worker_id") not in built]
         rows.extend(built.values())
         payload["pending_interactions"] = rows

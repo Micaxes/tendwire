@@ -43,6 +43,7 @@ from .herdr_cli import (
     _worker_record_from_item,
     _workers_and_bindings_from_records,
     herdr_backend_health,
+    session_worker_map,
 )
 from .herdr_protocol import (
     HERDR_EVENTS_SUBSCRIBE_METHOD,
@@ -714,6 +715,7 @@ class HerdrEventBackend:
             turn_target_kind=turn_target_kind,
             turn_target_value=turn_target_value,
             terminal_id=terminal_id,
+            session_value=agent_record.session_value or pane_record.session_value,
         )
 
     @staticmethod
@@ -771,6 +773,35 @@ class HerdrEventBackend:
                 break
         return pane_ids
 
+    def _sync_backend_decisions(self, records: list[Any], stored_bindings: Any, workers: list[Any]) -> None:
+        """Join session-keyed pending-decision files to the reconciled workers and carry them to the
+        connector via the backend_decision store (get_pending prefers it over the screen-scraped
+        backend_pending and the synthetic row). Presence-synced: a live worker whose decision file is
+        gone (answered) is pruned; dead workers are reaped. Never raises into the reconcile loop."""
+        if self.config.db_path is None:
+            return
+        try:
+            import time as _time
+
+            from ..store.sqlite import (
+                list_backend_decision,
+                merge_backend_decision,
+                prune_backend_decision,
+            )
+            from .decision_ingest import decisions_by_worker
+
+            session_to_worker = session_worker_map(records, stored_bindings)
+            fresh = decisions_by_worker(session_to_worker, now=_time.time())
+            for worker_id, decision in fresh.items():
+                merge_backend_decision(self.config.db_path, self.config.host_id, worker_id, decision)
+            live = {getattr(worker, "id", "") for worker in workers}
+            for worker_id in list_backend_decision(self.config.db_path, self.config.host_id):
+                if worker_id in live and worker_id not in fresh:
+                    merge_backend_decision(self.config.db_path, self.config.host_id, worker_id, None)
+            prune_backend_decision(self.config.db_path, self.config.host_id, live)
+        except Exception:  # noqa: BLE001 - decision ingest must never break reconcile
+            pass
+
     def reconcile_once(self, *, client: Any | None = None) -> Snapshot:
         """Perform a full Herdr list reconcile and persist Tendwire projections."""
         owns_client = client is None
@@ -807,6 +838,7 @@ class HerdrEventBackend:
                 )
                 if _observed_worker_count(workers) > self.max_workers:
                     return self._mark_worker_cap_exceeded_locked(_observed_worker_count(workers))
+                self._sync_backend_decisions(records, stored_bindings, workers)
                 outcome = "healthy_non_empty" if spaces or workers else "empty_healthy"
                 health = herdr_backend_health(outcome, spaces=spaces, workers=workers)
                 previous = latest_snapshot(self.db_path, self.config.host_id)

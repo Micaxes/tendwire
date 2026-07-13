@@ -47,6 +47,10 @@ class _WorkerRecord:
     # herdr's durable terminal id (survives restart), read from the raw item and threaded through the
     # pane merge / dedup so stable_key can hash it instead of the churning positional pane_id.
     terminal_id: str | None = None
+    # The Claude Code session uuid (pane.agent_session.value), threaded through the merge/dedup so the
+    # reconcile loop can join a session-keyed pending-decision file to this worker's FINAL id. Kept
+    # IN-MEMORY only — never serialized publicly or persisted (session ids are quarantined).
+    session_value: str | None = None
 
 _FORBIDDEN_CONNECTOR_FIELDS = {
     "telegram",
@@ -1011,6 +1015,7 @@ def _worker_record_from_item(item: Mapping[str, Any], config: Config | None = No
         turn_target_kind=turn_target[0] if turn_target is not None else None,
         turn_target_value=turn_target[1] if turn_target is not None else None,
         terminal_id=_first_text(item, ("terminal_id", "terminalId")),
+        session_value=_nested_text(item, "agent_session", "value"),
     )
 
 
@@ -1171,6 +1176,7 @@ def _record_with_worker(record: _WorkerRecord, worker: Worker) -> _WorkerRecord:
         turn_target_kind=record.turn_target_kind,
         turn_target_value=record.turn_target_value,
         terminal_id=record.terminal_id,
+        session_value=record.session_value,
     )
 
 
@@ -1327,6 +1333,24 @@ def _binding_from_worker_record(
         expires_at=None,
         private_fingerprint=record.private_fingerprint,
     )
+
+
+def session_worker_map(
+    records: list[_WorkerRecord],
+    stored_bindings: Sequence[WorkerBinding] | None = None,
+) -> dict[str, str]:
+    """Map each record's Claude ``session_value`` to its FINAL public worker id.
+
+    Runs the SAME dedup/re-letter as ``_workers_and_bindings_from_records`` (workers[i].id ==
+    deduplicated[i].worker.id), so the ids line up with the projected workers. This lets the reconcile
+    loop join a session-keyed pending-decision file to the exact worker the connector sees. In-memory
+    only — the session_value never leaves this map (never persisted, never projected)."""
+    out: dict[str, str] = {}
+    for record in _deduplicated_worker_records(records, stored_bindings):
+        session_value = str(getattr(record, "session_value", "") or "")
+        if session_value:
+            out[session_value] = record.worker.id
+    return out
 
 
 def _workers_and_bindings_from_records(
