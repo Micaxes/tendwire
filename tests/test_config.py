@@ -241,6 +241,16 @@ def test_command_receipt_retention_defaults_and_constants(monkeypatch) -> None:
     )
 
 
+def test_command_receipt_retention_exceeds_maximum_connector_retry_horizon() -> None:
+    assert MAX_COMMAND_RETRY_HORIZON_SECONDS == 604_800
+    assert MIN_COMMAND_RECEIPT_RETENTION_SECONDS == 691_200
+    assert (
+        DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS
+        > MIN_COMMAND_RECEIPT_RETENTION_SECONDS
+        > MAX_COMMAND_RETRY_HORIZON_SECONDS
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [

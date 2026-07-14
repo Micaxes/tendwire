@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .core.attention import attention_payload_from_snapshot
-from .core.commands import CommandEnvelope, STATUS_INVALID_REQUEST, error_value
+from .core.commands import CommandEnvelope, error_value
 from .core.models import (
     Snapshot,
     public_json_dumps,
@@ -276,20 +276,25 @@ def _snapshot_dict(snapshot: Snapshot) -> dict[str, Any]:
 
 def _command_result(value: Any) -> dict[str, Any]:
     if isinstance(value, CommandEnvelope):
-        return value.to_dict()
-    if hasattr(value, "to_dict"):
+        data: Any = value.to_dict()
+    elif hasattr(value, "to_dict"):
         data = value.to_dict()
-        if isinstance(data, Mapping):
-            return sanitize_public_mapping(dict(data))
-    if isinstance(value, Mapping):
-        return sanitize_public_mapping(dict(value))
-    return CommandEnvelope.error(
-        None,
-        error_value(
-            STATUS_INVALID_REQUEST,
-            "command.submit returned an invalid result",
-        ),
-    ).to_dict()
+    else:
+        data = value
+    if not isinstance(data, dict):
+        raise ValueError("command.submit returned a non-object result")
+    return CommandEnvelope.from_dict(data).to_dict()
+
+
+def _command_success_response(
+    value: Any,
+    *,
+    request_id: Any = None,
+) -> dict[str, Any]:
+    command_result = _command_result(value)
+    response = success_response({}, request_id=request_id)
+    response["result"] = command_result
+    return response
 
 
 class TendwireDaemonAPI:
@@ -538,8 +543,8 @@ class TendwireDaemonAPI:
                     return success_response(self._get_pending(), request_id=request_id)
                 return success_response(pending_payload_from_snapshot(self._get_snapshot()), request_id=request_id)
             if method == "command.submit":
-                return success_response(
-                    _command_result(self._submit_command(dict(params))),
+                return _command_success_response(
+                    self._submit_command(dict(params)),
                     request_id=request_id,
                 )
             if method.startswith("connector."):
@@ -703,6 +708,12 @@ def _serialized_response(response: Mapping[str, Any]) -> bytes:
         _restore_turn_list_text(sanitized, original_result)
         _restore_content_page_text(sanitized, original_result)
         _restore_plan_token(sanitized, original_result)
+        try:
+            command_result = _command_result(dict(original_result))
+        except (TypeError, ValueError):
+            pass
+        else:
+            sanitized["result"] = command_result
     return json.dumps(
         sanitized,
         ensure_ascii=False,

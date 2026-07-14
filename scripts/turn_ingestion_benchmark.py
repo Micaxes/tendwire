@@ -27,6 +27,12 @@ from typing import Any
 
 from tendwire.backends.herdr_turns import TurnIngestionScheduler
 from tendwire.config import Config
+from tendwire.core.commands import (
+    DISPOSITION_NO_RECEIPT,
+    STATUS_NOOP,
+    CommandEnvelope,
+    CommandRequest,
+)
 from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
 from tendwire.core.turns import recompute_pending_content_fingerprint
 from tendwire.daemon import DaemonHooks, TendwireDaemon
@@ -694,12 +700,21 @@ def _validate_health(response: Mapping[str, Any], blocked_workers: int) -> None:
 
 def _validate_command(response: Mapping[str, Any], _blocked_workers: int) -> None:
     result = response.get("result")
+    try:
+        envelope = (
+            CommandEnvelope.from_dict(dict(result))
+            if isinstance(result, Mapping)
+            else None
+        )
+    except (TypeError, ValueError):
+        envelope = None
     if (
         response.get("ok") is not True
-        or not isinstance(result, Mapping)
-        or result.get("ok") is not True
-        or result.get("status") != "accepted"
-        or result.get("dry_run") is not True
+        or envelope is None
+        or envelope.ok is not True
+        or envelope.status != STATUS_NOOP
+        or envelope.dry_run is not True
+        or envelope.disposition != DISPOSITION_NO_RECEIPT
     ):
         raise RuntimeError("command_contract_failed")
 
@@ -865,25 +880,21 @@ def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
             nonlocal command_calls
             parsed = json.loads(payload)
             if (
-                not isinstance(parsed, Mapping)
+                not isinstance(parsed, dict)
                 or parsed.get("schema_version") != 1
                 or parsed.get("action") != "noop"
                 or parsed.get("dry_run") is not True
             ):
                 raise RuntimeError("synthetic_command_invalid")
+            request = CommandRequest.from_dict(parsed)
             with command_lock:
                 command_calls += 1
-            return {
-                "schema_version": 1,
-                "action": "noop",
-                "request_id": None,
-                "ok": True,
-                "dry_run": True,
-                "status": "accepted",
-                "result": {"accepted": True},
-                "error": None,
-                "warnings": [],
-            }
+            return CommandEnvelope.from_result(
+                request,
+                ok=True,
+                status=STATUS_NOOP,
+                result={},
+            ).to_dict()
 
         baseline_threads = _thread_ids(
             (

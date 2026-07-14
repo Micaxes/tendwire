@@ -13,6 +13,7 @@ import pytest
 
 from tendwire.config import Config
 from tendwire.core.commands import (
+    DISPOSITION_TERMINAL_ACCEPTED,
     STATUS_ACCEPTED,
     CommandEnvelope,
     CommandRequest,
@@ -731,6 +732,7 @@ def test_completed_command_receipt_does_not_release_command_linked_pending_turn(
         request,
         ok=True,
         status=STATUS_ACCEPTED,
+        disposition=DISPOSITION_TERMINAL_ACCEPTED,
         result={"worker_id": WORKER_ID},
     )
     reservation = reserve_command_request(

@@ -17,7 +17,6 @@ from tendwire.core.commands import (
     STATUS_NOT_FOUND,
     STATUS_REJECTED,
     STATUS_RESOLVED,
-    CommandEnvelope,
     CommandRequest,
 )
 from tendwire.core.models import Snapshot, Worker
@@ -114,18 +113,11 @@ def test_read_snapshot_returns_snapshot_shaped_result() -> None:
 
 
 def test_unknown_action_rejected_without_backend_call() -> None:
-    calls: list[tuple[Any, Any]] = []
-
-    def fake_backend(target: Any, instruction: Any) -> CommandEnvelope:
-        calls.append((target, instruction))
-        return CommandEnvelope(ok=True, status="accepted", action="send_instruction")
-
     request = CommandRequest(action="bad_action")
-    context = CommandContext(host_id="host", workers=[], backend_sender=fake_backend)
+    context = CommandContext(host_id="host", workers=[])
     envelope = execute_command(request, context)
     assert envelope.ok is False
     assert envelope.status == STATUS_REJECTED
-    assert calls == []
 
 
 def test_resolve_target_exact() -> None:
@@ -178,13 +170,7 @@ def test_resolve_target_disallowed_status() -> None:
     assert envelope.status == STATUS_REJECTED
 
 
-def test_send_instruction_dry_run_does_not_call_backend() -> None:
-    calls: list[tuple[Any, Any]] = []
-
-    def fake_backend(target: Any, instruction: Any) -> CommandEnvelope:
-        calls.append((target, instruction))
-        return CommandEnvelope(ok=True, status="accepted", action="send_instruction")
-
+def test_send_instruction_dry_run_is_pure() -> None:
     snapshot = _snapshot()
     request = CommandRequest(
         action="send_instruction",
@@ -195,12 +181,20 @@ def test_send_instruction_dry_run_does_not_call_backend() -> None:
     context = CommandContext(
         host_id=snapshot.host_id,
         workers=_workers_with_backend_targets(snapshot),
-        backend_sender=fake_backend,
     )
     envelope = execute_command(request, context)
     assert envelope.ok is True
     assert envelope.status == STATUS_DRY_RUN
-    assert calls == []
+    assert envelope.result == {
+        "target": {
+            "worker_id": "w-1",
+            "name": "Alpha",
+            "space_id": "s-1",
+            "status": "active",
+            "worker_fingerprint": snapshot.workers[0].fingerprint,
+        },
+        "instruction": {"text": "hello"},
+    }
 
 
 def test_send_instruction_non_dry_run_requires_request_id() -> None:
@@ -234,13 +228,7 @@ def test_send_instruction_non_dry_run_returns_backend_unsupported() -> None:
     assert envelope.dry_run is False
 
 
-def test_send_instruction_without_sendable_backend_target_skips_backend() -> None:
-    calls: list[tuple[Any, Any]] = []
-
-    def fake_backend(target: Any, instruction: Any) -> CommandEnvelope:
-        calls.append((target, instruction))
-        return CommandEnvelope(ok=True, status="accepted", action="send_instruction")
-
+def test_send_instruction_without_sendable_backend_target_is_unsupported() -> None:
     request = CommandRequest(
         action="send_instruction",
         request_id="req-no-binding",
@@ -258,23 +246,15 @@ def test_send_instruction_without_sendable_backend_target_skips_backend() -> Non
                 reason="backend_unsupported",
             )
         ],
-        backend_sender=fake_backend,
     )
 
     envelope = execute_command(request, context)
 
     assert envelope.ok is False
     assert envelope.status == STATUS_BACKEND_UNSUPPORTED
-    assert calls == []
 
 
-def test_send_instruction_ambiguous_backend_target_skips_backend() -> None:
-    calls: list[tuple[Any, Any]] = []
-
-    def fake_backend(target: Any, instruction: Any) -> CommandEnvelope:
-        calls.append((target, instruction))
-        return CommandEnvelope(ok=True, status="accepted", action="send_instruction")
-
+def test_send_instruction_ambiguous_backend_target_is_rejected() -> None:
     request = CommandRequest(
         action="send_instruction",
         request_id="req-ambiguous-binding",
@@ -292,23 +272,15 @@ def test_send_instruction_ambiguous_backend_target_skips_backend() -> None:
                 reason="duplicate_backend_target",
             )
         ],
-        backend_sender=fake_backend,
     )
 
     envelope = execute_command(request, context)
 
     assert envelope.ok is False
     assert envelope.status == STATUS_AMBIGUOUS_BACKEND_TARGET
-    assert calls == []
 
 
-def test_send_instruction_rejects_empty_target_before_only_worker_fallback() -> None:
-    calls: list[tuple[Any, Any]] = []
-
-    def fake_backend(target: Any, instruction: Any) -> CommandEnvelope:
-        calls.append((target, instruction))
-        return CommandEnvelope(ok=True, status="accepted", action="send_instruction")
-
+def test_send_instruction_rejects_empty_target_before_resolution() -> None:
     request = CommandRequest(
         action="send_instruction",
         request_id="req-empty",
@@ -319,23 +291,15 @@ def test_send_instruction_rejects_empty_target_before_only_worker_fallback() -> 
     context = CommandContext(
         host_id="host",
         workers=[Worker(id="only-worker", name="Only", status="active")],
-        backend_sender=fake_backend,
     )
 
     envelope = execute_command(request, context)
 
     assert envelope.ok is False
     assert envelope.status == STATUS_INVALID_REQUEST
-    assert calls == []
 
 
-def test_send_instruction_allows_done_status() -> None:
-    calls: list[tuple[Any, Any]] = []
-
-    def fake_backend(target: Any, instruction: Any) -> CommandEnvelope:
-        calls.append((target, instruction))
-        return CommandEnvelope(ok=True, status="accepted", action="send_instruction")
-
+def test_send_instruction_done_worker_still_requires_authoritative_submission() -> None:
     snapshot = _snapshot()
     request = CommandRequest(
         action="send_instruction",
@@ -347,14 +311,14 @@ def test_send_instruction_allows_done_status() -> None:
     context = CommandContext(
         host_id=snapshot.host_id,
         workers=_workers_with_backend_targets(snapshot),
-        backend_sender=fake_backend,
     )
 
     envelope = execute_command(request, context)
 
-    assert envelope.ok is True
-    assert envelope.status == "accepted"
-    assert calls[0][0]["status"] == "done"
+    assert envelope.ok is False
+    assert envelope.status == STATUS_BACKEND_UNSUPPORTED
+    assert envelope.error is not None
+    assert "authoritative command submission" in envelope.error["message"]
 
 
 @pytest.mark.parametrize("worker_id", ["w-4", "w-6", "w-7", "w-8"])
@@ -375,13 +339,7 @@ def test_send_instruction_rejects_closed_failed_unknown_statuses(worker_id: str)
     assert envelope.status == STATUS_REJECTED
 
 
-def test_send_instruction_backend_receives_resolved_worker_id() -> None:
-    calls: list[tuple[Any, Any]] = []
-
-    def fake_backend(target: Any, instruction: Any) -> CommandEnvelope:
-        calls.append((target, instruction))
-        return CommandEnvelope(ok=True, status="accepted", action="send_instruction")
-
+def test_send_instruction_resolves_selector_but_does_not_mutate() -> None:
     snapshot = _snapshot()
     request = CommandRequest(
         action="send_instruction",
@@ -393,31 +351,12 @@ def test_send_instruction_backend_receives_resolved_worker_id() -> None:
     context = CommandContext(
         host_id=snapshot.host_id,
         workers=_workers_with_backend_targets(snapshot),
-        backend_sender=fake_backend,
     )
 
     envelope = execute_command(request, context)
 
-    assert envelope.ok is True
-    assert envelope.status == "accepted"
-    assert calls == [
-        (
-            {
-                "worker_id": "w-2",
-                "name": "Beta",
-                "space_id": "s-1",
-                "status": "idle",
-                "worker_fingerprint": snapshot.workers[1].fingerprint,
-                "backend_target": {
-                    "kind": "agent_id",
-                    "value": "agent-w-2",
-                    "sendable": True,
-                    "reason": None,
-                },
-            },
-            {"text": "hello"},
-        )
-    ]
+    assert envelope.ok is False
+    assert envelope.status == STATUS_BACKEND_UNSUPPORTED
 
 def test_send_instruction_respects_ambiguous_target_before_backend() -> None:
     snapshot = _snapshot()
@@ -498,50 +437,3 @@ def test_public_result_contains_no_connector_fields() -> None:
                 check(item, f"{path}[{i}]")
 
     check(payload)
-
-
-def test_send_instruction_backend_receives_private_target_but_public_result_is_sanitized() -> None:
-    calls: list[tuple[Any, Any]] = []
-    worker = Worker(
-        id="public-worker",
-        name="Agent",
-        status="active",
-        backend_target={"kind": "agent_id", "value": "send-agent", "sendable": True, "reason": None},
-    )
-
-    def fake_backend(target: Any, instruction: Any) -> CommandEnvelope:
-        calls.append((target, instruction))
-        return CommandEnvelope(
-            ok=True,
-            status="accepted",
-            action="send_instruction",
-            result={"target": target},
-        )
-
-    request = CommandRequest(
-        action="send_instruction",
-        request_id="req-private-target",
-        dry_run=False,
-        target={"worker_id": "public-worker"},
-        instruction={"text": "hello"},
-    )
-    envelope = execute_command(
-        request,
-        CommandContext(host_id="host", workers=[worker], backend_sender=fake_backend),
-    )
-    payload = json.loads(envelope.to_json())
-
-    assert envelope.ok is True
-    assert calls[0][0]["backend_target"] == {
-        "kind": "agent_id",
-        "value": "send-agent",
-        "sendable": True,
-        "reason": None,
-    }
-    assert payload["result"]["target"] == {
-        "worker_id": "public-worker",
-        "name": "Agent",
-        "space_id": None,
-        "status": "active",
-        "worker_fingerprint": worker.fingerprint,
-    }

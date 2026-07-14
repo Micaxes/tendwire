@@ -9,6 +9,22 @@ import pytest
 
 from tendwire.core.commands import (
     ALLOWED_ACTIONS,
+    COMMAND_ENVELOPE_SCHEMA_VERSION,
+    COMMAND_REQUEST_SCHEMA_VERSION,
+    DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES,
+    DISPOSITION_IN_PROGRESS,
+    DISPOSITION_NO_RECEIPT,
+    DISPOSITION_TERMINAL_ACCEPTED,
+    DISPOSITION_TERMINAL_REJECTED,
+    DISPOSITION_TERMINAL_UNCERTAIN,
+    LIVE_MUTATION_NO_RECEIPT_REJECTION_STATUSES,
+    TERMINAL_MUTATION_REJECTION_STATUSES,
+    VALID_DISPOSITIONS,
+    STATUS_ACCEPTED,
+    STATUS_BACKEND_UNAVAILABLE,
+    STATUS_PENDING,
+    STATUS_REQUEST_STATE_UNCERTAIN,
+    STATUS_DRY_RUN,
     CANONICAL_MUTATION_VERSION,
     STATUS_AMBIGUOUS_TARGET,
     STATUS_INVALID_REQUEST,
@@ -22,6 +38,7 @@ from tendwire.core.commands import (
     CanonicalMutation,
     MAX_INSTRUCTION_LENGTH,
     build_canonical_mutation,
+    is_valid_request_id,
     parse_command_request,
     resolve_target,
     sanitize_command_result,
@@ -396,21 +413,319 @@ def test_command_envelope_shape_matches_contract() -> None:
     request = CommandRequest(action="noop")
     envelope = CommandEnvelope.from_result(request, ok=True, status="noop")
     payload = envelope.to_dict()
-    assert {
+    assert set(payload) == {
         "schema_version",
         "action",
         "request_id",
         "ok",
         "dry_run",
         "status",
+        "disposition",
         "result",
         "error",
         "warnings",
-    } <= set(payload)
-    assert payload["schema_version"] == 1
+    }
+    assert COMMAND_REQUEST_SCHEMA_VERSION == 1
+    assert payload["schema_version"] == COMMAND_ENVELOPE_SCHEMA_VERSION == 2
     assert payload["ok"] is True
     assert payload["status"] == "noop"
+    assert payload["disposition"] == DISPOSITION_NO_RECEIPT
     _assert_no_forbidden_fields(payload)
+
+
+@pytest.mark.parametrize(
+    ("disposition", "action", "ok", "status", "error"),
+    [
+        (DISPOSITION_NO_RECEIPT, "noop", True, "noop", None),
+        (
+            DISPOSITION_IN_PROGRESS,
+            "send_instruction",
+            False,
+            STATUS_PENDING,
+            {"code": STATUS_PENDING, "message": "pending"},
+        ),
+        (
+            DISPOSITION_TERMINAL_ACCEPTED,
+            "send_instruction",
+            True,
+            STATUS_ACCEPTED,
+            None,
+        ),
+        (
+            DISPOSITION_TERMINAL_REJECTED,
+            "send_instruction",
+            False,
+            STATUS_BACKEND_UNAVAILABLE,
+            {"code": STATUS_BACKEND_UNAVAILABLE, "message": "unavailable"},
+        ),
+        (
+            DISPOSITION_TERMINAL_UNCERTAIN,
+            "send_instruction",
+            False,
+            STATUS_REQUEST_STATE_UNCERTAIN,
+            {"code": STATUS_REQUEST_STATE_UNCERTAIN, "message": "uncertain"},
+        ),
+    ],
+)
+def test_command_envelope_strictly_roundtrips_every_disposition(
+    disposition: str,
+    action: str,
+    ok: bool,
+    status: str,
+    error: dict[str, Any] | None,
+) -> None:
+    request = CommandRequest(
+        action=action,
+        request_id="roundtrip-1" if action == "send_instruction" else None,
+        dry_run=action != "send_instruction",
+        target={"worker_id": "w-1"} if action == "send_instruction" else None,
+        instruction={"text": "hello"} if action == "send_instruction" else None,
+    )
+    envelope = CommandEnvelope.from_result(
+        request,
+        ok=ok,
+        status=status,
+        disposition=disposition,
+        error=error,
+    )
+    payload = envelope.to_dict()
+
+    assert payload["disposition"] == disposition
+    assert set(VALID_DISPOSITIONS) == {
+        "no_receipt",
+        "in_progress",
+        "terminal_accepted",
+        "terminal_rejected",
+        "terminal_uncertain",
+    }
+    assert CommandEnvelope.from_dict(payload).to_dict() == payload
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload.pop("disposition"),
+        lambda payload: payload.__setitem__("disposition", "unknown"),
+        lambda payload: payload.__setitem__("private_receipt", "leak"),
+        lambda payload: payload.__setitem__("schema_version", 1),
+    ],
+)
+def test_command_envelope_rejects_malformed_wire_shape(mutation: Any) -> None:
+    payload = CommandEnvelope.from_result(
+        CommandRequest(action="noop"),
+        ok=True,
+        status="noop",
+    ).to_dict()
+    mutation(payload)
+
+    with pytest.raises((TypeError, ValueError)):
+        CommandEnvelope.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    ("disposition", "ok", "status"),
+    [
+        (DISPOSITION_IN_PROGRESS, True, STATUS_PENDING),
+        (DISPOSITION_TERMINAL_ACCEPTED, False, STATUS_ACCEPTED),
+        (DISPOSITION_TERMINAL_REJECTED, False, STATUS_REQUEST_STATE_UNCERTAIN),
+        (DISPOSITION_TERMINAL_UNCERTAIN, False, STATUS_PENDING),
+    ],
+)
+def test_command_envelope_rejects_inconsistent_receipt_tuples(
+    disposition: str,
+    ok: bool,
+    status: str,
+) -> None:
+    request = CommandRequest(
+        action="send_instruction",
+        request_id="tuple-1",
+        dry_run=False,
+        target={"worker_id": "w-1"},
+        instruction={"text": "hello"},
+    )
+    error = None if ok else {"code": status, "message": "failed"}
+
+    with pytest.raises(ValueError):
+        CommandEnvelope.from_result(
+            request,
+            ok=ok,
+            status=status,
+            disposition=disposition,
+            error=error,
+        )
+
+
+@pytest.mark.parametrize("action", ["send_instruction", "answer_pending"])
+@pytest.mark.parametrize("request_id", [None, "", "not canonical"])
+def test_command_envelope_live_mutations_require_canonical_request_ids(
+    action: str,
+    request_id: str | None,
+) -> None:
+    request = CommandRequest(
+        action=action,
+        request_id=request_id,
+        dry_run=False,
+        target={"worker_id": "w-1"} if action == "send_instruction" else None,
+        instruction={"text": "hello"} if action == "send_instruction" else None,
+        params=(
+            {
+                "pending_id": "pending-1",
+                "pending_fingerprint": "revision-1",
+                "choice_id": "choice-1",
+            }
+            if action == "answer_pending"
+            else None
+        ),
+    )
+
+    with pytest.raises(ValueError, match="valid request_id"):
+        CommandEnvelope.from_result(
+            request,
+            ok=False,
+            status=STATUS_BACKEND_UNAVAILABLE,
+            error={"code": STATUS_BACKEND_UNAVAILABLE, "message": "unavailable"},
+        )
+
+
+@pytest.mark.parametrize("request_id", [None, "", "not canonical"])
+@pytest.mark.parametrize(
+    ("disposition", "ok", "status"),
+    [
+        (DISPOSITION_IN_PROGRESS, False, STATUS_PENDING),
+        (DISPOSITION_TERMINAL_ACCEPTED, True, STATUS_ACCEPTED),
+        (DISPOSITION_TERMINAL_REJECTED, False, STATUS_BACKEND_UNAVAILABLE),
+        (
+            DISPOSITION_TERMINAL_UNCERTAIN,
+            False,
+            STATUS_REQUEST_STATE_UNCERTAIN,
+        ),
+    ],
+)
+def test_command_envelope_strict_parser_rejects_receipts_without_canonical_request_ids(
+    request_id: str | None,
+    disposition: str,
+    ok: bool,
+    status: str,
+) -> None:
+    request = CommandRequest(
+        action="send_instruction",
+        request_id="valid-id",
+        dry_run=False,
+        target={"worker_id": "w-1"},
+        instruction={"text": "hello"},
+    )
+    payload = CommandEnvelope.from_result(
+        request,
+        ok=ok,
+        status=status,
+        disposition=disposition,
+        error=None if ok else {"code": status, "message": "failed"},
+    ).to_dict()
+    payload["request_id"] = request_id
+
+    with pytest.raises(ValueError, match="valid request_id"):
+        CommandEnvelope.from_dict(payload)
+
+
+def test_mutation_disposition_status_sets_are_explicit_and_fail_closed() -> None:
+    assert TERMINAL_MUTATION_REJECTION_STATUSES == {
+        "rejected",
+        "stale_target",
+        "backend_unavailable",
+        "backend_unsupported",
+        "ambiguous_backend_target",
+        "backend_failed",
+        "duplicate_request",
+    }
+    assert LIVE_MUTATION_NO_RECEIPT_REJECTION_STATUSES == {
+        "invalid_request",
+        "rejected",
+        "not_found",
+        "ambiguous_target",
+        "stale_target",
+        "backend_unavailable",
+        "backend_unsupported",
+        "ambiguous_backend_target",
+        "backend_failed",
+    }
+    assert DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES == {
+        "invalid_request",
+        "rejected",
+        "not_found",
+        "ambiguous_target",
+        "stale_target",
+    }
+
+
+@pytest.mark.parametrize("action", ["send_instruction", "answer_pending"])
+@pytest.mark.parametrize("ok", [False, True])
+@pytest.mark.parametrize("status", sorted(VALID_STATUSES))
+def test_command_envelope_from_dict_enforces_terminal_rejected_matrix(
+    action: str,
+    ok: bool,
+    status: str,
+) -> None:
+    payload = {
+        "schema_version": COMMAND_ENVELOPE_SCHEMA_VERSION,
+        "action": action,
+        "request_id": "terminal-rejected-matrix",
+        "ok": ok,
+        "dry_run": False,
+        "status": status,
+        "disposition": DISPOSITION_TERMINAL_REJECTED,
+        "result": {} if ok else None,
+        "error": None if ok else {"message": "rejected before send"},
+        "warnings": [],
+    }
+    allowed = not ok and status in TERMINAL_MUTATION_REJECTION_STATUSES
+
+    if allowed:
+        assert CommandEnvelope.from_dict(payload).to_dict() == payload
+    else:
+        with pytest.raises(ValueError, match="terminal_rejected"):
+            CommandEnvelope.from_dict(payload)
+
+
+@pytest.mark.parametrize("action", ["send_instruction", "answer_pending"])
+@pytest.mark.parametrize("dry_run", [False, True], ids=["live", "dry-run"])
+@pytest.mark.parametrize("ok", [False, True])
+@pytest.mark.parametrize("status", sorted(VALID_STATUSES))
+def test_command_envelope_from_dict_enforces_mutation_no_receipt_matrix(
+    action: str,
+    dry_run: bool,
+    ok: bool,
+    status: str,
+) -> None:
+    payload = {
+        "schema_version": COMMAND_ENVELOPE_SCHEMA_VERSION,
+        "action": action,
+        "request_id": "no-receipt-matrix",
+        "ok": ok,
+        "dry_run": dry_run,
+        "status": status,
+        "disposition": DISPOSITION_NO_RECEIPT,
+        "result": {} if ok else None,
+        "error": None if ok else {"message": "failed before receipt"},
+        "warnings": [],
+    }
+    if dry_run:
+        allowed = (
+            ok and status == STATUS_DRY_RUN
+        ) or (
+            not ok
+            and status in DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES
+        )
+    else:
+        allowed = (
+            not ok
+            and status in LIVE_MUTATION_NO_RECEIPT_REJECTION_STATUSES
+        )
+
+    if allowed:
+        assert CommandEnvelope.from_dict(payload).to_dict() == payload
+    else:
+        with pytest.raises(ValueError, match="no_receipt"):
+            CommandEnvelope.from_dict(payload)
 
 
 def test_validate_request_rejects_bad_schema_version() -> None:
@@ -623,36 +938,114 @@ def test_validate_send_instruction_requires_target_and_text() -> None:
 
 @pytest.mark.parametrize(
     "request_id",
-    [None, "", "   \t", " leading", "trailing ", "\twrapped\t"],
+    [
+        "A",
+        "0",
+        ".",
+        "_",
+        "-",
+        "Az09._-",
+        "hri1_0123456789abcdef",
+        "x" * 128,
+    ],
 )
-def test_validate_send_instruction_non_dry_run_requires_canonical_request_id(
-    request_id: str | None,
+def test_mutation_request_id_accepts_exact_ascii_tokens_and_roundtrips(
+    request_id: str,
 ) -> None:
-    request = CommandRequest(
-        action="send_instruction",
-        request_id=request_id,
-        dry_run=False,
-        target={"worker_id": "w-1"},
-        instruction={"text": "ok"},
-    )
-    error = validate_request(request)
-    assert error is not None
-    assert error["code"] == STATUS_INVALID_REQUEST
-    assert "request_id" in error["message"]
+    requests = [
+        CommandRequest(
+            action="send_instruction",
+            request_id=request_id,
+            dry_run=False,
+            target={"worker_id": "w-1"},
+            instruction={"text": "ok"},
+        ),
+        _answer_pending_request(request_id=request_id),
+    ]
+
+    assert is_valid_request_id(request_id)
+    for request in requests:
+        assert validate_request(request) is None
+        assert request.to_dict()["request_id"].encode("ascii") == request_id.encode("ascii")
+
+        restored_request = CommandRequest.from_dict(request.to_dict())
+        assert restored_request.request_id == request_id
+
+        parsed_request, parse_error = parse_command_request(
+            json.dumps(request.to_dict(), ensure_ascii=False)
+        )
+        assert parse_error is None
+        assert parsed_request is not None
+        assert parsed_request.request_id.encode("ascii") == request_id.encode("ascii")
+        assert validate_request(parsed_request) is None
+
+        envelope = CommandEnvelope.from_result(
+            request,
+            ok=True,
+            status="accepted",
+            disposition=DISPOSITION_TERMINAL_ACCEPTED,
+        )
+        serialized_envelope = envelope.to_json()
+        assert json.loads(serialized_envelope)["request_id"].encode("ascii") == request_id.encode(
+            "ascii"
+        )
+        restored_envelope = CommandEnvelope.from_dict(json.loads(serialized_envelope))
+        assert restored_envelope.request_id == request_id
 
 
-def test_validate_mutation_request_ids_preserve_internal_whitespace() -> None:
-    send = CommandRequest(
-        action="send_instruction",
-        request_id="opaque  request\tid",
-        dry_run=False,
-        target={"worker_id": "w-1"},
-        instruction={"text": "ok"},
-    )
-    answer = _answer_pending_request(request_id="opaque  request\tid")
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(123, id="non-string"),
+        pytest.param("", id="empty"),
+        pytest.param("x" * 129, id="max-plus-one"),
+        pytest.param("x" * ((1024 * 1024) - 256), id="near-frame-size"),
+        pytest.param(" leading", id="leading-space"),
+        pytest.param("trailing ", id="trailing-space"),
+        pytest.param("interior space", id="interior-space"),
+        pytest.param("\t", id="tab"),
+        pytest.param("\n", id="newline"),
+        pytest.param("\r", id="carriage-return"),
+        pytest.param("\0", id="nul"),
+        pytest.param("\x1f", id="unit-separator"),
+        pytest.param("\x7f", id="delete"),
+        pytest.param("é", id="unicode-nfc"),
+        pytest.param("e\u0301", id="unicode-nfd"),
+        pytest.param("Ａ", id="unicode-fullwidth"),
+        pytest.param("K", id="unicode-normalizes-to-ascii"),
+        pytest.param("request:id", id="disallowed-ascii-punctuation"),
+    ],
+)
+def test_mutation_request_id_rejects_everything_outside_exact_ascii_grammar(
+    request_id: Any,
+) -> None:
+    requests = [
+        CommandRequest(
+            action="send_instruction",
+            request_id=request_id,
+            dry_run=False,
+            target={"worker_id": "w-1"},
+            instruction={"text": "ok"},
+        ),
+        _answer_pending_request(request_id=request_id),
+    ]
 
-    assert validate_request(send) is None
-    assert validate_request(answer) is None
+    assert not is_valid_request_id(request_id)
+    for request in requests:
+        error = validate_request(request)
+        assert error is not None
+        assert error["code"] == STATUS_INVALID_REQUEST
+        assert error["details"] == {"field": "request_id"}
+
+        parsed_request, parse_error = parse_command_request(
+            json.dumps(request.to_dict(), ensure_ascii=False)
+        )
+        assert parse_error is None
+        assert parsed_request is not None
+        parsed_error = validate_request(parsed_request)
+        assert parsed_error is not None
+        assert parsed_error["code"] == STATUS_INVALID_REQUEST
 
 
 def _answer_pending_request(

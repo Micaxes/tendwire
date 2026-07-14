@@ -19,9 +19,14 @@ from tendwire.backends.herdr_socket import (
     HerdrSocketDisconnectedError,
     HerdrSocketTimeoutError,
 )
-from tendwire.command_submission import submit_command
+from tendwire.command_submission import replay_command_receipt, submit_command
 from tendwire.config import Config
 from tendwire.core.commands import (
+    DISPOSITION_IN_PROGRESS,
+    DISPOSITION_NO_RECEIPT,
+    DISPOSITION_TERMINAL_ACCEPTED,
+    DISPOSITION_TERMINAL_REJECTED,
+    DISPOSITION_TERMINAL_UNCERTAIN,
     STATUS_ACCEPTED,
     STATUS_AMBIGUOUS_BACKEND_TARGET,
     STATUS_BACKEND_UNAVAILABLE,
@@ -41,6 +46,7 @@ from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
 from tendwire.core.turns import PendingObservation, PendingObservedChoice
 from tendwire.store.sqlite import (
     apply_backend_pending_observation,
+    cleanup_command_request_retention,
     get_command_request,
     init_store,
     merge_turn_content,
@@ -243,21 +249,31 @@ def _expected_private_clear_calls(pane_id: str = "pane-secret") -> list[dict[str
         {"method": "pane.send_keys", "params": {"pane_id": pane_id, "keys": ["ctrl+a", "backspace"]}},
     ]
 
+@pytest.mark.parametrize("action", ["send_instruction", "answer_pending"])
 @pytest.mark.parametrize(
     ("request_id", "include_request_id"),
     [
-        (None, False),
-        (None, True),
-        ("", True),
-        ("   \t", True),
-        (" leading", True),
-        ("trailing ", True),
-        ("\twrapped\t", True),
+        pytest.param(None, False, id="missing"),
+        pytest.param(None, True, id="null"),
+        pytest.param(123, True, id="non-string"),
+        pytest.param("", True, id="empty"),
+        pytest.param("x" * 129, True, id="max-plus-one"),
+        pytest.param("x" * ((1024 * 1024) - 256), True, id="near-frame-size"),
+        pytest.param(" leading", True, id="leading-space"),
+        pytest.param("trailing ", True, id="trailing-space"),
+        pytest.param("interior space", True, id="interior-space"),
+        pytest.param("\t", True, id="tab"),
+        pytest.param("\n", True, id="newline"),
+        pytest.param("\0", True, id="nul"),
+        pytest.param("é", True, id="unicode-nfc"),
+        pytest.param("e\u0301", True, id="unicode-nfd"),
+        pytest.param("Ａ", True, id="unicode-fullwidth"),
     ],
 )
 def test_submit_command_rejects_invalid_request_id_before_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    action: str,
     request_id: Any,
     include_request_id: bool,
 ) -> None:
@@ -265,6 +281,10 @@ def test_submit_command_rejects_invalid_request_id_before_mutation(
     assert config.db_path is not None
     init_store(config.db_path)
     calls: list[str] = []
+
+    def guarded_store(*args: Any, **kwargs: Any) -> Any:
+        calls.append("store")
+        raise AssertionError("invalid request_id must not access the store")
 
     def guarded_observation(config: Config) -> Snapshot:
         calls.append("observe")
@@ -275,7 +295,21 @@ def test_submit_command_rejects_invalid_request_id_before_mutation(
         raise AssertionError("invalid request_id must not construct a socket client")
 
     monkeypatch.setattr("tendwire.command_submission.project_from_observations", guarded_observation)
+    monkeypatch.setattr(command_submission, "get_command_request", guarded_store)
+    monkeypatch.setattr(command_submission, "latest_snapshot", guarded_store)
     payload = _request()
+    if action == "answer_pending":
+        payload = {
+            "schema_version": 1,
+            "action": "answer_pending",
+            "request_id": request_id,
+            "dry_run": False,
+            "params": {
+                "pending_id": "pending-public",
+                "pending_fingerprint": "pending-revision",
+                "choice_id": "choice-public",
+            },
+        }
     if include_request_id:
         payload["request_id"] = request_id
     else:
@@ -337,6 +371,7 @@ def test_submit_command_socket_setup_failures_are_backend_unavailable(
     )
 
     assert envelope.status == STATUS_BACKEND_UNAVAILABLE
+    assert envelope.disposition == DISPOSITION_TERMINAL_REJECTED
     assert envelope.error is not None
     assert envelope.error["code"] == STATUS_BACKEND_UNAVAILABLE
     assert "private" not in json.dumps(envelope.to_dict())
@@ -377,6 +412,7 @@ def test_submit_command_post_send_transport_failures_are_uncertain(
     )
 
     assert envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert envelope.disposition == DISPOSITION_TERMINAL_UNCERTAIN
     assert envelope.status != STATUS_BACKEND_UNAVAILABLE
     assert calls == [
         {"method": "agent.get", "params": {"target": "agent-secret"}},
@@ -408,6 +444,7 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
     )
 
     assert first.status == STATUS_ACCEPTED
+    assert first.disposition == DISPOSITION_TERMINAL_ACCEPTED
     assert first.result == {
         "target": {"worker_id": "w-1"},
         "delivery_state": "submitted",
@@ -417,6 +454,7 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
     }
     assert second.to_dict() == first.to_dict()
     assert duplicate.status == STATUS_DUPLICATE_REQUEST
+    assert duplicate.disposition == DISPOSITION_TERMINAL_REJECTED
     assert calls == _expected_submit_calls()
 
     assert config.db_path is not None
@@ -424,6 +462,21 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
     assert receipt is not None
     assert receipt["status"] == STATUS_ACCEPTED
     assert receipt["uncertain"] is False
+    stored_result = json.loads(receipt["result_json"])
+    assert stored_result["schema_version"] == 2
+    assert stored_result["disposition"] == DISPOSITION_TERMINAL_ACCEPTED
+    assert set(stored_result) == {
+        "schema_version",
+        "action",
+        "request_id",
+        "ok",
+        "dry_run",
+        "status",
+        "disposition",
+        "result",
+        "error",
+        "warnings",
+    }
     turns_payload = turns_payload_from_store(config.db_path, "cmd-host")
     command_turns = [
         turn
@@ -729,6 +782,7 @@ def test_submit_command_backend_unavailable_prevents_not_found_and_send(tmp_path
     )
 
     assert envelope.status == STATUS_BACKEND_UNAVAILABLE
+    assert envelope.disposition == DISPOSITION_NO_RECEIPT
     assert calls == []
     assert envelope.status != STATUS_NOT_FOUND
     assert config.db_path is not None
@@ -778,6 +832,7 @@ def test_submit_command_resolved_health_failure_is_terminal_and_replayed(
     )
 
     assert first.status == STATUS_BACKEND_UNAVAILABLE
+    assert first.disposition == DISPOSITION_TERMINAL_REJECTED
     assert replay.to_dict() == first.to_dict()
     assert calls == []
     receipt = get_command_request(
@@ -788,6 +843,57 @@ def test_submit_command_resolved_health_failure_is_terminal_and_replayed(
     assert receipt is not None
     assert receipt["state"] == "rejected"
     assert receipt["status"] == STATUS_BACKEND_UNAVAILABLE
+    stored_result = json.loads(receipt["result_json"])
+    assert stored_result["schema_version"] == 2
+    assert stored_result["disposition"] == DISPOSITION_TERMINAL_REJECTED
+
+
+def test_backend_unavailable_disposition_depends_on_receipt_authority(
+    tmp_path: Path,
+) -> None:
+    no_authority_config = _config(tmp_path / "no-authority")
+    _seed(no_authority_config, [], [], health=_degraded_backend())
+    no_authority = submit_command(
+        no_authority_config,
+        _request(request_id="unavailable-no-authority", worker_id="missing"),
+        socket_client_factory=lambda _config: pytest.fail(
+            "unresolved authority must not create a socket client"
+        ),
+    )
+
+    rejected_config = _config(tmp_path / "terminal-rejection")
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(
+        rejected_config,
+        [worker],
+        [_binding(worker)],
+        health=_degraded_backend(),
+    )
+    terminal_rejection = submit_command(
+        rejected_config,
+        _request(request_id="unavailable-terminal-rejection"),
+        socket_client_factory=lambda _config: pytest.fail(
+            "failed health must not create a socket client"
+        ),
+    )
+
+    assert no_authority.status == terminal_rejection.status == STATUS_BACKEND_UNAVAILABLE
+    assert no_authority.disposition == DISPOSITION_NO_RECEIPT
+    assert terminal_rejection.disposition == DISPOSITION_TERMINAL_REJECTED
+    assert no_authority_config.db_path is not None
+    assert rejected_config.db_path is not None
+    assert get_command_request(
+        no_authority_config.db_path,
+        no_authority_config.host_id,
+        "unavailable-no-authority",
+    ) is None
+    receipt = get_command_request(
+        rejected_config.db_path,
+        rejected_config.host_id,
+        "unavailable-terminal-rejection",
+    )
+    assert receipt is not None
+    assert receipt["state"] == "rejected"
 
 
 def test_submit_command_disallowed_worker_rejection_is_terminal_and_replayed(
@@ -911,7 +1017,9 @@ def test_submit_command_timeout_after_send_start_is_uncertain_and_not_retried(tm
     )
 
     assert first.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert first.disposition == DISPOSITION_TERMINAL_UNCERTAIN
     assert second.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert second.disposition == DISPOSITION_TERMINAL_UNCERTAIN
     assert calls == [
         {"method": "agent.get", "params": {"target": "agent-secret"}},
         *_expected_private_clear_calls(),
@@ -1096,6 +1204,7 @@ def test_submit_command_migrated_v11_exact_raw_request_replays(
         request,
         ok=True,
         status=STATUS_ACCEPTED,
+        disposition=DISPOSITION_TERMINAL_ACCEPTED,
         result={
             "target": {"worker_id": "w-1"},
             "delivery_state": "submitted",
@@ -1104,9 +1213,12 @@ def test_submit_command_migrated_v11_exact_raw_request_replays(
             "observed_turn_state": "pending_observation",
         },
     )
+    legacy_result = accepted.to_dict()
+    legacy_result.pop("disposition")
+    legacy_result["schema_version"] = 1
     legacy_fingerprint = request.payload_fingerprint()
     result_json = json.dumps(
-        accepted.to_dict(),
+        legacy_result,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -1179,7 +1291,9 @@ def test_submit_command_migrated_v11_exact_raw_request_replays(
     )
 
     assert replay.to_dict() == accepted.to_dict()
+    assert replay.disposition == DISPOSITION_TERMINAL_ACCEPTED
     assert changed.status == STATUS_DUPLICATE_REQUEST
+    assert changed.disposition == DISPOSITION_TERMINAL_REJECTED
 
 
 def test_submit_command_same_id_text_target_and_action_collide_without_backend(
@@ -1249,9 +1363,13 @@ def test_submit_command_same_id_text_target_and_action_collide_without_backend(
     )
 
     assert accepted.status == STATUS_ACCEPTED
+    assert accepted.disposition == DISPOSITION_TERMINAL_ACCEPTED
     assert changed_text.status == STATUS_DUPLICATE_REQUEST
+    assert changed_text.disposition == DISPOSITION_TERMINAL_REJECTED
     assert changed_target.status == STATUS_DUPLICATE_REQUEST
+    assert changed_target.disposition == DISPOSITION_TERMINAL_REJECTED
     assert changed_action.status == STATUS_DUPLICATE_REQUEST
+    assert changed_action.disposition == DISPOSITION_TERMINAL_REJECTED
     assert invalid_options.status == STATUS_INVALID_REQUEST
     assert fresh_invalid_options.status == STATUS_INVALID_REQUEST
     assert calls == _expected_submit_calls()
@@ -1343,7 +1461,7 @@ def test_submit_command_private_preparation_over_30_second_budget_precedes_reser
     ("after_commit", "expected_status", "expected_state"),
     [
         (False, STATUS_PENDING, "reserved"),
-        (True, STATUS_REQUEST_STATE_UNCERTAIN, "send_started"),
+        (True, STATUS_PENDING, "send_started"),
     ],
 )
 def test_submit_command_send_start_exception_recovers_durable_state_and_closes_prepared_clients(
@@ -1384,6 +1502,7 @@ def test_submit_command_send_start_exception_recovers_durable_state_and_closes_p
     )
 
     assert first.status == expected_status
+    assert first.disposition == DISPOSITION_IN_PROGRESS
     assert calls == [{"method": "agent.get", "params": {"target": "agent-secret"}}]
     assert clients[0].close_count == 1
     assert config.db_path is not None
@@ -1399,7 +1518,8 @@ def test_submit_command_send_start_exception_recovers_durable_state_and_closes_p
                 "send-started replay must not prepare another client"
             ),
         )
-        assert replay.status == STATUS_REQUEST_STATE_UNCERTAIN
+        assert replay.status == STATUS_PENDING
+        assert replay.disposition == DISPOSITION_IN_PROGRESS
         assert len(clients) == 1
     else:
         replay = submit_command(
@@ -1408,6 +1528,7 @@ def test_submit_command_send_start_exception_recovers_durable_state_and_closes_p
             socket_client_factory=factory,
         )
         assert replay.status == STATUS_PENDING
+        assert replay.disposition == DISPOSITION_IN_PROGRESS
         conflict = submit_command(
             config,
             _request(request_id="send-start-loss", text="different"),
@@ -1580,6 +1701,7 @@ def test_submit_command_timeout_before_send_start_rejects_and_replays(
     )
 
     assert first.status == STATUS_BACKEND_UNAVAILABLE
+    assert first.disposition == DISPOSITION_TERMINAL_REJECTED
     assert replay.to_dict() == first.to_dict()
     assert config.db_path is not None
     receipt = get_command_request(config.db_path, config.host_id, "before-timeout")
@@ -1615,13 +1737,32 @@ def test_submit_command_finalization_timeout_after_send_is_uncertain_and_not_ret
         ),
     )
 
-    assert first.status == STATUS_REQUEST_STATE_UNCERTAIN
-    assert replay.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert first.status == STATUS_PENDING
+    assert replay.status == STATUS_PENDING
+    assert first.disposition == DISPOSITION_IN_PROGRESS
+    assert replay.disposition == DISPOSITION_IN_PROGRESS
     assert calls == _expected_submit_calls()
     assert config.db_path is not None
     receipt = get_command_request(config.db_path, config.host_id, "after-timeout")
     assert receipt is not None
     assert receipt["state"] == "send_started"
+    maintenance = cleanup_command_request_retention(
+        config.db_path,
+        retry_horizon_seconds=60,
+        retention_seconds=691_200,
+        retention_count=4096,
+        host_id=config.host_id,
+        now="2099-01-01T00:00:00+00:00",
+    )
+    terminal = replay_command_receipt(
+        config,
+        _request(request_id="after-timeout"),
+    )
+    assert maintenance["stale_active"] == 1
+    assert terminal is not None
+    assert terminal.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert terminal.disposition == DISPOSITION_TERMINAL_UNCERTAIN
+    assert calls == _expected_submit_calls()
 
 
 def test_submit_command_accepted_finalization_response_loss_replays_accepted(
@@ -1659,6 +1800,7 @@ def test_submit_command_accepted_finalization_response_loss_replays_accepted(
     )
 
     assert first.status == STATUS_ACCEPTED
+    assert first.disposition == DISPOSITION_TERMINAL_ACCEPTED
     assert replay.to_dict() == first.to_dict()
     assert calls == _expected_submit_calls()
     assert config.db_path is not None
@@ -1677,6 +1819,121 @@ def test_submit_command_accepted_finalization_response_loss_replays_accepted(
         )
         == 1
     )
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "legacy_v1"),
+    [
+        pytest.param(True, True, id="v1-bool-alias"),
+        pytest.param(1.0, True, id="v1-float-alias"),
+        pytest.param(2.0, False, id="v2-float-alias"),
+    ],
+)
+def test_replay_command_receipt_rejects_non_exact_stored_schema_versions(
+    tmp_path: Path,
+    schema_version: Any,
+    legacy_v1: bool,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    request_payload = _request(request_id=f"schema-alias-{type(schema_version).__name__}")
+    accepted = submit_command(
+        config,
+        request_payload,
+        socket_client_factory=_factory(calls),
+    )
+    assert accepted.status == STATUS_ACCEPTED
+    assert config.db_path is not None
+    receipt = get_command_request(
+        config.db_path,
+        config.host_id,
+        request_payload["request_id"],
+    )
+    assert receipt is not None
+    stored = json.loads(receipt["result_json"])
+    if legacy_v1:
+        stored.pop("disposition")
+    stored["schema_version"] = schema_version
+    malformed_json = json.dumps(stored, sort_keys=True, separators=(",", ":"))
+    with sqlite3.connect(str(config.db_path)) as conn:
+        conn.execute(
+            "UPDATE command_receipts SET result_json = ? "
+            "WHERE host_id = ? AND request_id = ?",
+            (malformed_json, config.host_id, request_payload["request_id"]),
+        )
+        conn.commit()
+        rows_before = conn.execute(
+            "SELECT * FROM command_receipts ORDER BY id"
+        ).fetchall()
+
+    replay = replay_command_receipt(config, request_payload)
+
+    assert replay is not None
+    assert replay.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert replay.disposition == DISPOSITION_TERMINAL_UNCERTAIN
+    assert calls == _expected_submit_calls()
+    with sqlite3.connect(str(config.db_path)) as conn:
+        assert (
+            conn.execute("SELECT * FROM command_receipts ORDER BY id").fetchall()
+            == rows_before
+        )
+
+
+def test_response_loss_replay_uses_only_current_exact_worker_selector(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="active",
+        space_id="space-1",
+    )
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    request_payload = _request(request_id="response-loss-target")
+    accepted = submit_command(
+        config,
+        request_payload,
+        socket_client_factory=_factory(calls),
+    )
+    assert accepted.status == STATUS_ACCEPTED
+    assert config.db_path is not None
+
+    def stored_rows() -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+        with sqlite3.connect(str(config.db_path)) as conn:
+            return (
+                conn.execute("SELECT * FROM command_receipts ORDER BY id").fetchall(),
+                conn.execute("SELECT * FROM events ORDER BY id").fetchall(),
+            )
+
+    rows_before = stored_rows()
+    exact = replay_command_receipt(config, request_payload)
+    changed_request = _request(request_id="response-loss-target", worker_id="w-2")
+    changed = replay_command_receipt(config, changed_request)
+
+    monkeypatch.setattr(
+        command_submission,
+        "_current_snapshot",
+        lambda _config: pytest.fail(
+            "read-only response-loss reconciliation must not consult current authority"
+        ),
+    )
+    mutable_request = _request(request_id="response-loss-target")
+    mutable_request["target"] = {"name": "Alpha"}
+    mutable = replay_command_receipt(config, mutable_request)
+
+    assert exact is not None
+    assert exact.to_dict() == accepted.to_dict()
+    assert changed is not None
+    assert changed.status == STATUS_DUPLICATE_REQUEST
+    assert changed.disposition == DISPOSITION_TERMINAL_REJECTED
+    assert mutable is None
+    assert calls == _expected_submit_calls()
+    assert stored_rows() == rows_before
 
 
 @pytest.mark.parametrize("damage", ["malformed_result", "illegal_state"])
@@ -1731,6 +1988,7 @@ def test_submit_command_illegal_or_malformed_terminal_receipt_fails_closed(
     )
 
     assert replay.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert replay.disposition == DISPOSITION_TERMINAL_UNCERTAIN
     assert calls == _expected_submit_calls()
 
 
@@ -1769,6 +2027,7 @@ def test_answer_pending_migrated_v11_terminal_replays_without_current_authority(
         terminal = CommandEnvelope.from_result(
             request,
             ok=True,
+            disposition=DISPOSITION_TERMINAL_ACCEPTED,
             status=terminal_status,
             result={
                 "target": {"worker_id": "legacy-worker"},
@@ -1786,6 +2045,7 @@ def test_answer_pending_migrated_v11_terminal_replays_without_current_authority(
         terminal = CommandEnvelope.from_result(
             request,
             ok=False,
+            disposition=DISPOSITION_TERMINAL_REJECTED,
             status=terminal_status,
             error={
                 "code": terminal_status,
@@ -1793,7 +2053,15 @@ def test_answer_pending_migrated_v11_terminal_replays_without_current_authority(
             },
         )
     raw_fingerprint = request.payload_fingerprint()
-    result_json = terminal.to_json()
+    expected_terminal = terminal.to_dict()
+    legacy_terminal = dict(expected_terminal)
+    legacy_terminal.pop("disposition")
+    legacy_terminal["schema_version"] = 1
+    result_json = json.dumps(
+        legacy_terminal,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     request_json = json.dumps(
         request.to_dict(),
         sort_keys=True,
@@ -1879,6 +2147,7 @@ def test_answer_pending_migrated_v11_terminal_replays_without_current_authority(
     monkeypatch.setattr(command_submission, "_answer_pending", forbidden)
     monkeypatch.setattr(command_submission, "reserve_command_request", forbidden)
 
+    read_only_replay = replay_command_receipt(config, request_payload)
     replay = submit_command(
         config,
         request_payload,
@@ -1893,8 +2162,16 @@ def test_answer_pending_migrated_v11_terminal_replays_without_current_authority(
         socket_client_factory=forbidden,
     )
 
-    assert replay.to_dict() == terminal.to_dict()
+    assert read_only_replay is not None
+    assert read_only_replay.to_dict() == expected_terminal
+    assert replay.to_dict() == expected_terminal
+    assert replay.disposition == (
+        DISPOSITION_TERMINAL_ACCEPTED
+        if terminal_status == STATUS_ACCEPTED
+        else DISPOSITION_TERMINAL_REJECTED
+    )
     assert changed_choice.status == STATUS_DUPLICATE_REQUEST
+    assert changed_choice.disposition == DISPOSITION_TERMINAL_REJECTED
     assert command_rows() == rows_before
 
 

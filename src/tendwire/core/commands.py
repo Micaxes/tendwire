@@ -9,9 +9,10 @@ backends, stores, Herdr, Herdres, Telegram, or connector modules.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from .models import (
     FORBIDDEN_FIELD_NAMES,
@@ -21,7 +22,6 @@ from .models import (
     sanitize_public_mapping,
     sanitize_public_text,
     sanitize_public_value,
-    sanitize_forbidden_fields,
     stable_fingerprint,
     stable_json_dumps,
     _optional_string,
@@ -29,7 +29,8 @@ from .models import (
 )
 
 
-COMMAND_SCHEMA_VERSION = 1
+COMMAND_REQUEST_SCHEMA_VERSION = 1
+COMMAND_ENVELOPE_SCHEMA_VERSION = 2
 
 ALLOWED_ACTIONS = frozenset(
     {"noop", "read_snapshot", "resolve_target", "send_instruction", "answer_pending"}
@@ -57,6 +58,29 @@ STATUS_REQUEST_STATE_UNCERTAIN = "request_state_uncertain"
 STATUS_INVALID_REQUEST = "invalid_request"
 STATUS_PENDING = "pending"
 
+CommandDisposition = Literal[
+    "no_receipt",
+    "in_progress",
+    "terminal_accepted",
+    "terminal_rejected",
+    "terminal_uncertain",
+]
+
+DISPOSITION_NO_RECEIPT: CommandDisposition = "no_receipt"
+DISPOSITION_IN_PROGRESS: CommandDisposition = "in_progress"
+DISPOSITION_TERMINAL_ACCEPTED: CommandDisposition = "terminal_accepted"
+DISPOSITION_TERMINAL_REJECTED: CommandDisposition = "terminal_rejected"
+DISPOSITION_TERMINAL_UNCERTAIN: CommandDisposition = "terminal_uncertain"
+VALID_DISPOSITIONS = frozenset(
+    {
+        DISPOSITION_NO_RECEIPT,
+        DISPOSITION_IN_PROGRESS,
+        DISPOSITION_TERMINAL_ACCEPTED,
+        DISPOSITION_TERMINAL_REJECTED,
+        DISPOSITION_TERMINAL_UNCERTAIN,
+    }
+)
+
 VALID_STATUSES = frozenset(
     {
         STATUS_NOOP,
@@ -79,6 +103,50 @@ VALID_STATUSES = frozenset(
     }
 )
 
+# Durable rejections are possible only after a live mutation has a canonical
+# identity. Keep this explicit so a new neutral, success, pending, or uncertain
+# status cannot silently become valid stored rejection evidence.
+TERMINAL_MUTATION_REJECTION_STATUSES = frozenset(
+    {
+        STATUS_REJECTED,
+        STATUS_STALE_TARGET,
+        STATUS_BACKEND_UNAVAILABLE,
+        STATUS_BACKEND_UNSUPPORTED,
+        STATUS_AMBIGUOUS_BACKEND_TARGET,
+        STATUS_BACKEND_FAILED,
+        STATUS_DUPLICATE_REQUEST,
+    }
+)
+
+# A live no-receipt failure has no durable authority. These statuses cover
+# validation/target failures and the intermediate pre-reservation envelopes
+# used by the authoritative submission path before it terminalizes a failure.
+LIVE_MUTATION_NO_RECEIPT_REJECTION_STATUSES = frozenset(
+    {
+        STATUS_INVALID_REQUEST,
+        STATUS_REJECTED,
+        STATUS_NOT_FOUND,
+        STATUS_AMBIGUOUS_TARGET,
+        STATUS_STALE_TARGET,
+        STATUS_BACKEND_UNAVAILABLE,
+        STATUS_BACKEND_UNSUPPORTED,
+        STATUS_AMBIGUOUS_BACKEND_TARGET,
+        STATUS_BACKEND_FAILED,
+    }
+)
+
+# Dry-run mutations may fail only during validation or public target
+# resolution. Backend failures cannot describe a preview that performs no I/O.
+DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES = frozenset(
+    {
+        STATUS_INVALID_REQUEST,
+        STATUS_REJECTED,
+        STATUS_NOT_FOUND,
+        STATUS_AMBIGUOUS_TARGET,
+        STATUS_STALE_TARGET,
+    }
+)
+
 # Neutral target fields permitted in command requests.
 TARGET_ALLOWED_FIELDS = frozenset({"worker_id", "worker_fingerprint", "space_id", "name"})
 INSTRUCTION_ALLOWED_FIELDS = frozenset({"text"})
@@ -93,6 +161,7 @@ FORBIDDEN_REQUEST_FIELDS = FORBIDDEN_FIELD_NAMES
 _FORBIDDEN_REQUEST_COMPACT = frozenset(name.replace("_", "") for name in FORBIDDEN_REQUEST_FIELDS)
 
 MAX_INSTRUCTION_LENGTH = 4096
+_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}", re.ASCII)
 
 # Workers that must not receive instructions.
 _DISALLOWED_WORKER_STATUSES = frozenset({"closed", "failed", "unknown"})
@@ -235,17 +304,12 @@ def _target_has_explicit_selector(target: dict[str, Any] | None) -> bool:
     return any(_string_value(target.get(field)) for field in TARGET_ALLOWED_FIELDS)
 
 
-def has_nonblank_request_id(value: str | None) -> bool:
-    """Return True for a nonblank request ID with canonical edge whitespace.
+def is_valid_request_id(value: Any) -> bool:
+    """Return whether value is an exact command request-ID token.
 
-    Request IDs are otherwise opaque: internal whitespace and every other
-    validated character remain exact idempotency-key bytes.
+    IDs are opaque ASCII and are never trimmed, normalized, or case-folded.
     """
-    return (
-        isinstance(value, str)
-        and bool(value)
-        and value == value.strip()
-    )
+    return isinstance(value, str) and _REQUEST_ID_RE.fullmatch(value) is not None
 
 
 def _validate_instruction_shape(instruction: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -270,7 +334,7 @@ class CommandRequest:
     """A neutral, validated command request."""
 
     action: str
-    schema_version: int = COMMAND_SCHEMA_VERSION
+    schema_version: int = COMMAND_REQUEST_SCHEMA_VERSION
     request_id: str | None = None
     dry_run: bool = True
     target: dict[str, Any] | None = None
@@ -280,7 +344,6 @@ class CommandRequest:
     def __post_init__(self) -> None:
         object.__setattr__(self, "action", _string_value(self.action))
         object.__setattr__(self, "schema_version", self.schema_version)
-        object.__setattr__(self, "request_id", _optional_string(self.request_id))
         object.__setattr__(self, "dry_run", self.dry_run)
         object.__setattr__(self, "target", _clean_mapping(self.target))
         object.__setattr__(self, "instruction", _clean_mapping(self.instruction))
@@ -311,7 +374,7 @@ class CommandRequest:
     def from_dict(cls, data: dict[str, Any]) -> "CommandRequest":
         return cls(
             action=data.get("action", ""),
-            schema_version=data.get("schema_version", COMMAND_SCHEMA_VERSION),
+            schema_version=data.get("schema_version", COMMAND_REQUEST_SCHEMA_VERSION),
             request_id=data.get("request_id"),
             dry_run=data.get("dry_run", True),
             target=data.get("target"),
@@ -394,11 +457,11 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
     if (
         isinstance(request.schema_version, bool)
         or not isinstance(request.schema_version, int)
-        or request.schema_version != COMMAND_SCHEMA_VERSION
+        or request.schema_version != COMMAND_REQUEST_SCHEMA_VERSION
     ):
         return error_value(
             STATUS_INVALID_REQUEST,
-            f"schema_version must be {COMMAND_SCHEMA_VERSION}",
+            f"schema_version must be {COMMAND_REQUEST_SCHEMA_VERSION}",
             details={"field": "schema_version"},
         )
 
@@ -417,6 +480,16 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
             STATUS_REJECTED,
             f"unknown action {request.action!r}",
             details={"field": "action", "allowed": sorted(ALLOWED_ACTIONS)},
+        )
+    if (
+        request.action in {"send_instruction", "answer_pending"}
+        and request.dry_run is False
+        and not is_valid_request_id(request.request_id)
+    ):
+        return error_value(
+            STATUS_INVALID_REQUEST,
+            f"non-dry-run {request.action} requires a valid request_id",
+            details={"field": "request_id"},
         )
 
     forbidden = _find_forbidden_fields(request.to_dict())
@@ -453,12 +526,6 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
                 STATUS_INVALID_REQUEST,
                 "send_instruction requires instruction.text",
                 details={"field": "instruction.text"},
-            )
-        if not request.dry_run and not has_nonblank_request_id(request.request_id):
-            return error_value(
-                STATUS_INVALID_REQUEST,
-                "non-dry-run send_instruction requires request_id",
-                details={"field": "request_id"},
             )
 
     if request.action == "answer_pending":
@@ -500,12 +567,6 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
                     f"answer_pending requires nonblank params.{field}",
                     details={"field": f"params.{field}"},
                 )
-        if not request.dry_run and not has_nonblank_request_id(request.request_id):
-            return error_value(
-                STATUS_INVALID_REQUEST,
-                "non-dry-run answer_pending requires request_id",
-                details={"field": "request_id"},
-            )
 
     return None
 
@@ -550,18 +611,18 @@ def parse_command_request(payload: str) -> tuple[CommandRequest | None, dict[str
     if "schema_version" not in data:
         return None, error_value(
             STATUS_INVALID_REQUEST,
-            f"schema_version must be {COMMAND_SCHEMA_VERSION}",
+            f"schema_version must be {COMMAND_REQUEST_SCHEMA_VERSION}",
             details={"field": "schema_version"},
         )
     schema_version = data.get("schema_version")
     if (
         isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
-        or schema_version != COMMAND_SCHEMA_VERSION
+        or schema_version != COMMAND_REQUEST_SCHEMA_VERSION
     ):
         return None, error_value(
             STATUS_INVALID_REQUEST,
-            f"schema_version must be {COMMAND_SCHEMA_VERSION}",
+            f"schema_version must be {COMMAND_REQUEST_SCHEMA_VERSION}",
             details={"field": "schema_version"},
         )
     if "dry_run" in data and not isinstance(data.get("dry_run"), bool):
@@ -583,65 +644,162 @@ def parse_command_request(payload: str) -> tuple[CommandRequest | None, dict[str
 
 @dataclass(frozen=True)
 class CommandEnvelope:
-    """A neutral command result/envelope."""
+    """A strict public command result envelope."""
 
     ok: bool
     status: str
     action: str
+    disposition: CommandDisposition = DISPOSITION_NO_RECEIPT
     request_id: str | None = None
     dry_run: bool = True
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     warnings: list[str] = field(default_factory=list)
-    schema_version: int = COMMAND_SCHEMA_VERSION
+    schema_version: int = COMMAND_ENVELOPE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "ok", bool(self.ok))
-        object.__setattr__(self, "status", _string_value(self.status))
-        object.__setattr__(self, "action", _string_value(self.action))
-        object.__setattr__(self, "request_id", _optional_string(self.request_id))
-        object.__setattr__(self, "dry_run", bool(self.dry_run))
-        object.__setattr__(self, "result", _clean_public_mapping(self.result))
-        object.__setattr__(self, "error", _clean_public_mapping(self.error))
-        object.__setattr__(
-            self,
-            "warnings",
-            [clean for warning in self.warnings if (clean := sanitize_public_text(warning))],
-        )
-        object.__setattr__(self, "schema_version", int(self.schema_version))
+        if not isinstance(self.ok, bool):
+            raise TypeError("ok must be a boolean")
+        if not isinstance(self.status, str) or self.status not in VALID_STATUSES:
+            raise ValueError("status must be a supported command status")
+        if not isinstance(self.action, str):
+            raise TypeError("action must be a string")
+        if self.disposition not in VALID_DISPOSITIONS:
+            raise ValueError("disposition must be a supported command disposition")
+        if self.request_id is not None and not isinstance(self.request_id, str):
+            raise TypeError("request_id must be a string or null")
+        if not isinstance(self.dry_run, bool):
+            raise TypeError("dry_run must be a boolean")
+        if self.result is not None and not isinstance(self.result, Mapping):
+            raise TypeError("result must be an object or null")
+        if self.error is not None and not isinstance(self.error, Mapping):
+            raise TypeError("error must be an object or null")
+        if not isinstance(self.warnings, list) or any(
+            not isinstance(warning, str) for warning in self.warnings
+        ):
+            raise TypeError("warnings must be an array of strings")
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version != COMMAND_ENVELOPE_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                f"command envelope schema_version must be {COMMAND_ENVELOPE_SCHEMA_VERSION}"
+            )
+
+        mutating = self.action in {"send_instruction", "answer_pending"}
+        live_mutation = mutating and self.dry_run is False
+        if live_mutation and not is_valid_request_id(self.request_id):
+            raise ValueError("non-dry-run mutation requires a valid request_id")
+        if (
+            self.disposition != DISPOSITION_NO_RECEIPT
+            and not is_valid_request_id(self.request_id)
+        ):
+            raise ValueError("receipt-bearing disposition requires a valid request_id")
+
+        clean_result = _clean_public_mapping(self.result)
+        clean_error = _clean_public_mapping(self.error)
+        clean_warnings = [
+            clean for warning in self.warnings if (clean := sanitize_public_text(warning))
+        ]
+        object.__setattr__(self, "result", clean_result)
+        object.__setattr__(self, "error", clean_error)
+        object.__setattr__(self, "warnings", clean_warnings)
+
+        if self.ok and clean_error is not None:
+            raise ValueError("successful command envelope must not include an error")
+
+        if self.disposition == DISPOSITION_NO_RECEIPT:
+            if live_mutation:
+                valid_no_receipt_tuple = (
+                    not self.ok
+                    and self.status in LIVE_MUTATION_NO_RECEIPT_REJECTION_STATUSES
+                )
+            elif mutating:
+                valid_no_receipt_tuple = (
+                    self.ok and self.status == STATUS_DRY_RUN
+                ) or (
+                    not self.ok
+                    and self.status
+                    in DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES
+                )
+            else:
+                valid_no_receipt_tuple = True
+            if not valid_no_receipt_tuple:
+                raise ValueError("no_receipt disposition has an inconsistent command tuple")
+        elif self.disposition == DISPOSITION_IN_PROGRESS:
+            if not mutating or self.dry_run or self.ok or self.status != STATUS_PENDING:
+                raise ValueError("in_progress disposition has an inconsistent command tuple")
+        elif self.disposition == DISPOSITION_TERMINAL_ACCEPTED:
+            if not mutating or self.dry_run or not self.ok or self.status != STATUS_ACCEPTED:
+                raise ValueError("terminal_accepted disposition has an inconsistent command tuple")
+        elif self.disposition == DISPOSITION_TERMINAL_REJECTED:
+            if (
+                not mutating
+                or self.dry_run
+                or self.ok
+                or self.status not in TERMINAL_MUTATION_REJECTION_STATUSES
+            ):
+                raise ValueError("terminal_rejected disposition has an inconsistent command tuple")
+        elif self.disposition == DISPOSITION_TERMINAL_UNCERTAIN:
+            if (
+                not mutating
+                or self.dry_run
+                or self.ok
+                or self.status != STATUS_REQUEST_STATE_UNCERTAIN
+            ):
+                raise ValueError("terminal_uncertain disposition has an inconsistent command tuple")
 
     def to_dict(self) -> dict[str, Any]:
-        return sanitize_command_result(
-            {
-                "schema_version": self.schema_version,
-                "action": self.action,
-                "request_id": self.request_id,
-                "ok": self.ok,
-                "dry_run": self.dry_run,
-                "status": self.status,
-                "result": self.result,
-                "error": self.error,
-                "warnings": self.warnings,
-            }
-        )
+        return {
+            "schema_version": self.schema_version,
+            "action": self.action,
+            "request_id": self.request_id,
+            "ok": self.ok,
+            "dry_run": self.dry_run,
+            "status": self.status,
+            "disposition": self.disposition,
+            "result": self.result,
+            "error": self.error,
+            "warnings": self.warnings,
+        }
 
     def to_json(self, indent: int | None = None) -> str:
         return public_json_dumps(self.to_dict(), indent=indent)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CommandEnvelope":
-        clean = sanitize_forbidden_fields(data) if isinstance(data, dict) else {}
-        return cls(
-            ok=bool(clean.get("ok", False)),
-            status=_string_value(clean.get("status")),
-            action=_string_value(clean.get("action")),
-            request_id=_optional_string(clean.get("request_id")),
-            dry_run=bool(clean.get("dry_run", True)),
-            result=clean.get("result") if isinstance(clean.get("result"), dict) else None,
-            error=clean.get("error") if isinstance(clean.get("error"), dict) else None,
-            warnings=list(clean.get("warnings", [])) if isinstance(clean.get("warnings"), list) else [],
-            schema_version=int(clean.get("schema_version", COMMAND_SCHEMA_VERSION)),
+        if not isinstance(data, dict):
+            raise TypeError("command envelope must be an object")
+        required_fields = {
+            "schema_version",
+            "action",
+            "request_id",
+            "ok",
+            "dry_run",
+            "status",
+            "disposition",
+            "result",
+            "error",
+            "warnings",
+        }
+        if set(data) != required_fields:
+            raise ValueError("command envelope must contain exactly the schema fields")
+        envelope = cls(
+            ok=data["ok"],
+            status=data["status"],
+            action=data["action"],
+            disposition=data["disposition"],
+            request_id=data["request_id"],
+            dry_run=data["dry_run"],
+            result=data["result"],
+            error=data["error"],
+            warnings=data["warnings"],
+            schema_version=data["schema_version"],
         )
+        if envelope.to_dict() != data:
+            raise ValueError("command envelope is not an exact public roundtrip")
+        return envelope
 
     @classmethod
     def from_result(
@@ -650,6 +808,7 @@ class CommandEnvelope:
         *,
         ok: bool,
         status: str,
+        disposition: CommandDisposition = DISPOSITION_NO_RECEIPT,
         result: dict[str, Any] | None = None,
         error: dict[str, Any] | None = None,
         warnings: list[str] | None = None,
@@ -658,6 +817,7 @@ class CommandEnvelope:
             ok=ok,
             status=status,
             action=request.action,
+            disposition=disposition,
             request_id=request.request_id,
             dry_run=request.dry_run,
             result=result,
@@ -666,8 +826,8 @@ class CommandEnvelope:
         )
 
     @classmethod
-    def error(cls, request: CommandRequest | None, error: dict[str, Any]) -> "CommandEnvelope":
-        """Build a rejection envelope from a partial or missing request."""
+    def from_error(cls, request: CommandRequest | None, error: dict[str, Any]) -> "CommandEnvelope":
+        """Build a no-receipt rejection envelope from a partial or missing request."""
         if request is None:
             return cls(
                 ok=False,
@@ -678,7 +838,27 @@ class CommandEnvelope:
                 result=None,
                 error=error,
             )
-        return cls.from_result(request, ok=False, status=error.get("code", STATUS_REJECTED), error=error)
+        mutating = request.action in {"send_instruction", "answer_pending"}
+        valid_mutation_id = is_valid_request_id(request.request_id)
+        request_id = (
+            request.request_id
+            if valid_mutation_id or (not mutating and isinstance(request.request_id, str))
+            else None
+        )
+        dry_run = request.dry_run
+        if mutating and dry_run is False and not valid_mutation_id:
+            # An invalid request was rejected before it became a live mutation.
+            # Do not emit a wire envelope that claims otherwise.
+            dry_run = True
+        return cls(
+            ok=False,
+            status=error.get("code", STATUS_REJECTED),
+            action=request.action,
+            request_id=request_id,
+            dry_run=dry_run,
+            result=None,
+            error=error,
+        )
 
 
 def worker_candidate(worker: Worker, *, include_backend_target: bool = False) -> dict[str, Any]:

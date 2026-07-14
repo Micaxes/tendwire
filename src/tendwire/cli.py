@@ -29,7 +29,6 @@ from .core.actions import CommandContext, execute_command
 from .core.attention import attention_payload_from_snapshot
 from .core.commands import (
     STATUS_BACKEND_UNAVAILABLE,
-    STATUS_REQUEST_STATE_UNCERTAIN,
     CommandEnvelope,
     error_value,
     parse_command_request,
@@ -749,6 +748,12 @@ def _try_daemon_attempt(
         return _DaemonAttempt(error_kind="protocol", request_started=True)
     result = response.get("result")
     if isinstance(result, dict):
+        if method == "command.submit":
+            try:
+                command_result = CommandEnvelope.from_dict(result).to_dict()
+            except (TypeError, ValueError):
+                return _DaemonAttempt(error_kind="protocol", request_started=True)
+            return _DaemonAttempt(result=command_result, request_started=True)
         sanitized = sanitize_public_mapping(result)
         if preserve_content_text:
             _restore_cli_content_text(sanitized, result)
@@ -1168,15 +1173,15 @@ def command_envelope_from_payload(config: Config, payload: str) -> CommandEnvelo
     request, parse_error = parse_command_request(payload)
     if parse_error is not None:
         if request is not None:
-            return CommandEnvelope.error(request, parse_error)
-        return CommandEnvelope.error(
+            return CommandEnvelope.from_error(request, parse_error)
+        return CommandEnvelope.from_error(
             None,
             parse_error or error_value("invalid_request", "unknown parse error"),
         )
 
     validation_error = validate_request(request)
     if validation_error is not None:
-        return CommandEnvelope.error(request, validation_error)
+        return CommandEnvelope.from_error(request, validation_error)
 
     if request.action in {"send_instruction", "answer_pending"}:
         from .command_submission import submit_command
@@ -1241,20 +1246,40 @@ def _daemon_backend_failure_envelope(
     attempt: _DaemonAttempt,
 ) -> CommandEnvelope:
     if attempt.request_started is not False:
-        return CommandEnvelope.error(
-            request,
-            error_value(
-                STATUS_REQUEST_STATE_UNCERTAIN,
-                "Tendwire daemon command state is uncertain",
-            ),
-        )
-    return CommandEnvelope.error(
+        raise ValueError("ambiguous daemon attempt has no authoritative command envelope")
+    return CommandEnvelope.from_error(
         request,
         error_value(
             STATUS_BACKEND_UNAVAILABLE,
             "Tendwire daemon backend is unavailable",
         ),
     )
+
+
+def _strict_daemon_command_envelope(
+    request: Any,
+    value: dict[str, Any],
+) -> CommandEnvelope | None:
+    try:
+        envelope = CommandEnvelope.from_dict(value)
+    except (TypeError, ValueError):
+        return None
+    if (
+        envelope.action != request.action
+        or envelope.request_id != request.request_id
+        or envelope.dry_run != request.dry_run
+    ):
+        return None
+    return envelope
+
+
+def _replay_daemon_command_receipt(
+    config: Config,
+    payload: str,
+) -> CommandEnvelope | None:
+    from .command_submission import replay_command_receipt
+
+    return replay_command_receipt(config, payload)
 
 
 def cmd_command(
@@ -1292,16 +1317,35 @@ def cmd_command(
         if daemon_eligible:
             daemon_attempt = _try_daemon_attempt(config, "command.submit", request_payload)
             daemon_result = daemon_attempt.result
-            if daemon_result is not None:
-                print(public_json_dumps(daemon_result, indent=2))
-                return 0 if bool(daemon_result.get("ok")) else 1
-            if daemon_required_request is not None:
-                envelope = _daemon_backend_failure_envelope(
-                    daemon_required_request,
-                    daemon_attempt,
+            if daemon_result is not None and parsed_request is not None:
+                daemon_envelope = _strict_daemon_command_envelope(
+                    parsed_request,
+                    daemon_result,
                 )
-                print(envelope.to_json(indent=2))
-                return _command_exit_code(envelope)
+                if daemon_envelope is not None:
+                    print(daemon_envelope.to_json(indent=2))
+                    return _command_exit_code(daemon_envelope)
+                daemon_attempt = _DaemonAttempt(
+                    error_kind="protocol",
+                    request_started=True,
+                )
+            if daemon_required_request is not None:
+                if daemon_attempt.request_started is False:
+                    envelope = _daemon_backend_failure_envelope(
+                        daemon_required_request,
+                        daemon_attempt,
+                    )
+                    print(envelope.to_json(indent=2))
+                    return _command_exit_code(envelope)
+                envelope = _replay_daemon_command_receipt(config, payload)
+                if envelope is not None:
+                    print(envelope.to_json(indent=2))
+                    return _command_exit_code(envelope)
+                print(
+                    "error: Tendwire daemon command result is unresolved",
+                    file=sys.stderr,
+                )
+                return 2
     envelope = command_envelope_from_payload(config, payload)
     print(envelope.to_json(indent=2))
     return _command_exit_code(envelope)

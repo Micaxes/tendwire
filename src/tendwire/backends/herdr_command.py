@@ -8,6 +8,8 @@ parameters.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import shutil
 import subprocess
 from typing import Any
@@ -20,14 +22,32 @@ from ..core.commands import (
     STATUS_BACKEND_UNAVAILABLE,
     STATUS_BACKEND_UNSUPPORTED,
     STATUS_REQUEST_STATE_UNCERTAIN,
-    CommandEnvelope,
     error_value,
+    sanitize_command_result,
 )
 from ..core.models import _string_value
 
 _BACKEND_TARGET_KINDS = frozenset(
     {"agent_id", "terminal_id", "pane_id", "agent", "name", "label"}
 )
+
+
+@dataclass(frozen=True)
+class _HerdrCommandResult:
+    """Internal backend outcome, never a public command receipt envelope."""
+
+    ok: bool
+    status: str
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "status": self.status,
+            "result": sanitize_command_result(self.result),
+            "error": sanitize_command_result(self.error),
+        }
 
 
 def _run_agent_send(
@@ -45,14 +65,14 @@ def _run_agent_send(
     )
 
 
-def _backend_error(status: str, message: str, details: dict[str, Any] | None = None) -> CommandEnvelope:
-    return CommandEnvelope(
+def _backend_error(
+    status: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> _HerdrCommandResult:
+    return _HerdrCommandResult(
         ok=False,
         status=status,
-        action="send_instruction",
-        request_id=None,
-        dry_run=False,
-        result=None,
         error=error_value(status, message, details=details),
     )
 
@@ -61,7 +81,7 @@ def send_instruction(
     config: Config,
     target: dict[str, Any],
     instruction: dict[str, Any],
-) -> CommandEnvelope:
+) -> _HerdrCommandResult:
     """Send instruction text to the backend-resolved private Herdr target."""
     backend_target = target.get("backend_target")
     target_value = ""
@@ -123,14 +143,10 @@ def send_instruction(
         )
 
     if completed.returncode == 0:
-        return CommandEnvelope(
+        return _HerdrCommandResult(
             ok=True,
             status=STATUS_ACCEPTED,
-            action="send_instruction",
-            request_id=None,
-            dry_run=False,
             result={"target": {"worker_id": public_worker_id}},
-            error=None,
         )
 
     return _backend_error(

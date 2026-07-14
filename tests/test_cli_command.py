@@ -14,6 +14,11 @@ import pytest
 from tendwire.backends.herdr_cli import HerdrCommandObservation
 from tendwire.cli import main
 from tendwire.core.commands import (
+    DISPOSITION_IN_PROGRESS,
+    DISPOSITION_NO_RECEIPT,
+    DISPOSITION_TERMINAL_ACCEPTED,
+    DISPOSITION_TERMINAL_REJECTED,
+    DISPOSITION_TERMINAL_UNCERTAIN,
     STATUS_ACCEPTED,
     STATUS_AMBIGUOUS_BACKEND_TARGET,
     STATUS_BACKEND_FAILED,
@@ -79,24 +84,16 @@ def _fake_herdr_command_observation(config: Any) -> HerdrCommandObservation:
     )
 
 
-def _accepted_backend(calls: list[tuple[Any, Any]]):
-    def send(config: Any, target: Any, instruction: Any) -> CommandEnvelope:
-        calls.append((target, instruction))
-        return CommandEnvelope(
-            ok=True,
-            status=STATUS_ACCEPTED,
-            action="send_instruction",
-            result={"target": target},
-        )
-
-    return send
 
 
 def _seed_uncertain_request(db_path: Path, request: CommandRequest) -> None:
     canonical = build_canonical_mutation(request, public_worker_id="w-1")
-    pending = CommandEnvelope.error(
+    pending = CommandEnvelope.from_result(
         request,
-        {
+        ok=False,
+        status=STATUS_REQUEST_STATE_UNCERTAIN,
+        disposition=DISPOSITION_TERMINAL_UNCERTAIN,
+        error={
             "code": STATUS_REQUEST_STATE_UNCERTAIN,
             "message": "pending",
             "details": {},
@@ -136,6 +133,64 @@ def _seed_uncertain_request(db_path: Path, request: CommandRequest) -> None:
         result_json=pending.to_json(),
     )
     assert finished["status"] == "uncertain"
+
+
+def _seed_accepted_request(
+    db_path: Path,
+    request: CommandRequest,
+    *,
+    worker_id: str = "w-1",
+) -> None:
+    init_store(db_path)
+    canonical = build_canonical_mutation(request, public_worker_id=worker_id)
+    pending = CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status="pending",
+        disposition=DISPOSITION_IN_PROGRESS,
+        error={"code": "pending", "message": "pending"},
+    )
+    reservation = reserve_command_request(
+        db_path,
+        host_id="cmd-host",
+        request_id=request.request_id or "",
+        action=request.action,
+        canonical_version=canonical.canonical_version,
+        canonical_fingerprint=canonical.fingerprint,
+        canonical_request_json=canonical.canonical_json,
+        public_worker_id=canonical.public_worker_id,
+        pending_result_json=pending.to_json(),
+    )
+    owner_token = reservation["owner_token"]
+    assert isinstance(owner_token, str)
+    started = mark_command_send_started(
+        db_path,
+        host_id="cmd-host",
+        request_id=request.request_id or "",
+        canonical_fingerprint=canonical.fingerprint,
+        owner_token=owner_token,
+        binding_fingerprint="seed-binding",
+    )
+    assert started["status"] == "send_started"
+    accepted = CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_ACCEPTED,
+        disposition=DISPOSITION_TERMINAL_ACCEPTED,
+        result={"target": {"worker_id": worker_id}},
+    )
+    finished = finish_command_request(
+        db_path,
+        host_id="cmd-host",
+        request_id=request.request_id or "",
+        canonical_fingerprint=canonical.fingerprint,
+        owner_token=owner_token,
+        expected_state="send_started",
+        terminal_state="accepted",
+        status=STATUS_ACCEPTED,
+        result_json=accepted.to_json(),
+    )
+    assert finished["status"] == "accepted"
 
 
 def test_cli_command_invalid_json(capsys, monkeypatch) -> None:
@@ -184,7 +239,8 @@ def test_cli_command_noop_success(capsys, monkeypatch) -> None:
     payload = json.loads(captured.out)
     assert payload["ok"] is True
     assert payload["status"] == "noop"
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
+    assert payload["disposition"] == DISPOSITION_NO_RECEIPT
     assert captured.err == ""
     assert calls == []
 
@@ -314,6 +370,7 @@ def test_cli_command_mutation_dry_run_is_pure_and_creates_no_receipt(
     assert payload["ok"] is True
     assert payload["status"] == "dry_run"
     assert payload["dry_run"] is True
+    assert payload["disposition"] == DISPOSITION_NO_RECEIPT
     assert payload["result"] == expected_result
     assert calls == []
     with sqlite3.connect(str(db_path)) as conn:
@@ -399,6 +456,7 @@ def test_cli_command_socket_mode_mutation_unavailable_does_not_fallback(
     assert captured.err == ""
     assert payload["ok"] is False
     assert payload["status"] == STATUS_BACKEND_UNAVAILABLE
+    assert payload["disposition"] == DISPOSITION_NO_RECEIPT
     assert payload["request_id"] == request_id
     assert calls == []
     for fragment in forbidden_fragments:
@@ -427,10 +485,16 @@ def test_cli_daemon_client_uses_method_specific_timeouts(
             return {
                 "ok": True,
                 "result": {
-                    "schema_version": 1,
-                    "ok": True,
-                    "status": STATUS_ACCEPTED,
+                    "schema_version": 2,
                     "action": "send_instruction",
+                    "request_id": "daemon-timeout-method",
+                    "ok": True,
+                    "dry_run": False,
+                    "status": STATUS_ACCEPTED,
+                    "disposition": DISPOSITION_TERMINAL_ACCEPTED,
+                    "result": {},
+                    "error": None,
+                    "warnings": [],
                 },
             }
 
@@ -555,18 +619,463 @@ def test_cli_command_socket_mode_daemon_timeout_is_uncertain(
         ]
     )
     captured = capsys.readouterr()
+
+    assert code == 2
+    assert captured.out == ""
+    assert "unresolved" in captured.err
+    assert calls == []
+
+    # A lost daemon response with no authoritative receipt is not a command
+    # envelope and must never be labeled terminal uncertainty.
+    assert get_command_request(db_path, "cmd-host", request_id) is None
+
+
+def test_cli_rejects_malformed_daemon_inner_envelope_without_fabricating_json(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    request = {
+        "schema_version": 1,
+        "action": "send_instruction",
+        "request_id": "malformed-daemon-result",
+        "dry_run": False,
+        "target": {"worker_id": "w-1"},
+        "instruction": {"text": "hello"},
+    }
+
+    class MalformedResultClient:
+        def __init__(
+            self,
+            socket_path: Any,
+            *,
+            timeout_seconds: float,
+            max_response_bytes: int = 1024 * 1024,
+        ) -> None:
+            del socket_path, timeout_seconds, max_response_bytes
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            assert method == "command.submit"
+            assert params == request
+            return {
+                "schema_version": 1,
+                "ok": True,
+                "status": "ok",
+                "result": {
+                    "schema_version": 2,
+                    "action": request["action"],
+                    "request_id": request["request_id"],
+                    "ok": True,
+                    "dry_run": False,
+                    "status": STATUS_ACCEPTED,
+                    "result": {},
+                    "error": None,
+                    "warnings": [],
+                },
+                "error": None,
+            }
+
+    monkeypatch.setattr(
+        "tendwire.daemon_api.DaemonAPIClient",
+        MalformedResultClient,
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(request)))
+    db_path = tmp_path / "malformed-result.db"
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert captured.out == ""
+    assert "unresolved" in captured.err
+    assert get_command_request(
+        db_path,
+        "cmd-host",
+        "malformed-daemon-result",
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("case", "response_request_id", "ok", "status", "disposition"),
+    [
+        (
+            "receipt-null-id",
+            None,
+            True,
+            STATUS_ACCEPTED,
+            DISPOSITION_TERMINAL_ACCEPTED,
+        ),
+        (
+            "receipt-invalid-id",
+            "invalid id",
+            True,
+            STATUS_ACCEPTED,
+            DISPOSITION_TERMINAL_ACCEPTED,
+        ),
+        (
+            "no-receipt-success",
+            "illegal-daemon-tuple",
+            True,
+            STATUS_BACKEND_UNAVAILABLE,
+            DISPOSITION_NO_RECEIPT,
+        ),
+        (
+            "no-receipt-accepted",
+            "illegal-daemon-tuple",
+            False,
+            STATUS_ACCEPTED,
+            DISPOSITION_NO_RECEIPT,
+        ),
+        (
+            "no-receipt-pending",
+            "illegal-daemon-tuple",
+            False,
+            "pending",
+            DISPOSITION_NO_RECEIPT,
+        ),
+        (
+            "no-receipt-uncertain",
+            "illegal-daemon-tuple",
+            False,
+            STATUS_REQUEST_STATE_UNCERTAIN,
+            DISPOSITION_NO_RECEIPT,
+        ),
+    ],
+)
+def test_cli_strictly_rejects_illegal_daemon_disposition_tuples(
+    case: str,
+    response_request_id: Any,
+    ok: bool,
+    status: str,
+    disposition: str,
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    request = {
+        "schema_version": 1,
+        "action": "send_instruction",
+        "request_id": "illegal-daemon-tuple",
+        "dry_run": False,
+        "target": {"worker_id": "w-1"},
+        "instruction": {"text": "hello"},
+    }
+    inner = {
+        "schema_version": 2,
+        "action": request["action"],
+        "request_id": response_request_id,
+        "ok": ok,
+        "dry_run": False,
+        "status": status,
+        "disposition": disposition,
+        "result": {},
+        "error": None if ok else {"code": status, "message": "invalid tuple"},
+        "warnings": [],
+    }
+
+    class IllegalTupleClient:
+        def __init__(
+            self,
+            socket_path: Any,
+            *,
+            timeout_seconds: float,
+            max_response_bytes: int = 1024 * 1024,
+        ) -> None:
+            del socket_path, timeout_seconds, max_response_bytes
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            assert method == "command.submit"
+            assert params == request
+            return {
+                "schema_version": 1,
+                "ok": True,
+                "status": "ok",
+                "result": inner,
+                "error": None,
+            }
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", IllegalTupleClient)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(request)))
+    db_path = tmp_path / f"{case}.db"
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert captured.out == ""
+    assert "unresolved" in captured.err
+    assert get_command_request(
+        db_path,
+        "cmd-host",
+        request["request_id"],
+    ) is None
+
+
+def test_cli_daemon_response_loss_recovers_accepted_receipt_exactly_once(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from tendwire.daemon_api import DaemonProtocolError
+
+    db_path = tmp_path / "accepted-loss.db"
+    init_store(db_path)
+    request_payload = {
+        "schema_version": 1,
+        "action": "send_instruction",
+        "request_id": "accepted-loss",
+        "dry_run": False,
+        "target": {"worker_id": "w-1"},
+        "instruction": {"text": "hello"},
+    }
+    request = CommandRequest.from_dict(request_payload)
+    canonical = build_canonical_mutation(request, public_worker_id="w-1")
+    effects: list[str] = []
+
+    class LostAcceptedResponseClient:
+        def __init__(
+            self,
+            socket_path: Any,
+            *,
+            timeout_seconds: float,
+            max_response_bytes: int = 1024 * 1024,
+        ) -> None:
+            del socket_path, timeout_seconds, max_response_bytes
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            assert method == "command.submit"
+            assert params == request_payload
+            pending = CommandEnvelope.from_result(
+                request,
+                ok=False,
+                status="pending",
+                disposition=DISPOSITION_IN_PROGRESS,
+                error={"code": "pending", "message": "pending"},
+            )
+            reservation = reserve_command_request(
+                db_path,
+                host_id="cmd-host",
+                request_id=request.request_id or "",
+                action=request.action,
+                canonical_version=canonical.canonical_version,
+                canonical_fingerprint=canonical.fingerprint,
+                canonical_request_json=canonical.canonical_json,
+                public_worker_id=canonical.public_worker_id,
+                pending_result_json=pending.to_json(),
+            )
+            owner_token = reservation["owner_token"]
+            mark_command_send_started(
+                db_path,
+                host_id="cmd-host",
+                request_id=request.request_id or "",
+                canonical_fingerprint=canonical.fingerprint,
+                owner_token=owner_token,
+                binding_fingerprint="private-binding",
+            )
+            effects.append("sent")
+            accepted = CommandEnvelope.from_result(
+                request,
+                ok=True,
+                status=STATUS_ACCEPTED,
+                disposition=DISPOSITION_TERMINAL_ACCEPTED,
+                result={"target": {"worker_id": "w-1"}},
+            )
+            finish_command_request(
+                db_path,
+                host_id="cmd-host",
+                request_id=request.request_id or "",
+                canonical_fingerprint=canonical.fingerprint,
+                owner_token=owner_token,
+                expected_state="send_started",
+                terminal_state="accepted",
+                status=STATUS_ACCEPTED,
+                result_json=accepted.to_json(),
+            )
+            raise DaemonProtocolError(
+                "accepted response lost",
+                request_started=True,
+            )
+
+    monkeypatch.setattr(
+        "tendwire.daemon_api.DaemonAPIClient",
+        LostAcceptedResponseClient,
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(request_payload)))
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
     payload = json.loads(captured.out)
 
-    assert code == 1
+    assert code == 0
     assert captured.err == ""
-    assert payload["ok"] is False
-    assert payload["status"] == STATUS_REQUEST_STATE_UNCERTAIN
-    assert payload["request_id"] == request_id
-    assert calls == []
+    assert payload["status"] == STATUS_ACCEPTED
+    assert payload["disposition"] == DISPOSITION_TERMINAL_ACCEPTED
+    assert effects == ["sent"]
+    receipt = get_command_request(db_path, "cmd-host", "accepted-loss")
+    assert receipt is not None
+    assert receipt["state"] == "accepted"
     _assert_no_command_public_forbidden_fields(payload)
 
-    # Client-edge uncertainty is not authoritative store state.
-    assert get_command_request(db_path, "cmd-host", request_id) is None
+
+@pytest.mark.parametrize(
+    ("case", "current_target", "expected_status"),
+    [
+        (
+            "changed-worker-id",
+            {"worker_id": "w-2"},
+            STATUS_DUPLICATE_REQUEST,
+        ),
+        ("mutable-name", {"name": "Alpha"}, None),
+        ("mutable-space", {"space_id": "space-1"}, None),
+        (
+            "worker-precondition",
+            {"worker_id": "w-1", "worker_fingerprint": "current-fingerprint"},
+            None,
+        ),
+        (
+            "worker-plus-null-alias",
+            {"worker_id": "w-1", "name": None},
+            None,
+        ),
+    ],
+)
+def test_cli_response_loss_reconciliation_never_reuses_stored_target_authority(
+    case: str,
+    current_target: dict[str, Any],
+    expected_status: str | None,
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    request_id = f"response-loss-{case}"
+    db_path = tmp_path / f"{case}.db"
+    stored_request = CommandRequest(
+        action="send_instruction",
+        request_id=request_id,
+        dry_run=False,
+        target={"worker_id": "w-1"},
+        instruction={"text": "hello"},
+    )
+    _seed_accepted_request(db_path, stored_request)
+    current_request = {
+        **stored_request.to_dict(),
+        "target": current_target,
+    }
+    daemon_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def stored_rows() -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+        with sqlite3.connect(str(db_path)) as conn:
+            return (
+                conn.execute("SELECT * FROM command_receipts ORDER BY id").fetchall(),
+                conn.execute("SELECT * FROM events ORDER BY id").fetchall(),
+            )
+
+    rows_before = stored_rows()
+
+    class LostResponseClient:
+        def __init__(
+            self,
+            socket_path: Any,
+            *,
+            timeout_seconds: float,
+            max_response_bytes: int = 1024 * 1024,
+        ) -> None:
+            del socket_path, timeout_seconds, max_response_bytes
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            from tendwire.daemon_api import DaemonProtocolError
+
+            daemon_calls.append((method, dict(params or {})))
+            raise DaemonProtocolError("response lost", request_started=True)
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise AssertionError(
+            "response-loss reconciliation must not submit or resolve mutable authority"
+        )
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", LostResponseClient)
+    monkeypatch.setattr("tendwire.command_submission._current_snapshot", forbidden)
+    monkeypatch.setattr("tendwire.cli.command_envelope_from_payload", forbidden)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(current_request)))
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert daemon_calls == [("command.submit", current_request)]
+    assert stored_rows() == rows_before
+    if expected_status is None:
+        assert code == 2
+        assert captured.out == ""
+        assert "unresolved" in captured.err
+    else:
+        assert code == 1
+        assert captured.err == ""
+        payload = json.loads(captured.out)
+        assert payload["status"] == expected_status
+        assert payload["status"] != STATUS_ACCEPTED
+        assert payload["disposition"] == DISPOSITION_TERMINAL_REJECTED
+        _assert_no_command_public_forbidden_fields(payload)
 
 
 @pytest.mark.parametrize(
@@ -593,18 +1102,14 @@ def test_cli_command_socket_mode_daemon_timeout_is_uncertain(
     ids=["send", "answer"],
 )
 @pytest.mark.parametrize(
-    ("request_started", "expected_status"),
-    [
-        (False, STATUS_BACKEND_UNAVAILABLE),
-        (True, STATUS_REQUEST_STATE_UNCERTAIN),
-    ],
+    "request_started",
+    [False, True],
     ids=["pre-start", "may-have-started"],
 )
 def test_cli_mutations_never_fallback_or_write_receipt_on_daemon_edge_failure(
     action: str,
     action_fields: dict[str, Any],
     request_started: bool,
-    expected_status: str,
     capsys,
     monkeypatch,
     tmp_path: Path,
@@ -662,15 +1167,21 @@ def test_cli_mutations_never_fallback_or_write_receipt_on_daemon_edge_failure(
         ]
     )
     captured = capsys.readouterr()
-    payload = json.loads(captured.out)
 
-    assert code == 1
-    assert captured.err == ""
-    assert payload["status"] == expected_status
-    assert payload["request_id"] == request_id
     assert calls == [("command.submit", request)]
     assert get_command_request(db_path, "cmd-host", request_id) is None
-    _assert_no_command_public_forbidden_fields(payload)
+    if request_started:
+        assert code == 2
+        assert captured.out == ""
+        assert "unresolved" in captured.err
+    else:
+        payload = json.loads(captured.out)
+        assert code == 1
+        assert captured.err == ""
+        assert payload["status"] == STATUS_BACKEND_UNAVAILABLE
+        assert payload["disposition"] == DISPOSITION_NO_RECEIPT
+        assert payload["request_id"] == request_id
+        _assert_no_command_public_forbidden_fields(payload)
 
 
 @pytest.mark.parametrize(
@@ -1399,6 +1910,7 @@ def test_cli_command_pending_receipt_rejects_without_retry(capsys, monkeypatch, 
     assert code == 1
     result = json.loads(captured.out)
     assert result["status"] == STATUS_REQUEST_STATE_UNCERTAIN
+    assert result["disposition"] == DISPOSITION_TERMINAL_UNCERTAIN
 
 
 def test_cli_command_uncertain_receipt_changed_payload_is_duplicate_without_retry(
@@ -1953,6 +2465,7 @@ def test_cli_command_backend_unavailable_preserves_request_id(
     assert code == 1
     payload = json.loads(captured.out)
     assert payload["status"] == STATUS_BACKEND_UNAVAILABLE
+    assert payload["disposition"] == DISPOSITION_NO_RECEIPT
     assert payload["request_id"] == "req-visible"
 
     assert get_command_request(db_path, "cmd-host", "req-visible") is None

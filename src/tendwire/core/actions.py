@@ -9,7 +9,6 @@ Telegram, or connector modules.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
 
 from ..config import Config
 from .commands import (
@@ -36,8 +35,6 @@ from .commands import (
 from .projector import project_from_observations
 
 
-SendInstructionCallback = Callable[[dict[str, Any], dict[str, Any]], CommandEnvelope]
-
 
 @dataclass(frozen=True)
 class CommandContext:
@@ -46,7 +43,6 @@ class CommandContext:
     host_id: str
     workers: list[Worker]
     snapshot: Snapshot | None = None
-    backend_sender: SendInstructionCallback | None = None
 
 
 def _config_for_host(host_id: str) -> Config:
@@ -181,27 +177,14 @@ def _send_instruction_result(request: CommandRequest, context: CommandContext) -
             ),
         )
 
-    if context.backend_sender is None:
-        return CommandEnvelope.from_result(
-            request,
-            ok=False,
-            status=STATUS_BACKEND_UNSUPPORTED,
-            error=error_value(
-                STATUS_BACKEND_UNSUPPORTED,
-                "send_instruction is not supported by this backend in this milestone",
-            ),
-        )
-
-    backend_envelope = context.backend_sender(target, instruction)
-    # Rebuild the backend envelope against the original request so that
-    # caller context such as request_id and dry_run is always preserved.
     return CommandEnvelope.from_result(
         request,
-        ok=backend_envelope.ok,
-        status=backend_envelope.status,
-        result=backend_envelope.result,
-        error=backend_envelope.error,
-        warnings=backend_envelope.warnings,
+        ok=False,
+        status=STATUS_BACKEND_UNSUPPORTED,
+        error=error_value(
+            STATUS_BACKEND_UNSUPPORTED,
+            "live mutations require the authoritative command submission path",
+        ),
     )
 
 
@@ -209,7 +192,7 @@ def execute_command(request: CommandRequest, context: CommandContext) -> Command
     """Execute a validated command request and return a neutral envelope."""
     validation_error = validate_request(request)
     if validation_error is not None:
-        return CommandEnvelope.error(request, validation_error)
+        return CommandEnvelope.from_error(request, validation_error)
 
     if request.action == "noop":
         return _noop_result(request)
@@ -230,7 +213,7 @@ def execute_command(request: CommandRequest, context: CommandContext) -> Command
     if request.action == "send_instruction":
         return _send_instruction_result(request, context)
 
-    return CommandEnvelope.error(
+    return CommandEnvelope.from_error(
         request,
         error_value(STATUS_REJECTED, f"unknown action {request.action!r}"),
     )

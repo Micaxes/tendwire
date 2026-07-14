@@ -22,10 +22,18 @@ from tendwire.backends.herdr_turns import TurnIngestionScheduler, TurnRefreshRes
 from tendwire.cli import main
 from tendwire.config import Config
 from tendwire.core.commands import (
+    DISPOSITION_IN_PROGRESS,
+    DISPOSITION_NO_RECEIPT,
+    DISPOSITION_TERMINAL_ACCEPTED,
+    DISPOSITION_TERMINAL_REJECTED,
+    DISPOSITION_TERMINAL_UNCERTAIN,
+    STATUS_BACKEND_UNAVAILABLE,
+    STATUS_REQUEST_STATE_UNCERTAIN,
     STATUS_ACCEPTED,
     STATUS_INVALID_REQUEST,
     STATUS_PENDING,
     CommandEnvelope,
+    CommandRequest,
 )
 from tendwire.core.models import (
     AttentionSignal,
@@ -174,7 +182,7 @@ def test_daemon_api_required_methods_are_public_safe() -> None:
             "backend_health": [health.to_dict() for health in snapshot.backend_health],
         },
         submit_command=lambda params: calls.append(dict(params))
-        or CommandEnvelope.error(
+        or CommandEnvelope.from_error(
             None,
             {
                 "code": STATUS_INVALID_REQUEST,
@@ -212,7 +220,10 @@ def test_daemon_api_required_methods_are_public_safe() -> None:
         }
     )
     assert command_response["ok"] is True
+    assert command_response["schema_version"] == 1
     assert command_response["result"]["ok"] is False
+    assert command_response["result"]["schema_version"] == 2
+    assert command_response["result"]["disposition"] == DISPOSITION_NO_RECEIPT
     assert calls[0]["tty"] == "sentinel-private-tty"
     assert "sentinel-private" not in json.dumps(command_response)
     _assert_no_public_json_forbidden(command_response)
@@ -220,17 +231,25 @@ def test_daemon_api_required_methods_are_public_safe() -> None:
 
 def test_daemon_answer_pending_response_is_recursively_public_safe() -> None:
     snapshot = _public_snapshot()
+    request = CommandRequest(
+        action="answer_pending",
+        request_id="answer-public",
+        dry_run=False,
+        params={
+            "pending_id": "pending-" + ("a" * 24),
+            "pending_fingerprint": "b" * 24,
+            "choice_id": "choice-" + ("c" * 24),
+        },
+    )
     api = TendwireDaemonAPI(
         get_snapshot=lambda: snapshot,
         get_health=lambda: {"schema_version": 1, "status": "ok"},
-        submit_command=lambda _params: {
-            "schema_version": 1,
-            "action": "answer_pending",
-            "request_id": "answer-public",
-            "ok": True,
-            "dry_run": False,
-            "status": "accepted",
-            "result": {
+        submit_command=lambda _params: CommandEnvelope.from_result(
+            request,
+            ok=True,
+            status=STATUS_ACCEPTED,
+            disposition=DISPOSITION_TERMINAL_ACCEPTED,
+            result={
                 "target": {
                     "worker_id": "worker-public",
                     "pane_id": "sentinel-private-pane",
@@ -250,29 +269,21 @@ def test_daemon_answer_pending_response_is_recursively_public_safe() -> None:
                 "transport_state": "submitted",
                 "observed_pending_state": "pending_observation",
             },
-            "error": None,
-            "warnings": [],
-        },
+        ),
     )
 
     response = api.dispatch(
         {
             "method": "command.submit",
-            "params": {
-                "schema_version": 1,
-                "action": "answer_pending",
-                "request_id": "answer-public",
-                "dry_run": False,
-                "params": {
-                    "pending_id": "pending-" + ("a" * 24),
-                    "pending_fingerprint": "b" * 24,
-                    "choice_id": "choice-" + ("c" * 24),
-                },
-            },
+            "params": request.to_dict(),
         }
     )
     result = response["result"]["result"]
 
+    assert response["schema_version"] == 1
+    assert response["ok"] is True
+    assert response["result"]["schema_version"] == 2
+    assert response["result"]["disposition"] == DISPOSITION_TERMINAL_ACCEPTED
     assert result == {
         "target": {"worker_id": "worker-public"},
         "pending": {
@@ -285,6 +296,109 @@ def test_daemon_answer_pending_response_is_recursively_public_safe() -> None:
         "observed_pending_state": "pending_observation",
     }
     assert "sentinel-private" not in json.dumps(response, sort_keys=True)
+    _assert_no_public_json_forbidden(response)
+
+
+@pytest.mark.parametrize(
+    ("disposition", "ok", "status", "error"),
+    [
+        (DISPOSITION_NO_RECEIPT, False, STATUS_BACKEND_UNAVAILABLE, {
+            "code": STATUS_BACKEND_UNAVAILABLE,
+            "message": "unavailable",
+        }),
+        (DISPOSITION_IN_PROGRESS, False, STATUS_PENDING, {
+            "code": STATUS_PENDING,
+            "message": "pending",
+        }),
+        (DISPOSITION_TERMINAL_ACCEPTED, True, STATUS_ACCEPTED, None),
+        (DISPOSITION_TERMINAL_REJECTED, False, STATUS_BACKEND_UNAVAILABLE, {
+            "code": STATUS_BACKEND_UNAVAILABLE,
+            "message": "rejected",
+        }),
+        (
+            DISPOSITION_TERMINAL_UNCERTAIN,
+            False,
+            STATUS_REQUEST_STATE_UNCERTAIN,
+            {
+                "code": STATUS_REQUEST_STATE_UNCERTAIN,
+                "message": "uncertain",
+            },
+        ),
+    ],
+)
+def test_daemon_command_submit_preserves_exact_disposition(
+    disposition: str,
+    ok: bool,
+    status: str,
+    error: dict[str, Any] | None,
+) -> None:
+    request = CommandRequest(
+        action="send_instruction",
+        request_id=f"daemon-{disposition}",
+        dry_run=False,
+        target={"worker_id": "w-1"},
+        instruction={"text": "hello"},
+    )
+    envelope = CommandEnvelope.from_result(
+        request,
+        ok=ok,
+        status=status,
+        disposition=disposition,
+        error=error,
+    )
+    api = TendwireDaemonAPI(
+        get_snapshot=_public_snapshot,
+        get_health=lambda: {"schema_version": 1, "status": "ok"},
+        submit_command=lambda _params: envelope,
+    )
+
+    response = api.dispatch(
+        {"method": "command.submit", "params": request.to_dict()}
+    )
+
+    assert response["schema_version"] == 1
+    assert response["ok"] is True
+    assert response["result"] == envelope.to_dict()
+    assert response["result"]["schema_version"] == 2
+    assert response["result"]["disposition"] == disposition
+
+
+def test_daemon_command_submit_rejects_malformed_inner_envelope() -> None:
+    api = TendwireDaemonAPI(
+        get_snapshot=_public_snapshot,
+        get_health=lambda: {"schema_version": 1, "status": "ok"},
+        submit_command=lambda _params: {
+            "schema_version": 2,
+            "action": "send_instruction",
+            "request_id": "malformed-inner",
+            "ok": True,
+            "dry_run": False,
+            "status": STATUS_ACCEPTED,
+            "result": {},
+            "error": None,
+            "warnings": [],
+        },
+    )
+
+    response = api.dispatch(
+        {
+            "method": "command.submit",
+            "params": {
+                "schema_version": 1,
+                "action": "send_instruction",
+                "request_id": "malformed-inner",
+                "dry_run": False,
+                "target": {"worker_id": "w-1"},
+                "instruction": {"text": "hello"},
+            },
+        }
+    )
+
+    assert response["schema_version"] == 1
+    assert response["ok"] is False
+    assert response["result"] is None
+    assert response["error"]["code"] == "internal_error"
+    assert "disposition" not in response
     _assert_no_public_json_forbidden(response)
 
 
@@ -826,7 +940,7 @@ def test_daemon_api_protocol_errors_do_not_echo_private_request_names() -> None:
     api = TendwireDaemonAPI(
         get_snapshot=lambda: Snapshot(host_id="daemon-host"),
         get_health=lambda: {"schema_version": 1, "status": "ok", "host_id": "daemon-host"},
-        submit_command=lambda params: CommandEnvelope.error(
+        submit_command=lambda params: CommandEnvelope.from_error(
             None,
             {
                 "code": STATUS_INVALID_REQUEST,
@@ -3684,20 +3798,14 @@ def test_blocked_turn_ingestion_does_not_delay_cached_real_socket_handlers(
 
     command_calls: list[str] = []
 
-    def submit_command(_config: Config, payload: str) -> dict[str, Any]:
+    def submit_command(_config: Config, payload: str) -> CommandEnvelope:
         command_calls.append(payload)
-        return {
-            "schema_version": 1,
-            "action": "noop",
-            "request_id": None,
-            "ok": True,
-            "dry_run": True,
-            "status": "accepted",
-            "result": {"accepted": True},
-            "error": None,
-            "warnings": [],
-        }
-
+        return CommandEnvelope(
+            ok=True,
+            status="accepted",
+            action="noop",
+            result={"accepted": True},
+        )
     daemon = TendwireDaemon(
         config,
         hooks=DaemonHooks(
@@ -4442,6 +4550,14 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
             STATUS_ACCEPTED,
             STATUS_PENDING,
         ]
+        assert sorted(
+            response["result"]["disposition"] for response in responses
+        ) == [
+            DISPOSITION_IN_PROGRESS,
+            DISPOSITION_TERMINAL_ACCEPTED,
+        ]
+        assert all(response["schema_version"] == 1 for response in responses)
+        assert all(response["result"]["schema_version"] == 2 for response in responses)
         assert calls == [
             {"method": "agent.get", "params": {"target": "agent-private"}},
             {"method": "agent.get", "params": {"target": "agent-private"}},
@@ -4465,6 +4581,7 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
         replay = DaemonAPIClient(socket_path).request("command.submit", request)
         assert replay["ok"] is True
         assert replay["result"]["status"] == STATUS_ACCEPTED
+        assert replay["result"]["disposition"] == DISPOSITION_TERMINAL_ACCEPTED
         monkeypatch.setenv("TENDWIRE_DATA_DIR", str(tmp_path / "cli-state"))
         monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(request)))
         cli_code = main(
@@ -4484,6 +4601,7 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
         assert cli_code == 0
         assert captured.err == ""
         assert cli_result == replay["result"]
+        assert cli_result["disposition"] == DISPOSITION_TERMINAL_ACCEPTED
         _assert_no_public_json_forbidden(cli_result)
         assert len([call for call in calls if call["method"] == "pane.send_text"]) == 1
         for response in [*responses, replay]:

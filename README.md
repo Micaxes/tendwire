@@ -119,8 +119,13 @@ python -m tendwire.cli snapshot --json
 
 `snapshot --json` prints one neutral JSON snapshot to stdout and exits
 successfully, even when no Herdr data is available. `command --json` reads
-exactly one JSON request from stdin and prints exactly one JSON envelope to
-stdout. Stdout is JSON-only for these public machine-readable commands.
+exactly one schema-v1 JSON command request from stdin. When Tendwire can prove
+the result, it prints exactly one schema-v2 command envelope to stdout and exits
+`0` for `ok=true` or `1` for `ok=false`. If a mutating daemon request may have
+started but no exact authoritative envelope or durable replay can be proven, it
+prints no stdout envelope, writes a fixed diagnostic to stderr, and exits `2`;
+it never forges a status-only result for that process-level ambiguity. Stdout is
+JSON-only for these public machine-readable commands when stdout is present.
 
 Snapshot-adjacent public turn and pending-interaction views are also available:
 
@@ -338,15 +343,17 @@ transmission may mean the daemon started the request, so the CLI returns
 `daemon_timeout` and does not run a second refresh.
 Other invalid daemon exchanges return `daemon_protocol_error`.
 
-Mutating `command --json` requests (`send_instruction` with `dry_run: false`) do
-**not** fall back in explicit daemon/socket mode. A missing/refused daemon
-returns `backend_unavailable` before any one-shot Herdr send is attempted. A
-daemon timeout or malformed daemon response during `command.submit` returns
-`request_state_uncertain`, because the daemon may have received or started the
-mutation even though the CLI did not receive a trusted final response. The
-daemon API never returns raw Herdr pane IDs, terminal IDs, backend targets,
-socket paths, target values, private fingerprints, argv/env/stdout/stderr,
-tokens, or secrets.
+Mutating `command --json` requests (`send_instruction` or `answer_pending` with
+`dry_run: false`) do **not** fall back in explicit daemon/socket mode. A
+missing/refused daemon proven unavailable before request start returns an exact
+schema-v2 `backend_unavailable/no_receipt` envelope and exits `1`, before any
+one-shot Herdr send is attempted. After request start, a daemon timeout or
+malformed response is not itself command authority: the CLI first attempts an
+exact durable receipt replay. It returns that schema-v2 envelope when proven;
+otherwise it prints no stdout envelope and exits `2` because the process result
+is ambiguous. The daemon API never returns raw Herdr pane IDs, terminal IDs,
+backend targets, socket paths, target values, private fingerprints,
+argv/env/stdout/stderr, tokens, or secrets.
 
 The Herdr socket/event backend is opt-in:
 
@@ -1268,11 +1275,12 @@ Tendwire now exposes a minimal, safety-first command interface:
 echo '{"schema_version": 1, "action": "noop"}' | tendwire command --json
 ```
 
-The `command --json` subcommand reads exactly one JSON request from stdin and
-prints exactly one JSON result/envelope to stdout. Stdout remains JSON-only.
-Human argparse errors may use stderr, but normal command output is machine
-readable. `command.submit` is the daemon method for the same contract; mutating
-Herdr sends require the socket backend and a healthy authoritative snapshot.
+The `command --json` subcommand reads exactly one schema-v1 JSON request from
+stdin. A proven result is exactly one schema-v2 command envelope on JSON-only
+stdout with exit `0`/`1`; unresolved process ambiguity is no stdout envelope
+and exit `2`. Human argparse errors may use stderr. `command.submit` is the
+daemon method for the same contract; mutating Herdr sends require the socket
+backend and a healthy authoritative snapshot.
 
 ### Send transport (current and planned)
 
@@ -1322,8 +1330,9 @@ change is required.
   `send_instruction`, or `answer_pending`.
 - `request_id` — optional for non-mutating/dry-run work; required for every
   non-dry-run `send_instruction` and `answer_pending`. A required mutating ID
-  must be nonempty and exactly as supplied: leading or trailing whitespace is
-  rejected rather than trimmed.
+  must match `[A-Za-z0-9._-]{1,128}` exactly. It is opaque ASCII and is never
+  trimmed, normalized, or case-folded; the exact supplied bytes round-trip in
+  every command envelope that can be authoritatively returned.
 - `dry_run` — defaults to `true`; only literal JSON booleans are accepted, and
   a request must explicitly set `dry_run: false` to ask for mutation.
 - `target` — optional neutral target descriptor using only `worker_id`,
@@ -1340,31 +1349,70 @@ any backend call. Rejected fields include `telegram`, `chat_id`, `topic_id`,
 `target_kind`, `target_value`, `turn_target_kind`, `turn_target_value`, and
 `private_fingerprint`.
 
-### Command result/envelope shape v1
+### Command result/envelope shape v2
+
+The command request remains schema v1. Its command result is a distinct, exact
+schema-v2 envelope:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "action": "noop",
   "request_id": "optional-id",
   "ok": true,
   "dry_run": true,
   "status": "noop",
+  "disposition": "no_receipt",
   "result": {},
   "error": null,
   "warnings": []
 }
 ```
 
+The envelope contains exactly those fields. The local daemon's outer RPC frame
+remains schema v1; for `command.submit`, its `result` is this exact schema-v2
+command envelope. The CLI unwraps that result and prints the schema-v2 command
+envelope itself.
+
+`disposition`, not `status` alone, is the receipt-authority and finality
+contract:
+
+- `no_receipt` asserts no terminal receipt authority in this response. It is
+  used for non-mutating work, dry runs, validation/pre-authority failures, and
+  other results that were not finalized against a canonical durable receipt.
+- `in_progress` projects durable `reserved` or `send_started`; it is not
+  terminal, and replay of the same request ID does not start a second send.
+- `terminal_accepted` projects durable `accepted` and requires
+  `ok=true,status=accepted`.
+- `terminal_rejected` projects durable `rejected`; it is terminal even when its
+  explanatory status is also seen in a `no_receipt` envelope.
+- `terminal_uncertain` projects durable `uncertain` and requires
+  `ok=false,status=request_state_uncertain`; the effect may have occurred and
+  is never silently retried.
+
 Status values include `noop`, `snapshot`, `resolved`, `dry_run`, `accepted`,
 `rejected`, `not_found`, `ambiguous_target`, `stale_target`,
 `backend_unavailable`, `ambiguous_backend_target`, `backend_unsupported`,
 `backend_failed`, `duplicate_request`, `request_state_uncertain`,
-`invalid_request`, and `pending`. `pending` is the in-progress envelope status;
-it is distinct from the durable receipt lifecycle described below. A backend
-that is not enabled, not reachable before send start, or not healthy reports
-`backend_unavailable`; a disconnect, timeout, protocol failure, or OS error
-after send start reports `request_state_uncertain`.
+`invalid_request`, and `pending`. `pending` is the status paired with
+`in_progress`; status text never proves terminality by itself.
+
+In particular, `backend_unavailable` has two authority cases. With
+`disposition=no_receipt`, Tendwire could not establish a receipt-authoritative
+terminal result (including a daemon failure proven to occur before request
+start), so the status alone is not final. With
+`disposition=terminal_rejected`, Tendwire established the canonical request,
+reserved its durable receipt, and persisted the pre-send rejection; that
+combination is terminal and replayable. A disconnect, timeout, protocol
+failure, or OS error after send start instead becomes
+`request_state_uncertain/terminal_uncertain`.
+
+A valid schema-v2 CLI envelope exits `0` when `ok=true` and `1` when
+`ok=false`, including `in_progress`, terminal rejection, and terminal
+uncertainty. Exit `2` is outside the envelope protocol: it means the CLI cannot
+prove whether the mutating daemon process accepted the request, emits no stdout
+JSON, and must not be interpreted by status or replaced with a synthetic
+envelope.
 
 Errors use a neutral shape: `code`, `message`, and sanitized `details`. Public
 results must never include connector delivery state, Herdr routing objects, bot
@@ -1477,7 +1525,10 @@ and terminal `accepted`, `rejected`, or `uncertain` rows. Within that pool, a
 row is deletable only when it is both older than the configured retention age
 (2592000 seconds by default) and ranked beyond the newest 4096 rows for its host
 by default. Retention seconds have a hard minimum of 691200 and must be strictly
-greater than the retry horizon. Active `reserved` owner leases are outside the
+greater than the retry horizon. The unchanged 2592000-second default therefore
+remains greater than Herdres's entire configurable connector retry horizon (at
+most 604800 seconds), so the connector cannot legitimately outlive Tendwire's
+default receipt evidence. Active `reserved` owner leases are outside the
 deletion pool, and `send_started` rows are transitioned rather than deleted
 directly. Dry-runs never create receipts.
 

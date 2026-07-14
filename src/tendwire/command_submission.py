@@ -11,6 +11,11 @@ from typing import Any
 from .config import Config
 from .core.actions import CommandContext, execute_command
 from .core.commands import (
+    COMMAND_ENVELOPE_SCHEMA_VERSION,
+    DISPOSITION_IN_PROGRESS,
+    DISPOSITION_TERMINAL_ACCEPTED,
+    DISPOSITION_TERMINAL_REJECTED,
+    DISPOSITION_TERMINAL_UNCERTAIN,
     STATUS_ACCEPTED,
     STATUS_AMBIGUOUS_BACKEND_TARGET,
     STATUS_AMBIGUOUS_TARGET,
@@ -133,7 +138,7 @@ def _backend_unavailable(
             "status": health.status,
             "outcome": health.outcome,
         }
-    return CommandEnvelope.error(
+    return CommandEnvelope.from_error(
         request,
         error_value(STATUS_BACKEND_UNAVAILABLE, message, details=details),
     )
@@ -385,6 +390,7 @@ def _backend_uncertain(request: CommandRequest, message: str) -> CommandEnvelope
         request,
         ok=False,
         status=STATUS_REQUEST_STATE_UNCERTAIN,
+        disposition=DISPOSITION_TERMINAL_UNCERTAIN,
         error=error_value(STATUS_REQUEST_STATE_UNCERTAIN, message),
     )
 
@@ -394,6 +400,7 @@ def _request_in_progress(request: CommandRequest) -> CommandEnvelope:
         request,
         ok=False,
         status=STATUS_PENDING,
+        disposition=DISPOSITION_IN_PROGRESS,
         error=error_value(STATUS_PENDING, "request is already in progress"),
     )
 
@@ -403,6 +410,7 @@ def _duplicate_request(request: CommandRequest) -> CommandEnvelope:
         request,
         ok=False,
         status=STATUS_DUPLICATE_REQUEST,
+        disposition=DISPOSITION_TERMINAL_REJECTED,
         error=error_value(
             STATUS_DUPLICATE_REQUEST,
             "request_id reused with a different canonical mutation",
@@ -616,6 +624,7 @@ def _stored_terminal_envelope(
     request: CommandRequest,
     receipt: Mapping[str, Any],
 ) -> CommandEnvelope:
+    malformed = "stored request result is malformed; not retrying mutation"
     try:
         data = json.loads(receipt["result_json"])
     except (KeyError, TypeError, json.JSONDecodeError):
@@ -628,30 +637,56 @@ def _stored_terminal_envelope(
             request,
             "stored request result is unreadable; not retrying mutation",
         )
-    normalized = dict(data)
-    normalized.setdefault("status", receipt.get("status"))
-    error = normalized.get("error")
-    if isinstance(error, Mapping) and "code" not in error:
-        normalized["error"] = {**error, "code": receipt.get("status")}
-    try:
-        envelope = CommandEnvelope.from_dict(normalized)
-    except (TypeError, ValueError):
-        return _backend_uncertain(
-            request,
-            "stored request result is malformed; not retrying mutation",
-        )
-    if envelope.to_dict() != data:
-        return _backend_uncertain(
-            request,
-            "stored request result is malformed; not retrying mutation",
-        )
+
     state = receipt.get("state")
+    if state == "accepted":
+        expected_disposition = DISPOSITION_TERMINAL_ACCEPTED
+    elif state == "rejected":
+        expected_disposition = DISPOSITION_TERMINAL_REJECTED
+    else:
+        return _backend_uncertain(request, malformed)
+
+    schema_version = data.get("schema_version")
+    try:
+        if type(schema_version) is not int:
+            raise ValueError("stored envelope schema_version must be an exact integer")
+        if schema_version == COMMAND_ENVELOPE_SCHEMA_VERSION:
+            envelope = CommandEnvelope.from_dict(data)
+        elif schema_version == 1:
+            legacy_fields = {
+                "schema_version",
+                "action",
+                "request_id",
+                "ok",
+                "dry_run",
+                "status",
+                "result",
+                "error",
+                "warnings",
+            }
+            if set(data) != legacy_fields:
+                raise ValueError("legacy envelope has an invalid field set")
+            upgraded = dict(data)
+            upgraded["schema_version"] = COMMAND_ENVELOPE_SCHEMA_VERSION
+            upgraded["disposition"] = expected_disposition
+            envelope = CommandEnvelope.from_dict(upgraded)
+            roundtrip = envelope.to_dict()
+            roundtrip.pop("disposition")
+            roundtrip["schema_version"] = 1
+            if roundtrip != data:
+                raise ValueError("legacy envelope is not an exact public roundtrip")
+        else:
+            raise ValueError("unsupported stored envelope schema")
+    except (TypeError, ValueError):
+        return _backend_uncertain(request, malformed)
+
     status = receipt.get("status")
     valid_identity = (
         envelope.action == request.action
         and envelope.request_id == request.request_id
         and envelope.dry_run is False
         and envelope.status == status
+        and envelope.disposition == expected_disposition
     )
     valid_terminal = (
         state == "accepted"
@@ -700,14 +735,19 @@ def _envelope_from_receipt(
     if not _receipt_is_canonical(request, canonical, receipt):
         return _duplicate_request(request)
     state = receipt.get("state")
-    if state == "reserved":
+    if state in {"reserved", "send_started"}:
         if receipt.get("status") != STATUS_PENDING:
             return _backend_uncertain(
                 request,
                 "stored request receipt is inconsistent; not retrying mutation",
             )
         return _request_in_progress(request)
-    if state in {"send_started", "uncertain"}:
+    if state == "uncertain":
+        if receipt.get("status") != STATUS_REQUEST_STATE_UNCERTAIN:
+            return _backend_uncertain(
+                request,
+                "stored request receipt is inconsistent; not retrying mutation",
+            )
         return _backend_uncertain(
             request,
             "previous request state is uncertain; not retrying mutation",
@@ -857,6 +897,31 @@ def _recover_request(
     return _envelope_from_receipt(request, canonical, receipt)
 
 
+def _terminal_envelope(
+    request: CommandRequest,
+    envelope: CommandEnvelope,
+    terminal_state: str,
+) -> CommandEnvelope:
+    dispositions = {
+        "accepted": DISPOSITION_TERMINAL_ACCEPTED,
+        "rejected": DISPOSITION_TERMINAL_REJECTED,
+        "uncertain": DISPOSITION_TERMINAL_UNCERTAIN,
+    }
+    try:
+        disposition = dispositions[terminal_state]
+    except KeyError as exc:
+        raise ValueError("invalid terminal command state") from exc
+    return CommandEnvelope.from_result(
+        request,
+        ok=envelope.ok,
+        status=envelope.status,
+        disposition=disposition,
+        result=envelope.result,
+        error=envelope.error,
+        warnings=envelope.warnings,
+    )
+
+
 def _finish_request(
     config: Config,
     request: CommandRequest,
@@ -870,6 +935,7 @@ def _finish_request(
     if config.db_path is None:
         return _backend_uncertain(request, "command receipt store is unavailable")
     try:
+        terminal = _terminal_envelope(request, envelope, terminal_state)
         finished = finish_command_request(
             config.db_path,
             host_id=config.host_id,
@@ -878,12 +944,12 @@ def _finish_request(
             owner_token=reservation.owner_token,
             expected_state=expected_state,
             terminal_state=terminal_state,
-            status=envelope.status,
-            result_json=envelope_to_receipt_json(envelope),
+            status=terminal.status,
+            result_json=envelope_to_receipt_json(terminal),
             event_payload=_transition_payload(
                 request,
                 worker_id=reservation.canonical.public_worker_id,
-                envelope=envelope,
+                envelope=terminal,
             ),
             terminal_effect=terminal_effect,
         )
@@ -1042,6 +1108,7 @@ def _accepted_send_envelope(
         request,
         ok=True,
         status=STATUS_ACCEPTED,
+        disposition=DISPOSITION_TERMINAL_ACCEPTED,
         result={
             "target": {"worker_id": worker.id},
             "delivery_state": "submitted",
@@ -1280,6 +1347,7 @@ def _answer_pending(
         request,
         ok=True,
         status=STATUS_ACCEPTED,
+        disposition=DISPOSITION_TERMINAL_ACCEPTED,
         result=_pending_public_result(request, started, delivery_state="submitted"),
     )
     try:
@@ -1348,14 +1416,71 @@ def _mutation_dry_run(request: CommandRequest) -> CommandEnvelope:
 def _direct_replay_worker_id(request: CommandRequest) -> str | None:
     """Return an exact explicit ID only when no mutable selector must resolve."""
     target = request.target or {}
+    if set(target) != {"worker_id"}:
+        return None
     worker_id = target.get("worker_id")
     if not isinstance(worker_id, str) or not worker_id.strip():
         return None
-    for field in ("name", "space_id", "worker_fingerprint"):
-        value = target.get(field)
-        if value is not None and str(value):
-            return None
     return worker_id
+
+
+def replay_command_receipt(
+    config: Config,
+    params: Mapping[str, Any] | str,
+) -> CommandEnvelope | None:
+    """Read one existing receipt without reserving, resending, or rewriting it."""
+    payload = params if isinstance(params, str) else _raw_payload_from_mapping(params)
+    request, parse_error = parse_command_request(payload)
+    if parse_error is not None or request is None or validate_request(request) is not None:
+        return None
+    if request.action not in _MUTATING_ACTIONS or request.dry_run or config.db_path is None:
+        return None
+    try:
+        receipt = get_command_request(
+            config.db_path,
+            config.host_id,
+            request.request_id or "",
+        )
+    except Exception:
+        return None
+    if not isinstance(receipt, Mapping):
+        return None
+    if receipt.get("action") != request.action:
+        return _duplicate_request(request)
+    stored_worker_id = receipt.get("public_worker_id")
+    canonical_version = receipt.get("canonical_version")
+    if request.action == "send_instruction":
+        public_worker_id = _direct_replay_worker_id(request)
+        if public_worker_id is None:
+            return None
+        if canonical_version != 0 and (
+            not isinstance(stored_worker_id, str) or not stored_worker_id
+        ):
+            return _backend_uncertain(
+                request,
+                "stored request receipt is malformed; not retrying mutation",
+            )
+    else:
+        if not isinstance(stored_worker_id, str) or not stored_worker_id:
+            if canonical_version != 0:
+                return _backend_uncertain(
+                    request,
+                    "stored request receipt is malformed; not retrying mutation",
+                )
+            public_worker_id = _LEGACY_V0_REPLAY_WORKER_ID
+        else:
+            public_worker_id = stored_worker_id
+    try:
+        canonical = build_canonical_mutation(
+            request,
+            public_worker_id=public_worker_id,
+        )
+    except (TypeError, ValueError):
+        return _backend_uncertain(
+            request,
+            "stored request receipt is malformed; not retrying mutation",
+        )
+    return _envelope_from_receipt(request, canonical, receipt)
 
 
 def submit_command(
@@ -1369,12 +1494,12 @@ def submit_command(
     request, parse_error = parse_command_request(payload)
     if parse_error is not None:
         if request is not None:
-            return CommandEnvelope.error(request, parse_error)
-        return CommandEnvelope.error(None, parse_error)
+            return CommandEnvelope.from_error(request, parse_error)
+        return CommandEnvelope.from_error(None, parse_error)
 
     validation_error = validate_request(request)
     if validation_error is not None:
-        return CommandEnvelope.error(request, validation_error)
+        return CommandEnvelope.from_error(request, validation_error)
 
     if request.action not in _MUTATING_ACTIONS:
         return _execute_non_mutating(config, request)

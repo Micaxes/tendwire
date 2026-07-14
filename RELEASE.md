@@ -464,13 +464,22 @@ not claim production deployment from this hermetic gate.
 
 The Goal 11 release evidence is local and public-safe:
 
-- One receipt owns each `(host_id, request_id)` across mutating actions. Required
-  mutating request IDs are nonempty and reject leading or trailing whitespace
-  rather than trimming it. The canonical mutation is built after authoritative
-  selector resolution to the public worker identity.
+- The public command request is schema v1; the authoritative command envelope
+  is exact schema v2 and round-trips `request_id`. One receipt owns each
+  `(host_id, request_id)` across mutating actions. Required mutating request IDs
+  match `[A-Za-z0-9._-]{1,128}` exactly and are never trimmed, normalized, or
+  case-folded. The canonical mutation is built after authoritative selector
+  resolution to the public worker identity.
+- The exact disposition projection is `no_receipt` for no terminal receipt
+  authority, `in_progress` for `reserved`/`send_started`,
+  `terminal_accepted` for `accepted`, `terminal_rejected` for `rejected`, and
+  `terminal_uncertain` for `uncertain`. Status alone is never finality.
+  Accordingly, `backend_unavailable/no_receipt` is not a terminal receipt,
+  while `backend_unavailable/terminal_rejected` is a persisted pre-send terminal
+  rejection.
 - A same-ID canonical replay returns in-progress, cached terminal, or uncertain
-  state without a second send. Changed action, resolved worker, instruction, or
-  pending choice rejects as `duplicate_request`.
+  disposition without a second send. Changed action, resolved worker,
+  instruction, or pending choice rejects as `duplicate_request`.
 - A different request ID is always a distinct mutation and, when otherwise
   valid, sends even if instruction content matches an earlier request. There is
   no content-based or time-window command suppression.
@@ -497,6 +506,11 @@ The Goal 11 release evidence is local and public-safe:
   only aggregate state/policy/candidate counts and pressure, never request IDs,
   canonical requests, instructions, pending choices, workers, or private
   bindings.
+- An exact CLI envelope exits `0` for `ok=true` or `1` for `ok=false`. If a
+  mutating daemon request may have started but no exact envelope or durable
+  replay can be proven, exit `2` carries no stdout envelope and no forged
+  status/disposition. The unchanged 2592000-second default receipt retention is
+  greater than Herdres's maximum 604800-second connector retry horizon.
 
 These checks use temporary local SQLite state and fake backend transport. They
 do not require or authorize a live Herdr send, connector, network credential,

@@ -370,14 +370,17 @@ deduplicated and bounded per host by the same count policy. Missing/malformed
 owners, known-incomplete content, and internal automation remain nonretryable
 safety holds and are never converted by cleanup or retry.
 
-Command receipts use one host-wide `(host_id, request_id)` authority across
-mutating actions. A required mutating request ID must be nonempty and have no
-leading or trailing whitespace; Tendwire rejects rather than trims edge
-whitespace. Canonical identity is computed only after authoritative selector
-resolution and contains the resolved public worker identity plus the exact
-mutation; raw selector spelling and private binding data are not authority. A
-validated mutation dry-run is pure: it needs neither a backend nor a store,
-creates no receipt, and does not resolve mutable target authority.
+Command requests use schema v1, while every authoritative command result uses
+the exact schema-v2 envelope with `disposition`. Command receipts use one
+host-wide `(host_id, request_id)` authority across mutating actions. A required
+mutating request ID must match `[A-Za-z0-9._-]{1,128}` exactly. Tendwire never
+trims, normalizes, or case-folds it, and an authoritative envelope round-trips
+the supplied ID exactly. Canonical identity is computed only after
+authoritative selector resolution and contains the resolved public worker
+identity plus the exact mutation; raw selector spelling and private binding
+data are not authority. A validated mutation dry-run is pure: it needs neither
+a backend nor a store, creates no receipt, and does not resolve mutable target
+authority.
 
 The durable states are `reserved`, `send_started`, `accepted`, `rejected`, and
 `uncertain`. An active `reserved` lease protects its pre-send owner; after lease
@@ -386,6 +389,16 @@ evidence that an external effect may have begun, so replay never automatically
 retries it. Accepted/rejected work replays the stored result. Different request
 IDs remain independent sends even when instruction content matches.
 
+Disposition is the finality authority, never status alone: `no_receipt` asserts
+no terminal receipt authority, `in_progress` projects `reserved` or
+`send_started`, `terminal_accepted` projects `accepted`, `terminal_rejected`
+projects `rejected`, and `terminal_uncertain` projects `uncertain`.
+`backend_unavailable/no_receipt` is therefore nonterminal at the receipt layer,
+whereas `backend_unavailable/terminal_rejected` is a persisted pre-send terminal
+rejection. For the CLI, an exact schema-v2 envelope exits `0` for `ok=true` and
+`1` for `ok=false`. Exit `2` emits no stdout envelope: the process could not
+prove whether a mutating daemon request started and must not forge one.
+
 By default, a `send_started` receipt older than the 604800-second retry horizon
 becomes `uncertain`; `reserved` is not converted merely because it is old.
 The bounded deletion pool contains only expired pre-send `reserved` rows and
@@ -393,6 +406,8 @@ terminal `accepted`, `rejected`, or `uncertain` rows. A row in that pool is
 eligible only when it is both older than 2592000 seconds and ranked beyond the
 newest 4096 bounded rows for its host. Active owner leases and `send_started`
 rows remain protected from deletion.
+The unchanged 2592000-second default is greater than Herdres's maximum
+604800-second connector retry horizon.
 
 The daemon checks a persisted database-wide cadence after a stored snapshot.
 By default, it removes at most 100 snapshot rows, shares a 100-graph final

@@ -56,28 +56,43 @@ public-safe delivery state; concrete Telegram delivery, topic routing, retries,
 and rate limits stay in Herdres or another connector process.
 
 Mutating command idempotency is host-wide: `(host_id, request_id)` is the sole
-receipt authority across actions. A required mutating request ID must be
-nonempty and have no leading or trailing whitespace; edge whitespace is
-rejected, not normalized. Tendwire canonicalizes only after resolving a neutral
-selector to one public worker identity; raw selector spelling, observation
-fingerprints, connector metadata, and private binding data are not authority.
-Reusing an ID for a changed canonical mutation fails before send, while a
-different ID remains an independent send even when instruction text matches.
-Tendwire therefore makes no content-based command deduplication claim. A
-validated mutation dry-run is pure and requires neither backend nor store; it
-creates no receipt and consults no mutable target authority.
+receipt authority across actions. Requests use schema v1; authoritative command
+envelopes use exact schema v2. A required mutating request ID must match
+`[A-Za-z0-9._-]{1,128}` exactly and is opaque ASCII: Tendwire does not trim,
+normalize, or case-fold it, and the authoritative envelope must round-trip it
+exactly. Tendwire canonicalizes only after resolving a neutral selector to one
+public worker identity; raw selector spelling, observation fingerprints,
+connector metadata, and private binding data are not authority. Reusing an ID
+for a changed canonical mutation fails before send, while a different ID
+remains an independent send even when instruction text matches. Tendwire
+therefore makes no content-based command deduplication claim. A validated
+mutation dry-run is pure and requires neither backend nor store; it creates no
+receipt and consults no mutable target authority.
 
-Receipt state is explicit: an active `reserved` lease protects a pre-send owner,
-and an expired lease remains reclaimable for the same canonical mutation.
-`send_started` is durable evidence that an external effect may begin;
-`accepted` and `rejected` are replayable terminal results, and `uncertain` is
-terminal evidence that an effect may have occurred. A `send_started` row older
-than the retry horizon becomes `uncertain`; neither state is automatically
-retried. Retention bounds only expired `reserved` rows and terminal `accepted`,
-`rejected`, or `uncertain` rows, and deletes a bounded row only after it is both
-older than the age floor and beyond the per-host newest-count floor. Active
-leases remain outside the deletion pool, and `send_started` is transitioned
-rather than deleted directly.
+Receipt state is explicit and projected only through envelope `disposition`:
+`no_receipt` provides no terminal receipt authority; `in_progress` projects
+durable `reserved` or `send_started`; `terminal_accepted` projects `accepted`;
+`terminal_rejected` projects `rejected`; and `terminal_uncertain` projects
+`uncertain`. Status is explanatory and must never be used alone for finality.
+Thus `backend_unavailable/no_receipt` does not prove a terminal receipt, while
+`backend_unavailable/terminal_rejected` proves a persisted pre-send rejection.
+If a mutating daemon request may have started but neither an exact schema-v2
+envelope nor a durable replay can be proven, the CLI emits no stdout envelope
+and exits `2` rather than inventing an `ok`, status, or disposition. Exact
+envelopes exit `0` for `ok=true` and `1` for `ok=false`.
+
+An active `reserved` lease protects a pre-send owner, and an expired lease
+remains reclaimable for the same canonical mutation. `send_started` is durable
+evidence that an external effect may begin; `accepted` and `rejected` are
+replayable terminal results, and `uncertain` is terminal evidence that an
+effect may have occurred. A `send_started` row older than the retry horizon
+becomes `uncertain`; neither state is automatically retried. Retention bounds
+only expired `reserved` rows and terminal `accepted`, `rejected`, or
+`uncertain` rows, and deletes a bounded row only after it is both older than the
+age floor and beyond the per-host newest-count floor. Active leases remain
+outside the deletion pool, and `send_started` is transitioned rather than
+deleted directly. The unchanged 2592000-second default receipt retention
+remains greater than Herdres's maximum 604800-second connector retry horizon.
 
 The SQLite receipt is private local state and may contain canonical instruction
 or pending-choice data; public command, event, status, and health surfaces do

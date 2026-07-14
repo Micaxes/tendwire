@@ -21,6 +21,7 @@ from tendwire.core.commands import (
     STATUS_BACKEND_UNAVAILABLE,
     STATUS_BACKEND_UNSUPPORTED,
     STATUS_REQUEST_STATE_UNCERTAIN,
+    CommandEnvelope,
 )
 from tendwire.core.models import Worker, WorkerBinding, worker_binding_private_fingerprint
 from tendwire.core.projector import project_from_observations
@@ -136,6 +137,8 @@ def test_send_instruction_uses_agent_send_argv(monkeypatch) -> None:
     assert envelope.ok is True
     assert envelope.status == STATUS_ACCEPTED
     assert envelope.result == {"target": {"worker_id": "public-worker-1"}}
+    assert not isinstance(envelope, CommandEnvelope)
+    assert set(envelope.to_dict()) == {"ok", "status", "result", "error"}
     assert calls == [
         (
             ["herdr", "agent", "send", "agent-send-1", instruction_text],
