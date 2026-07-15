@@ -1,6 +1,6 @@
-# Release checklist (Tendwire 0.1.0rc2 / Herdres 0.7.0rc3)
+# Release checklist (Tendwire 0.1.0rc3 / Herdres 0.7.0rc3)
 
-The supported RC runtime is Python 3.13. Tendwire `0.1.0rc2` must be paired
+The supported RC runtime is Python 3.13. Tendwire `0.1.0rc3` must be paired
 with Herdres `0.7.0rc3` or a reviewed descendant preserving its source
 contract. The package version is defined once in `src/tendwire/_version.py`;
 Hatch reads that value, and `scripts/release_artifacts.py` validates the

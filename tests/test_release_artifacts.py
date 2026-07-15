@@ -22,7 +22,7 @@ def test_rc_metadata_has_one_version_source_and_python_313_support() -> None:
     assert project["dynamic"] == ["version"]
     assert "version" not in project
     assert data["tool"]["hatch"]["version"]["path"] == "src/tendwire/_version.py"
-    assert release_artifacts._package_version() == "0.1.0rc2"
+    assert release_artifacts._package_version() == "0.1.0rc3"
     assert project["requires-python"] == ">=3.13"
     assert "Programming Language :: Python :: 3.13" in project["classifiers"]
     assert not any("Python :: 3.1" in item and not item.endswith("3.13") for item in project["classifiers"])

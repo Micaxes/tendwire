@@ -1042,6 +1042,8 @@ def _run_herdres_phase(
                  "turns",
                  "--schema-version",
                  "2",
+                 "--limit",
+                 "50",
                  "--json",
              ],
              ["--socket-path", str(socket_path), "pending", "--json"])
