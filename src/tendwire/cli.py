@@ -941,7 +941,7 @@ def _restore_cli_plan_token(
         r"turn-final:revision:twfinal1\.[A-Za-z0-9_-]+", delivery_key
     ):
         sanitized["key"] = delivery_key
-    for nested_key in ("turn", "final"):
+    for nested_key in ("turn", "final", "payload"):
         nested_original = original.get(nested_key)
         nested_sanitized = sanitized.get(nested_key)
         if isinstance(nested_original, dict) and isinstance(nested_sanitized, dict):

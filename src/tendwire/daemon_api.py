@@ -681,7 +681,7 @@ def _restore_plan_token(
             is not None
         ):
             target["key"] = delivery_key
-        for nested_key in ("turn", "final"):
+        for nested_key in ("turn", "final", "payload"):
             nested_original = original.get(nested_key)
             nested_target = target.get(nested_key)
             if isinstance(nested_original, Mapping) and isinstance(nested_target, dict):

@@ -274,6 +274,7 @@ def test_cli_daemon_connector_result_is_sanitized_before_printing(
                             "payload": {
                                 "safe": "kept",
                                 "turn_id": "turn-public-final",
+                                "plan_token": "twplan1.publicPlan",
                                 "chat_id": "sentinel-private-chat",
                                 "raw_payload": "sentinel-private-raw",
                             },
@@ -306,6 +307,7 @@ def test_cli_daemon_connector_result_is_sanitized_before_printing(
     assert payload["items"][0]["payload"] == {
         "safe": "kept",
         "turn_id": "turn-public-final",
+        "plan_token": "twplan1.publicPlan",
     }
     assert "sentinel-private" not in encoded
     assert "raw_payload" not in encoded
@@ -348,6 +350,46 @@ def test_daemon_connector_preserves_public_turn_id_for_final_ready() -> None:
         "schema_version": 2,
         "operation": "final_ready",
         "turn_id": "turn-public-final",
+    }
+    _assert_json_only_and_safe(response)
+
+
+def test_daemon_connector_preserves_nested_plan_token_for_final_part() -> None:
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: Snapshot(host_id="host-a"),
+        get_health=lambda: {},
+        submit_command=lambda _params: {},
+        connector_call=lambda _method, _params: {
+            "schema_version": 1,
+            "ok": True,
+            "status": "ok",
+            "items": [
+                {
+                    "key": "turn-final:twplan1.publicPlan:000000",
+                    "ref": "twref1.publicSafeRef",
+                    "payload": {
+                        "schema_version": 1,
+                        "plan_token": "twplan1.publicPlan",
+                        "operation": "upsert",
+                        "turn": {
+                            "turn_id": "turn-public-final",
+                            "pane_id": "sentinel-private-pane",
+                        },
+                    },
+                }
+            ],
+        },
+    )
+
+    response = api.dispatch(
+        {"method": "connector.poll", "params": {"name": "turn-final"}}
+    )
+
+    assert response["result"]["items"][0]["payload"] == {
+        "schema_version": 1,
+        "plan_token": "twplan1.publicPlan",
+        "operation": "upsert",
+        "turn": {"turn_id": "turn-public-final"},
     }
     _assert_json_only_and_safe(response)
 
