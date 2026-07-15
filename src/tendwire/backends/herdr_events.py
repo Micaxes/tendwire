@@ -82,8 +82,18 @@ DEFAULT_RECONNECT_DELAY_SECONDS = 0.25
 _AGENT_PAYLOAD_KEYS = ("agents", "workers", "data", "items", "results", "result")
 _PANE_PAYLOAD_KEYS = ("panes", "items", "data", "results", "result")
 _SUPPORTED_EVENT_NAMES = HERDR_OFFICIAL_EVENT_NAMES
+_PANE_SCOPED_REPLAY_EVENT_NAMES = frozenset(
+    {
+        "workspace.focused",
+        "pane.focused",
+        "pane.agent_detected",
+        "pane.output_matched",
+    }
+)
 _PANE_SCOPED_FALLBACK_EVENT_NAMES = tuple(
-    event_name for event_name in _SUPPORTED_EVENT_NAMES if event_name != "pane.output_matched"
+    event_name
+    for event_name in _SUPPORTED_EVENT_NAMES
+    if event_name not in _PANE_SCOPED_REPLAY_EVENT_NAMES
 )
 _CLOSED_EVENT_NAMES = frozenset({"pane.closed", "pane.exited"})
 _SPACE_EVENT_NAMES = frozenset(

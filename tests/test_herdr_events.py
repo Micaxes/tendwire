@@ -679,7 +679,12 @@ def test_backend_falls_back_to_private_pane_scoped_event_subscriptions(tmp_path:
     method, params = client.subscriptions[0]
     assert method == HERDR_EVENTS_SUBSCRIBE_METHOD
     subscriptions = params["subscriptions"]
-    fallback_names = set(HERDR_OFFICIAL_EVENT_NAMES) - {"pane.output_matched"}
+    fallback_names = set(HERDR_OFFICIAL_EVENT_NAMES) - {
+        "workspace.focused",
+        "pane.focused",
+        "pane.agent_detected",
+        "pane.output_matched",
+    }
     assert len(subscriptions) == len(fallback_names)
     assert {item["type"] for item in subscriptions} == fallback_names
     assert {item["pane_id"] for item in subscriptions} == {"pane-private"}
