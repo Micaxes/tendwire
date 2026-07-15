@@ -370,8 +370,11 @@ def test_submit_command_socket_setup_failures_are_backend_unavailable(
         socket_client_factory=make_client,
     )
 
+    # Socket setup failed before any transmission. That is a safe pre-send
+    # transient: no send began, so the request ID stays retryable and no durable
+    # rejection receipt is written.
     assert envelope.status == STATUS_BACKEND_UNAVAILABLE
-    assert envelope.disposition == DISPOSITION_TERMINAL_REJECTED
+    assert envelope.disposition == DISPOSITION_NO_RECEIPT
     assert envelope.error is not None
     assert envelope.error["code"] == STATUS_BACKEND_UNAVAILABLE
     assert "private" not in json.dumps(envelope.to_dict())
@@ -379,13 +382,27 @@ def test_submit_command_socket_setup_failures_are_backend_unavailable(
     assert envelope.status != STATUS_NOT_FOUND
     assert envelope.status != STATUS_REQUEST_STATE_UNCERTAIN
     assert config.db_path is not None
-    receipt = _receipt_for_action(config.db_path, "cmd-host", f"setup-{label}", "send_instruction")
-    assert receipt is not None
-    assert receipt["status"] == STATUS_BACKEND_UNAVAILABLE
-    assert receipt["uncertain"] is False
+    assert get_command_request(config.db_path, "cmd-host", f"setup-{label}") is None
     with sqlite3.connect(str(config.db_path)) as conn:
-        events = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
-    assert "command.send_started" not in events
+        assert conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0] == 0
+        command_events = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'command_request'"
+        ).fetchone()[0]
+    assert command_events == 0
+
+    # Once the transient clears, the same request ID succeeds exactly once.
+    recovery_calls: list[dict[str, Any]] = []
+    recovered = submit_command(
+        config,
+        _request(request_id=f"setup-{label}"),
+        socket_client_factory=_factory(recovery_calls),
+    )
+    assert recovered.status == STATUS_ACCEPTED
+    assert recovered.disposition == DISPOSITION_TERMINAL_ACCEPTED
+    assert [call["method"] for call in recovery_calls].count("pane.send_text") == 1
+    receipt = get_command_request(config.db_path, "cmd-host", f"setup-{label}")
+    assert receipt is not None
+    assert receipt["state"] == "accepted"
 
 
 @pytest.mark.parametrize(
@@ -1817,7 +1834,7 @@ def test_submit_command_terminal_replay_retention_delete_atomically_fences_prepa
     )
 
 
-def test_submit_command_timeout_before_send_start_rejects_and_replays(
+def test_submit_command_timeout_before_send_start_stays_retryable(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path)
@@ -1845,22 +1862,28 @@ def test_submit_command_timeout_before_send_start_rejects_and_replays(
         _request(request_id="before-timeout"),
         socket_client_factory=lambda _config: ConnectTimeoutClient(),
     )
-    replay = submit_command(
+
+    # A connect timeout occurs before any request transmission, so no send began.
+    # It must stay retryable rather than durably reject the unsent command.
+    assert first.status == STATUS_BACKEND_UNAVAILABLE
+    assert first.disposition == DISPOSITION_NO_RECEIPT
+    assert config.db_path is not None
+    assert get_command_request(config.db_path, config.host_id, "before-timeout") is None
+
+    # A retry under the same request ID re-attempts and, once the socket
+    # responds, sends exactly once.
+    recovery_calls: list[dict[str, Any]] = []
+    recovered = submit_command(
         config,
         _request(request_id="before-timeout"),
-        socket_client_factory=lambda _config: pytest.fail(
-            "rejected replay must not create a socket client"
-        ),
+        socket_client_factory=_factory(recovery_calls),
     )
-
-    assert first.status == STATUS_BACKEND_UNAVAILABLE
-    assert first.disposition == DISPOSITION_TERMINAL_REJECTED
-    assert replay.to_dict() == first.to_dict()
-    assert config.db_path is not None
+    assert recovered.status == STATUS_ACCEPTED
+    assert [call["method"] for call in recovery_calls].count("pane.send_text") == 1
     receipt = get_command_request(config.db_path, config.host_id, "before-timeout")
     assert receipt is not None
-    assert receipt["state"] == "rejected"
-    assert receipt["send_started_at"] is None
+    assert receipt["state"] == "accepted"
+    assert receipt["send_started_at"] is not None
 
 
 def test_submit_command_finalization_timeout_after_send_is_uncertain_and_not_retried(
@@ -3102,7 +3125,7 @@ def test_answer_pending_send_start_exception_is_retryable_only_after_claim_relea
     assert receipt is not None
     assert receipt["state"] == expected_state
 
-def test_answer_pending_socket_setup_failure_precedes_claim_and_is_definite(
+def test_answer_pending_socket_setup_failure_precedes_claim_and_stays_retryable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3119,31 +3142,29 @@ def test_answer_pending_socket_setup_failure_precedes_claim_and_is_definite(
         private_fingerprint="claimed-private",
     )
 
-    def failed_abandon(db_path: Path, host_id: str, claim_token: str) -> bool:
-        transitions.append(("abandon_failed", claim_token))
-        return False
+    connect_ok = {"value": False}
 
-    monkeypatch.setattr(
-        command_submission,
-        "abandon_backend_pending_choice_claim",
-        failed_abandon,
-    )
-
-    def failed_factory(config: Config) -> Any:
-        raise OSError("socket unavailable")
+    def flaky_factory(config: Config) -> Any:
+        if not connect_ok["value"]:
+            raise OSError("socket unavailable")
+        return _FakeSocketClient([])
 
     envelope = submit_command(
         config,
         _answer_request(request_id="answer-setup-failed"),
-        socket_client_factory=failed_factory,
+        socket_client_factory=flaky_factory,
     )
 
+    # The socket could not be reached, before any pending choice was claimed and
+    # before any transmission. That is a safe pre-send transient.
     assert envelope.status == STATUS_BACKEND_UNAVAILABLE
+    assert envelope.disposition == DISPOSITION_NO_RECEIPT
     assert envelope.error == {
         "code": STATUS_BACKEND_UNAVAILABLE,
         "message": "Herdr socket could not be reached",
         "details": {},
     }
+    # Only the read-only validation ran; nothing was claimed or sent.
     assert transitions == [
         (
             "claim",
@@ -3155,6 +3176,22 @@ def test_answer_pending_socket_setup_failure_precedes_claim_and_is_definite(
         )
     ]
     assert config.db_path is not None
+    assert _receipt_for_action(
+        config.db_path,
+        config.host_id,
+        "answer-setup-failed",
+        "answer_pending",
+    ) is None
+
+    # The same request ID answers exactly once after the socket recovers.
+    connect_ok["value"] = True
+    recovered = submit_command(
+        config,
+        _answer_request(request_id="answer-setup-failed"),
+        socket_client_factory=flaky_factory,
+    )
+    assert recovered.status == STATUS_ACCEPTED
+    assert recovered.disposition == DISPOSITION_TERMINAL_ACCEPTED
     receipt = _receipt_for_action(
         config.db_path,
         config.host_id,
@@ -3162,8 +3199,8 @@ def test_answer_pending_socket_setup_failure_precedes_claim_and_is_definite(
         "answer_pending",
     )
     assert receipt is not None
-    assert receipt["state"] == "rejected"
-    assert receipt["uncertain"] is False
+    assert receipt["state"] == "accepted"
+    assert ("finish", "claim-private", True) in transitions
 
 
 def test_stable_owner_pending_command_survives_worker_churn_and_source_wins(

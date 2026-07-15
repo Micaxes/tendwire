@@ -6,6 +6,7 @@ import json
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from .config import Config
@@ -775,13 +776,53 @@ class PreparedInstructionMutation:
     binding_fingerprint: str
 
 
+class PreSendCertainty(Enum):
+    """How a pre-send failure must be classified before any external mutation.
+
+    The distinction is which stage's evidence produced the failure, not the
+    status text. An authoritative snapshot observation or proven target
+    unsuitability is deterministic and may terminalize; a failed local or
+    backend *operation* proves nothing durable and must stay retryable.
+    """
+
+    #: Proven target unsuitability -- a disallowed worker status, an unavailable
+    #: backend, or a missing/stale/ambiguous private binding read from current
+    #: data. A durable rejection is justified and a same-ID retry replays it.
+    PERMANENT = "permanent"
+    #: A local or backend operation failed before any send: the binding store,
+    #: socket connect, pane resolution, or receipt-store open raised. No external
+    #: mutation began and no durable authority exists, so the request ID stays
+    #: retryable with no receipt written.
+    SAFE_TRANSIENT = "safe_transient"
+
+
+@dataclass(frozen=True)
+class PreSendFailure:
+    """A classified failure that occurred before any external mutation began."""
+
+    envelope: CommandEnvelope
+    certainty: PreSendCertainty
+
+    @property
+    def is_transient(self) -> bool:
+        return self.certainty is PreSendCertainty.SAFE_TRANSIENT
+
+
+def _permanent_pre_send(envelope: CommandEnvelope) -> PreSendFailure:
+    return PreSendFailure(envelope=envelope, certainty=PreSendCertainty.PERMANENT)
+
+
+def _safe_transient_pre_send(envelope: CommandEnvelope) -> PreSendFailure:
+    return PreSendFailure(envelope=envelope, certainty=PreSendCertainty.SAFE_TRANSIENT)
+
+
 def _prepare_instruction(
     config: Config,
     request: CommandRequest,
     worker: Worker,
     *,
     socket_client_factory: SocketClientFactory | None,
-) -> PreparedInstructionMutation | CommandEnvelope:
+) -> PreparedInstructionMutation | PreSendFailure:
     assert config.db_path is not None
     try:
         bindings = list_worker_bindings(
@@ -790,22 +831,33 @@ def _prepare_instruction(
             backend=HERDR_BACKEND,
         )
     except Exception:
-        return _backend_unavailable(request, "private binding store is unavailable")
+        # The binding store raised. This is an operation failure, not a proven
+        # target property, and no send began: stay retryable under the same ID.
+        return _safe_transient_pre_send(
+            _backend_unavailable(request, "private binding store is unavailable")
+        )
     resolved = _binding_for_worker(request, worker, bindings)
     if isinstance(resolved, CommandEnvelope):
-        return resolved
+        # A missing, stale, or ambiguous binding read from current data is a
+        # proven target property; a same-ID retry would resolve it the same way.
+        return _permanent_pre_send(resolved)
 
     binding_fingerprint = str(resolved.binding.private_fingerprint or "").strip()
     if not binding_fingerprint:
-        return _binding_error(
-            request,
-            STATUS_BACKEND_UNSUPPORTED,
-            "target private binding has no durable identity",
+        return _permanent_pre_send(
+            _binding_error(
+                request,
+                STATUS_BACKEND_UNSUPPORTED,
+                "target private binding has no durable identity",
+            )
         )
 
+    # Everything past here is a backend operation performed before the send. A
+    # failed connect or pane resolution proves nothing durable, so it stays
+    # retryable rather than burning the request ID.
     client_or_error = _connect_socket(config, request, socket_client_factory)
     if isinstance(client_or_error, CommandEnvelope):
-        return client_or_error
+        return _safe_transient_pre_send(client_or_error)
     client = client_or_error
     pane_or_error = _resolve_private_pane(
         config,
@@ -815,7 +867,7 @@ def _prepare_instruction(
     )
     if isinstance(pane_or_error, CommandEnvelope):
         _close_socket_client(client)
-        return pane_or_error
+        return _safe_transient_pre_send(pane_or_error)
     return PreparedInstructionMutation(
         client=client,
         pane_id=pane_or_error,
@@ -1196,9 +1248,11 @@ def _submit_instruction(
 def _validate_pending_choice(
     config: Config,
     request: CommandRequest,
-) -> Any | CommandEnvelope:
+) -> Any | PreSendFailure:
     if config.db_path is None:
-        return _backend_unavailable(request, "pending state store is unavailable")
+        return _safe_transient_pre_send(
+            _backend_unavailable(request, "pending state store is unavailable")
+        )
     params = request.params or {}
     try:
         validated = claim_backend_pending_choice(
@@ -1210,9 +1264,13 @@ def _validate_pending_choice(
             claim=False,
         )
     except Exception:
-        return _backend_unavailable(request, "pending state store is unavailable")
+        # The pending store raised; nothing was claimed or sent.
+        return _safe_transient_pre_send(
+            _backend_unavailable(request, "pending state store is unavailable")
+        )
     if validated.status != "validated" or not _pending_claim_has_exact_route(validated):
-        return _pending_changed_envelope(request)
+        # The pending interaction provably changed or is no longer answerable.
+        return _permanent_pre_send(_pending_changed_envelope(request))
     return validated
 
 
@@ -1692,29 +1750,39 @@ def submit_command(
             # changed target. Fail before any socket or backend work.
             return _duplicate_request(request)
         canonical = build_canonical_mutation(request, public_worker_id=worker.id)
-        pre_send_error = _worker_status_error(request, worker) or health_error
-        prepared: PreparedInstructionMutation | CommandEnvelope | None = None
-        if pre_send_error is None:
+        # A disallowed worker status or an unavailable backend is an authoritative
+        # observation of proven target unsuitability: a durable rejection is
+        # justified, and a same-ID retry replays it.
+        permanent_error = _worker_status_error(request, worker) or health_error
+        prepared: PreparedInstructionMutation | PreSendFailure | None = None
+        if permanent_error is None:
             prepared = _prepare_instruction(
                 config,
                 request,
                 worker,
                 socket_client_factory=socket_client_factory,
             )
+        # A safe transient preparation failure never began a send and never
+        # created durable authority. Keep the request ID retryable without
+        # reserving, so a command that was never sent is never silently dropped.
+        if isinstance(prepared, PreSendFailure) and prepared.is_transient:
+            if takeover is not None:
+                return _request_in_progress(request)
+            return prepared.envelope
         reservation = _reserve_canonical_request(config, request, canonical)
         if isinstance(reservation, CommandEnvelope):
             if isinstance(prepared, PreparedInstructionMutation):
                 _close_socket_client(prepared.client)
             return reservation
-        if pre_send_error is not None:
+        if permanent_error is not None:
             return _finish_before_send(
                 config,
                 request,
                 reservation,
-                pre_send_error,
+                permanent_error,
             )
-        if isinstance(prepared, CommandEnvelope):
-            return _finish_before_send(config, request, reservation, prepared)
+        if isinstance(prepared, PreSendFailure):
+            return _finish_before_send(config, request, reservation, prepared.envelope)
         assert isinstance(prepared, PreparedInstructionMutation)
         return _submit_instruction(
             config,
@@ -1724,7 +1792,7 @@ def submit_command(
             prepared,
         )
 
-    answer_pre_send_error: CommandEnvelope | None = None
+    answer_pre_send: PreSendFailure | None = None
     if takeover is not None:
         # Re-driving an abandoned answer reservation: the receipt already fixed
         # which worker this request answers, so a pending interaction that now
@@ -1735,36 +1803,51 @@ def submit_command(
             public_worker_id=existing_worker_id,
         )
         validated = _validate_pending_choice(config, request)
-        if isinstance(validated, CommandEnvelope):
-            answer_pre_send_error = validated
+        if isinstance(validated, PreSendFailure):
+            answer_pre_send = validated
         elif validated.worker_id != existing_worker_id:
-            answer_pre_send_error = _duplicate_request(request)
+            answer_pre_send = _permanent_pre_send(_duplicate_request(request))
     else:
         validated = _validate_pending_choice(config, request)
-        if isinstance(validated, CommandEnvelope):
+        if isinstance(validated, PreSendFailure):
+            # No reservation exists yet, so neither a transient nor a permanent
+            # validation failure writes a receipt here. Return it directly.
             if health_error is not None:
                 return health_error
-            return validated
+            return validated.envelope
         canonical = build_canonical_mutation(
             request,
             public_worker_id=validated.worker_id,
         )
 
+    # A safe transient pre-send failure (the pending store raised) never began a
+    # send. Keep it retryable under the same request ID without reserving.
+    if answer_pre_send is not None and answer_pre_send.is_transient:
+        if takeover is not None:
+            return _request_in_progress(request)
+        return answer_pre_send.envelope
+
     client_or_error: Any | CommandEnvelope | None = None
-    if answer_pre_send_error is None and health_error is None:
+    if answer_pre_send is None and health_error is None:
         client_or_error = _connect_socket(config, request, socket_client_factory)
+    if isinstance(client_or_error, CommandEnvelope):
+        # The socket could not be reached before any transmission -> safe
+        # transient. Stay retryable rather than reserving a durable rejection.
+        if takeover is not None:
+            return _request_in_progress(request)
+        return client_or_error
 
     reservation = _reserve_canonical_request(config, request, canonical)
     if isinstance(reservation, CommandEnvelope):
         if client_or_error is not None and not isinstance(client_or_error, CommandEnvelope):
             _close_socket_client(client_or_error)
         return reservation
-    if answer_pre_send_error is not None:
+    if answer_pre_send is not None:
         return _finish_before_send(
             config,
             request,
             reservation,
-            answer_pre_send_error,
+            answer_pre_send.envelope,
         )
     if health_error is not None:
         return _finish_before_send(
@@ -1772,13 +1855,6 @@ def submit_command(
             request,
             reservation,
             health_error,
-        )
-    if isinstance(client_or_error, CommandEnvelope):
-        return _finish_before_send(
-            config,
-            request,
-            reservation,
-            client_or_error,
         )
     assert client_or_error is not None
     return _answer_pending(
