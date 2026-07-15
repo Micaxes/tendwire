@@ -183,11 +183,13 @@ def test_parse_valid_result_error_and_event_envelopes() -> None:
     error = validate_response(parse_json_line(b'{"id":"req-2","error":{"message":"no"}}\n'))
     event = validate_event(
         parse_json_line(
-            b'{"id":"sub-1","event":"pane.output","payload":{"text":"hello"},"future":true}\n'
+            b'{"id":"sub-1","event":"pane.output_matched","data":{"text":"hello"}}\n'
         )
     )
     idless_event = validate_event(
-        parse_json_line(b'{"event":"pane.output","data":{"text":"hello"},"future":true}\n')
+        parse_json_line(
+            b'{"event":"pane.agent_status_changed","data":{"status":"blocked"}}\n'
+        )
     )
 
     assert is_result_response(result) is True
@@ -195,10 +197,16 @@ def test_parse_valid_result_error_and_event_envelopes() -> None:
     assert is_error_response(error) is True
     assert error_payload(error) == {"message": "no"}
     assert is_event(event) is True
-    assert event["payload"] == {"text": "hello"}
-    assert event["future"] is True
+    assert event == {
+        "id": "sub-1",
+        "event": "pane.output_matched",
+        "data": {"text": "hello"},
+    }
     assert is_event(idless_event) is True
-    assert idless_event["data"] == {"text": "hello"}
+    assert idless_event == {
+        "event": "pane.agent_status_changed",
+        "data": {"status": "blocked"},
+    }
 
 
 def test_parse_json_line_rejects_malformed_json() -> None:

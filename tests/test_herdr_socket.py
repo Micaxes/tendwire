@@ -330,8 +330,8 @@ def test_subscription_ack_events_and_stream_termination(tmp_path: Path) -> None:
 
 def test_subscription_accepts_uncorrelated_idless_event_data_frames(tmp_path: Path) -> None:
     events = [
-        {"event": "pane_agent_status_changed", "data": {"status": "blocked"}},
-        {"event": "pane_closed", "data": {"pane_id": "p-1"}},
+        {"event": "pane.agent_status_changed", "data": {"status": "blocked"}},
+        {"event": "pane.closed", "data": {"pane_id": "p-1"}},
     ]
 
     def handler(conn: _Connection) -> None:
@@ -346,6 +346,26 @@ def test_subscription_accepts_uncorrelated_idless_event_data_frames(tmp_path: Pa
 
         assert stream.ack == {"subscribed": True}
         assert list(stream) == events
+        client.close()
+
+
+def test_subscription_buffers_idless_event_before_correlated_ack(tmp_path: Path) -> None:
+    event = {
+        "event": "pane.output_matched",
+        "data": {"pane_id": "p-1"},
+    }
+
+    def handler(conn: _Connection) -> None:
+        request = conn.read_request()
+        conn.send_json(event)
+        conn.send_json({"id": request["id"], "result": {"subscribed": True}})
+
+    with _FakeHerdrServer(tmp_path, handler) as server:
+        client = HerdrSocketClient(str(server.path), timeout=1)
+        stream = client.events_subscribe(["pane.output_matched"])
+
+        assert stream.ack == {"subscribed": True}
+        assert list(stream) == [event]
         client.close()
 
 

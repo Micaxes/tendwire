@@ -223,9 +223,16 @@ class _SocketConnection:
 
 
 class _FakeHerdrSocketServer:
-    def __init__(self, tmp_path: Path, handler: Callable[[_SocketConnection], None]) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        handler: Callable[[_SocketConnection], None],
+        *,
+        connections: int = 1,
+    ) -> None:
         self.path = tmp_path / f"herdr-events-{time.monotonic_ns()}.sock"
         self.handler = handler
+        self.connections = connections
         self.requests: list[dict[str, Any]] = []
         self.errors: list[BaseException] = []
         self._ready = threading.Event()
@@ -235,7 +242,7 @@ class _FakeHerdrSocketServer:
     def __enter__(self) -> "_FakeHerdrSocketServer":
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(self.path))
-        listener.listen(1)
+        listener.listen(self.connections)
         listener.settimeout(0.2)
         self._listener = listener
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -259,9 +266,10 @@ class _FakeHerdrSocketServer:
         self._ready.set()
         try:
             assert self._listener is not None
-            conn, _addr = self._listener.accept()
-            with conn:
-                self.handler(_SocketConnection(conn, self.requests))
+            for _index in range(self.connections):
+                conn, _addr = self._listener.accept()
+                with conn:
+                    self.handler(_SocketConnection(conn, self.requests))
         except OSError:
             pass
         except BaseException as exc:
@@ -383,13 +391,12 @@ def test_startup_reconcile_uses_socket_client_persists_projection_and_private_bi
                 ]
             },
         }
-        for _index in range(4):
-            request = conn.read_request()
-            conn.send_json({"id": request["id"], "result": results[request["method"]]})
+        request = conn.read_request()
+        conn.send_json({"id": request["id"], "result": results[request["method"]]})
 
     config = _config(tmp_path, "socket-reconcile")
     init_store(Path(config.db_path))
-    with _FakeHerdrSocketServer(tmp_path, handler) as server:
+    with _FakeHerdrSocketServer(tmp_path, handler, connections=4) as server:
         backend = HerdrEventBackend(config, debounce_seconds=0)
         client = HerdrSocketClient(str(server.path), timeout=1)
         snapshot = backend.reconcile_once(client=client)

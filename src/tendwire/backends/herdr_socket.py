@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import socket
 import time
+from collections import deque
 from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
 
@@ -34,6 +35,7 @@ from .herdr_protocol import (
 
 _DEFAULT_TIMEOUT_SECONDS = 5.0
 _RECV_SIZE = 4096
+_MAX_PENDING_EVENTS = 1024
 
 
 class HerdrSocketError(HerdrProtocolError):
@@ -98,6 +100,7 @@ class HerdrSocketClient:
         self.timeout = self._validate_timeout(timeout)
         self._socket: socket.socket | None = None
         self._buffer = bytearray()
+        self._pending_events: deque[dict[str, Any]] = deque()
 
     def __enter__(self) -> "HerdrSocketClient":
         self.connect()
@@ -134,6 +137,7 @@ class HerdrSocketClient:
         sock = self._socket
         self._socket = None
         self._buffer.clear()
+        self._pending_events.clear()
         if sock is None:
             return
         try:
@@ -192,8 +196,11 @@ class HerdrSocketClient:
         )
 
     def read_event(self, subscription_id: str, *, timeout: float | None = None) -> dict[str, Any]:
-        deadline = self._deadline(timeout)
-        envelope = self._read_server_envelope(deadline=deadline)
+        envelope = (
+            self._pending_events.popleft()
+            if self._pending_events
+            else self._read_server_envelope(deadline=self._deadline(timeout))
+        )
         if not is_event(envelope):
             raise HerdrEnvelopeError("expected Herdr event envelope")
         if envelope.get("id") is not None:
@@ -318,15 +325,19 @@ class HerdrSocketClient:
             raise HerdrSocketDisconnectedError("Herdr socket disconnected during write") from exc
 
     def _read_response(self, request_id: str, *, deadline: float) -> dict[str, Any]:
-        envelope = self._read_server_envelope(deadline=deadline)
-        if is_event(envelope):
-            raise HerdrRequestIdMismatchError(
-                f"expected response for request {request_id!r}, got event envelope"
-            )
-        ensure_response_id(envelope, request_id)
-        if not (is_result_response(envelope) or is_error_response(envelope)):
-            raise HerdrEnvelopeError("expected Herdr response envelope")
-        return envelope
+        while True:
+            envelope = self._read_server_envelope(deadline=deadline)
+            if is_event(envelope):
+                if len(self._pending_events) >= _MAX_PENDING_EVENTS:
+                    raise HerdrEnvelopeError(
+                        "too many Herdr events arrived before the response"
+                    )
+                self._pending_events.append(envelope)
+                continue
+            ensure_response_id(envelope, request_id)
+            if not (is_result_response(envelope) or is_error_response(envelope)):
+                raise HerdrEnvelopeError("expected Herdr response envelope")
+            return envelope
 
     def _read_server_envelope(self, *, deadline: float) -> dict[str, Any]:
         line = self._read_line(deadline=deadline)

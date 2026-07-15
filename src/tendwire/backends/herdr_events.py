@@ -1012,9 +1012,16 @@ class HerdrEventBackend:
     def _call_list_method(self, client: Any, method_name: str) -> Any:
         method = getattr(client, method_name)
         try:
-            return method(timeout=self.config.herdr_timeout_seconds)
-        except TypeError:
-            return method()
+            try:
+                return method(timeout=self.config.herdr_timeout_seconds)
+            except TypeError:
+                return method()
+        finally:
+            # Herdr 0.7.x may close a list connection immediately after its
+            # response. Reconnect between authoritative read-only probes so a
+            # late close cannot race the next request after its write.
+            if hasattr(client, "close"):
+                client.close()
 
     def _subscribe_event_stream(self, client: Any) -> Any:
         if self.subscribe_method == HERDR_EVENTS_SUBSCRIBE_METHOD and hasattr(client, "events_subscribe"):
