@@ -13,23 +13,29 @@ from .core.actions import CommandContext, execute_command
 from .core.commands import (
     COMMAND_ENVELOPE_SCHEMA_VERSION,
     DISPOSITION_IN_PROGRESS,
+    DISPOSITION_NO_RECEIPT,
     DISPOSITION_TERMINAL_ACCEPTED,
     DISPOSITION_TERMINAL_REJECTED,
     DISPOSITION_TERMINAL_UNCERTAIN,
     STATUS_ACCEPTED,
+    STATUS_ANSWER_IN_PROGRESS,
     STATUS_AMBIGUOUS_BACKEND_TARGET,
     STATUS_AMBIGUOUS_TARGET,
     STATUS_BACKEND_FAILED,
     STATUS_BACKEND_UNAVAILABLE,
     STATUS_BACKEND_UNSUPPORTED,
     STATUS_DRY_RUN,
+    STATUS_DECISION_NOT_PENDING,
     STATUS_DUPLICATE_REQUEST,
+    STATUS_INVALID_SELECTION,
     STATUS_NOT_FOUND,
     STATUS_PENDING,
     STATUS_REJECTED,
     STATUS_REQUEST_STATE_UNCERTAIN,
     STATUS_RESOLVED,
     STATUS_STALE_TARGET,
+    STATUS_UNKNOWN_WORKER,
+    STATUS_UNSUPPORTED_DECISION,
     CanonicalMutation,
     CommandEnvelope,
     CommandRequest,
@@ -44,10 +50,13 @@ from .core.commands import (
 )
 from .core.models import BackendHealth, Snapshot, Worker, WorkerBinding
 from .core.projector import project_from_observations
+from .backends.herdr_decision import calibrate_decision_steps
 from .store.sqlite import (
     abandon_backend_pending_choice_claim,
+    abandon_command_request_reservation,
     backend_pending_choice_terminal_effect,
     claim_backend_pending_choice,
+    claim_backend_pending_decision,
     command_pending_turn_terminal_effect,
     command_reservation_is_live,
     envelope_to_receipt_json,
@@ -59,11 +68,14 @@ from .store.sqlite import (
     reserve_command_request,
     reserve_terminal_command_replay,
     start_backend_pending_choice_send,
+    start_backend_pending_decision_send,
 )
 
 
 HERDR_BACKEND = "herdr"
-_MUTATING_ACTIONS = frozenset({"send_instruction", "answer_pending"})
+_MUTATING_ACTIONS = frozenset(
+    {"send_instruction", "answer_pending", "answer_decision"}
+)
 _LEGACY_V0_REPLAY_WORKER_ID = "legacy-v0-replay-only"
 _PENDING_CHANGED_MESSAGE = "pending interaction changed or is no longer answerable"
 _DISALLOWED_SEND_STATUSES = frozenset({"closed", "failed", "unknown"})
@@ -394,6 +406,27 @@ def _request_in_progress(request: CommandRequest) -> CommandEnvelope:
     )
 
 
+def _answer_in_progress(
+    request: CommandRequest,
+    *,
+    receipt_reserved: bool = False,
+) -> CommandEnvelope:
+    return CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status=STATUS_ANSWER_IN_PROGRESS,
+        disposition=(
+            DISPOSITION_IN_PROGRESS
+            if receipt_reserved
+            else DISPOSITION_NO_RECEIPT
+        ),
+        error=error_value(
+            STATUS_ANSWER_IN_PROGRESS,
+            "another request is currently answering this decision",
+        ),
+    )
+
+
 def _duplicate_request(request: CommandRequest) -> CommandEnvelope:
     return CommandEnvelope.from_result(
         request,
@@ -474,6 +507,82 @@ def _same_pending_route(left: Any, right: Any) -> bool:
     )
 
 
+def _decision_failure_envelope(
+    request: CommandRequest,
+    status: str,
+) -> CommandEnvelope:
+    messages = {
+        STATUS_ANSWER_IN_PROGRESS: "another request is currently answering this decision",
+        STATUS_DECISION_NOT_PENDING: "decision is not the worker's current pending decision",
+        STATUS_UNKNOWN_WORKER: "target worker does not exist or is not open",
+        STATUS_INVALID_SELECTION: "selection is invalid for the current decision",
+        STATUS_UNSUPPORTED_DECISION: "multi-question decisions are not supported",
+    }
+    return CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status=status,
+        error=error_value(status, messages[status]),
+    )
+
+
+def _decision_claim_has_exact_route(claim: Any) -> bool:
+    return (
+        isinstance(getattr(claim, "worker_id", None), str)
+        and bool(claim.worker_id)
+        and isinstance(getattr(claim, "worker_fingerprint", None), str)
+        and bool(claim.worker_fingerprint)
+        and isinstance(getattr(claim, "binding_private_fingerprint", None), str)
+        and bool(claim.binding_private_fingerprint)
+        and isinstance(getattr(claim, "turn_target_value", None), str)
+        and bool(claim.turn_target_value.strip())
+        and isinstance(getattr(claim, "decision_ref", None), str)
+        and bool(claim.decision_ref)
+        and getattr(claim, "decision_kind", None) in {"single", "multi", "plan"}
+        and isinstance(getattr(claim, "option_count", None), int)
+        and not isinstance(claim.option_count, bool)
+        and claim.option_count >= 1
+        and isinstance(getattr(claim, "option_refs", None), tuple)
+        and (
+            (claim.text is None and bool(claim.option_refs))
+            or (
+                isinstance(claim.text, str)
+                and bool(claim.text)
+                and not claim.option_refs
+            )
+        )
+    )
+
+
+def _same_decision_route(left: Any, right: Any) -> bool:
+    return (
+        _decision_claim_has_exact_route(left)
+        and _decision_claim_has_exact_route(right)
+        and (
+            left.worker_id,
+            left.worker_fingerprint,
+            left.binding_private_fingerprint,
+            left.turn_target_value,
+            left.decision_ref,
+            left.decision_kind,
+            left.option_count,
+            left.option_refs,
+            left.text,
+        )
+        == (
+            right.worker_id,
+            right.worker_fingerprint,
+            right.binding_private_fingerprint,
+            right.turn_target_value,
+            right.decision_ref,
+            right.decision_kind,
+            right.option_count,
+            right.option_refs,
+            right.text,
+        )
+    )
+
+
 class PreSendCertainty(Enum):
     """How a pre-send failure must be classified before any external mutation.
 
@@ -532,6 +641,25 @@ def _abandon_pending_claim(config: Config, claim_token: str | None) -> bool:
             config.db_path,
             config.host_id,
             claim_token,
+        )
+    except Exception:
+        return False
+
+
+def _abandon_request_reservation(
+    config: Config,
+    request: CommandRequest,
+    reservation: ReservedCommandMutation,
+) -> bool:
+    if config.db_path is None:
+        return False
+    try:
+        return abandon_command_request_reservation(
+            config.db_path,
+            host_id=config.host_id,
+            request_id=request.request_id or "",
+            canonical_fingerprint=reservation.canonical.fingerprint,
+            owner_token=reservation.owner_token,
         )
     except Exception:
         return False
@@ -1452,6 +1580,250 @@ def _answer_pending(
     )
 
 
+def _validate_pending_decision(
+    config: Config,
+    request: CommandRequest,
+) -> Any | PreSendFailure:
+    if config.db_path is None:
+        return _safe_transient_pre_send(
+            _backend_unavailable(request, "pending state store is unavailable")
+        )
+    params = request.params or {}
+    target = request.target or {}
+    try:
+        validated = claim_backend_pending_decision(
+            config.db_path,
+            config.host_id,
+            str(target.get("worker_id") or ""),
+            str(params.get("decision_ref") or ""),
+            params.get("selection")
+            if isinstance(params.get("selection"), Mapping)
+            else {},
+            claim=False,
+        )
+    except Exception:
+        return _safe_transient_pre_send(
+            _backend_unavailable(request, "pending state store is unavailable")
+        )
+    if validated.status == "validated" and _decision_claim_has_exact_route(validated):
+        return validated
+    status = {
+        "already_claimed": STATUS_ANSWER_IN_PROGRESS,
+        "unknown_worker": STATUS_UNKNOWN_WORKER,
+        "invalid_selection": STATUS_INVALID_SELECTION,
+        "unsupported_decision": STATUS_UNSUPPORTED_DECISION,
+    }.get(validated.status, STATUS_DECISION_NOT_PENDING)
+    return _permanent_pre_send(_decision_failure_envelope(request, status))
+
+
+def _claim_pending_decision(
+    config: Config,
+    request: CommandRequest,
+    validated: Any,
+) -> Any | CommandEnvelope:
+    assert config.db_path is not None
+    params = request.params or {}
+    target = request.target or {}
+    try:
+        claim = claim_backend_pending_decision(
+            config.db_path,
+            config.host_id,
+            str(target.get("worker_id") or ""),
+            str(params.get("decision_ref") or ""),
+            params.get("selection")
+            if isinstance(params.get("selection"), Mapping)
+            else {},
+            claim=True,
+        )
+    except Exception:
+        return _backend_uncertain(request, "pending decision claim state is uncertain")
+    if (
+        claim.status == "claimed"
+        and isinstance(claim.claim_token, str)
+        and claim.claim_token
+    ):
+        if _same_decision_route(validated, claim):
+            return claim
+    status = {
+        "already_claimed": STATUS_ANSWER_IN_PROGRESS,
+        "unknown_worker": STATUS_UNKNOWN_WORKER,
+        "invalid_selection": STATUS_INVALID_SELECTION,
+        "unsupported_decision": STATUS_UNSUPPORTED_DECISION,
+    }.get(claim.status, STATUS_DECISION_NOT_PENDING)
+    return _decision_failure_envelope(request, status)
+
+
+def _submit_decision_calibration(
+    client: Any,
+    pane_id: str,
+    decision: Any,
+    *,
+    timeout: float,
+) -> None:
+    steps = calibrate_decision_steps(
+        kind=decision.decision_kind,
+        option_count=decision.option_count,
+        option_refs=decision.option_refs,
+        text=decision.text,
+    )
+    for step in steps:
+        if step.operation == "keys":
+            _socket_request(
+                client,
+                "pane.send_keys",
+                {"pane_id": pane_id, "keys": list(step.keys)},
+                timeout=timeout,
+            )
+        elif step.operation == "text":
+            _socket_request(
+                client,
+                "pane.send_text",
+                {"pane_id": pane_id, "text": step.text},
+                timeout=timeout,
+            )
+        else:
+            _socket_request(
+                client,
+                "pane.send_input",
+                {"pane_id": pane_id, "text": step.text, "keys": list(step.keys)},
+                timeout=timeout,
+            )
+
+
+def _decision_public_result(
+    request: CommandRequest,
+    claim: Any,
+) -> dict[str, Any]:
+    return {
+        "target": {"worker_id": claim.worker_id},
+        "decision": {"decision_ref": (request.params or {}).get("decision_ref")},
+        "delivery_state": "submitted",
+        "transport_state": "submitted",
+        "observed_pending_state": "pending_observation",
+    }
+
+
+def _answer_decision(
+    config: Config,
+    request: CommandRequest,
+    validated: Any,
+    reservation: ReservedCommandMutation,
+    client: Any,
+) -> CommandEnvelope:
+    assert config.db_path is not None
+    claim = _claim_pending_decision(config, request, validated)
+    if isinstance(claim, CommandEnvelope):
+        _close_socket_client(client)
+        if claim.status == STATUS_ANSWER_IN_PROGRESS:
+            _abandon_request_reservation(config, request, reservation)
+            return _answer_in_progress(request, receipt_reserved=True)
+        return _finish_before_send(config, request, reservation, claim)
+    claim_token = claim.claim_token
+
+    send_start_error = _mark_request_send_started(
+        config,
+        request,
+        reservation,
+        binding_fingerprint=claim.binding_private_fingerprint,
+    )
+    if send_start_error is not None:
+        _close_socket_client(client)
+        claim_released = _abandon_pending_claim(config, claim_token)
+        if send_start_error.status == STATUS_PENDING and not claim_released:
+            return _finish_before_send(
+                config,
+                request,
+                reservation,
+                _backend_uncertain(
+                    request,
+                    "pending decision claim could not be safely released",
+                ),
+            )
+        return send_start_error
+
+    try:
+        started = start_backend_pending_decision_send(
+            config.db_path,
+            config.host_id,
+            claim_token,
+        )
+    except Exception:
+        _close_socket_client(client)
+        _abandon_pending_claim(config, claim_token)
+        return _finish_request(
+            config,
+            request,
+            reservation,
+            _backend_uncertain(request, "pending decision start state is uncertain"),
+            expected_state="send_started",
+            terminal_state="uncertain",
+            terminal_effect=_uncertain_pending_effect(config, claim_token),
+        )
+    if getattr(started, "status", None) != "started" or not _same_decision_route(claim, started):
+        _close_socket_client(client)
+        _abandon_pending_claim(config, claim_token)
+        return _finish_request(
+            config,
+            request,
+            reservation,
+            _backend_uncertain(
+                request,
+                "pending decision state is uncertain after send start",
+            ),
+            expected_state="send_started",
+            terminal_state="uncertain",
+            terminal_effect=_uncertain_pending_effect(config, claim_token),
+        )
+
+    try:
+        _submit_decision_calibration(
+            client,
+            started.turn_target_value.strip(),
+            started,
+            timeout=config.herdr_timeout_seconds,
+        )
+    except Exception:  # noqa: BLE001
+        return _finish_request(
+            config,
+            request,
+            reservation,
+            _backend_uncertain(
+                request,
+                "Herdr decision input state is uncertain after send start",
+            ),
+            expected_state="send_started",
+            terminal_state="uncertain",
+            terminal_effect=_uncertain_pending_effect(config, claim_token),
+        )
+    finally:
+        _close_socket_client(client)
+
+    accepted = CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_ACCEPTED,
+        disposition=DISPOSITION_TERMINAL_ACCEPTED,
+        result=_decision_public_result(request, started),
+    )
+    try:
+        effect = backend_pending_choice_terminal_effect(
+            host_id=config.host_id,
+            claim_token=claim_token,
+            accepted=True,
+        )
+    except Exception:
+        return _recover_request(config, request, reservation.canonical)
+    return _finish_request(
+        config,
+        request,
+        reservation,
+        accepted,
+        expected_state="send_started",
+        terminal_state="accepted",
+        terminal_effect=effect,
+    )
+
+
 def _execute_non_mutating(config: Config, request: CommandRequest) -> CommandEnvelope:
     if request.action == "noop":
         return execute_command(request, CommandContext(host_id=config.host_id, workers=[]))
@@ -1477,6 +1849,17 @@ def _mutation_dry_run(request: CommandRequest) -> CommandEnvelope:
             },
         )
     params = request.params or {}
+    if request.action == "answer_decision":
+        return CommandEnvelope.from_result(
+            request,
+            ok=True,
+            status=STATUS_DRY_RUN,
+            result={
+                "target": dict(request.target or {}),
+                "decision": {"decision_ref": params.get("decision_ref")},
+                "delivery_state": "not_submitted",
+            },
+        )
     return CommandEnvelope.from_result(
         request,
         ok=True,
@@ -1569,6 +1952,11 @@ def _proven_replay_worker_id(
         return stored_worker_id or _LEGACY_V0_REPLAY_WORKER_ID
     if not stored_worker_id:
         return _receipt_malformed(request)
+    if request.action == "answer_decision":
+        explicit_worker_id = _direct_replay_worker_id(request)
+        if explicit_worker_id != stored_worker_id:
+            return _duplicate_request(request)
+        return stored_worker_id
     if request.action != "send_instruction":
         return stored_worker_id
 
@@ -1824,6 +2212,11 @@ def submit_command(
         )
 
     answer_pre_send: PreSendFailure | None = None
+    validate_answer = (
+        _validate_pending_decision
+        if request.action == "answer_decision"
+        else _validate_pending_choice
+    )
     if takeover is not None:
         # Re-driving an abandoned answer reservation: the receipt already fixed
         # which worker this request answers, so a pending interaction that now
@@ -1833,17 +2226,17 @@ def submit_command(
             request,
             public_worker_id=existing_worker_id,
         )
-        validated = _validate_pending_choice(config, request)
+        validated = validate_answer(config, request)
         if isinstance(validated, PreSendFailure):
             answer_pre_send = validated
         elif validated.worker_id != existing_worker_id:
             answer_pre_send = _permanent_pre_send(_duplicate_request(request))
     else:
-        validated = _validate_pending_choice(config, request)
+        validated = validate_answer(config, request)
         if isinstance(validated, PreSendFailure):
             # No reservation exists yet, so neither a transient nor a permanent
             # validation failure writes a receipt here. Return it directly.
-            if health_error is not None:
+            if health_error is not None and request.action != "answer_decision":
                 return health_error
             return validated.envelope
         canonical = build_canonical_mutation(
@@ -1857,6 +2250,14 @@ def submit_command(
         if takeover is not None:
             return _request_in_progress(request)
         return answer_pre_send.envelope
+    if (
+        answer_pre_send is not None
+        and answer_pre_send.envelope.status == STATUS_ANSWER_IN_PROGRESS
+    ):
+        # Another request owns the still-live decision claim. Keep this
+        # abandoned reservation nonterminal so it can take over after that
+        # claim is released or expires.
+        return _answer_in_progress(request, receipt_reserved=True)
 
     client_or_error: Any | CommandEnvelope | None = None
     if answer_pre_send is None and health_error is None:
@@ -1888,6 +2289,14 @@ def submit_command(
             health_error,
         )
     assert client_or_error is not None
+    if request.action == "answer_decision":
+        return _answer_decision(
+            config,
+            request,
+            validated,
+            reservation,
+            client_or_error,
+        )
     return _answer_pending(
         config,
         request,

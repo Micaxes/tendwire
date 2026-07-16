@@ -993,6 +993,13 @@ def _run_herdres_phase(
             if herdres_root.resolve() not in module_path.parents:
                 raise RuntimeError("herdres_origin_failed")
         origin_ok = True
+        # The paired Herdres owns its turn page size (it changed 50 -> 100 in
+        # luminexord/herdres 31c3152); derive the expected command sequence from
+        # the paired checkout instead of hardcoding a value that breaks the
+        # pairing every time Herdres retunes it.
+        turn_page_limit = getattr(tendwire_client, "TURN_LIST_PAGE_LIMIT", 50)
+        if type(turn_page_limit) is not int or turn_page_limit < 1:
+            raise RuntimeError("herdres_turn_page_limit_invalid")
         runtime = source_sync.SyncRuntime(
             tendwire=tendwire_client.TendwireClient(timeout=10.0),
             telegram=telegram_delivery.TelegramClient(token="", dry_run=True),
@@ -1043,7 +1050,7 @@ def _run_herdres_phase(
                  "--schema-version",
                  "2",
                  "--limit",
-                 "50",
+                 str(turn_page_limit),
                  "--json",
              ],
              ["--socket-path", str(socket_path), "pending", "--json"])

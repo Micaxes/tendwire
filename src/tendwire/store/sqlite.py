@@ -54,7 +54,7 @@ from ..local_state import (
     verify_created_private_sqlite_replacement_at,
     verify_entry_identity,
 )
-from ..core.commands import CommandEnvelope, is_selector_proof
+from ..core.commands import CommandEnvelope, is_selector_proof, validate_instruction_text
 from ..core.models import (
     FINGERPRINT_HEX_CHARS,
     SCHEMA_VERSION,
@@ -191,6 +191,50 @@ class BackendPendingChoiceSend:
     binding_private_fingerprint: str | None = None
     turn_target_value: str | None = None
     picker_ordinal: int | None = None
+
+
+@dataclass(frozen=True)
+class BackendPendingDecisionClaim:
+    status: Literal[
+        "claimed",
+        "validated",
+        "unknown_worker",
+        "decision_not_pending",
+        "invalid_selection",
+        "unsupported_decision",
+        "already_claimed",
+    ]
+    claim_token: str | None = None
+    worker_id: str | None = None
+    worker_fingerprint: str | None = None
+    binding_private_fingerprint: str | None = None
+    turn_target_value: str | None = None
+    decision_ref: str | None = None
+    decision_kind: Literal["single", "multi", "plan"] | None = None
+    option_count: int | None = None
+    option_refs: tuple[str, ...] = ()
+    text: str | None = None
+
+
+@dataclass(frozen=True)
+class BackendPendingDecisionSend:
+    status: Literal[
+        "started",
+        "not_found",
+        "stale",
+        "changed",
+        "binding_changed",
+        "already_started",
+    ]
+    worker_id: str | None = None
+    worker_fingerprint: str | None = None
+    binding_private_fingerprint: str | None = None
+    turn_target_value: str | None = None
+    decision_ref: str | None = None
+    decision_kind: Literal["single", "multi", "plan"] | None = None
+    option_count: int | None = None
+    option_refs: tuple[str, ...] = ()
+    text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -15625,6 +15669,57 @@ def _update_persisted_turn_row(
     return material_changed, item
 
 
+def _normalize_pending_decision_meta(value: Any) -> dict[str, Any]:
+    """Validate the connector-facing semantic decision contract."""
+    if not isinstance(value, Mapping) or set(value) != {
+        "decision_ref",
+        "kind",
+        "prompt",
+        "options",
+        "multi_select",
+        "question_count",
+    }:
+        raise ValueError("invalid backend pending decision")
+    decision_ref = value.get("decision_ref")
+    kind = value.get("kind")
+    prompt = value.get("prompt")
+    options = value.get("options")
+    multi_select = value.get("multi_select")
+    question_count = value.get("question_count")
+    if (
+        type(decision_ref) is not str
+        or not decision_ref.strip()
+        or kind not in {"single", "multi", "plan"}
+        or type(prompt) is not str
+        or not prompt.strip()
+        or not isinstance(options, list)
+        or not options
+        or not isinstance(multi_select, bool)
+        or multi_select is not (kind == "multi")
+        or not isinstance(question_count, int)
+        or isinstance(question_count, bool)
+        or question_count < 1
+    ):
+        raise ValueError("invalid backend pending decision")
+    normalized_options: list[dict[str, str]] = []
+    for ordinal, option in enumerate(options, 1):
+        if not isinstance(option, Mapping) or set(option) != {"ref", "label"}:
+            raise ValueError("invalid backend pending decision option")
+        ref = option.get("ref")
+        label = option.get("label")
+        if ref != str(ordinal) or type(label) is not str or not label.strip():
+            raise ValueError("invalid backend pending decision option")
+        normalized_options.append({"ref": ref, "label": label})
+    return {
+        "decision_ref": decision_ref,
+        "kind": kind,
+        "prompt": prompt,
+        "options": normalized_options,
+        "multi_select": multi_select,
+        "question_count": question_count,
+    }
+
+
 def _normalize_backend_pending_payload(
     pending: Mapping[str, Any],
     choice_routes: tuple[tuple[str, int], ...],
@@ -15673,11 +15768,16 @@ def _normalize_backend_pending_payload(
         type(ordinal) is not int or ordinal < 1 for ordinal in route_map.values()
     ):
         raise ValueError("backend pending choices do not match private routes")
+    normalized_meta = sanitize_public_mapping(meta)
+    if "decision" in normalized_meta:
+        normalized_meta["decision"] = _normalize_pending_decision_meta(
+            normalized_meta["decision"]
+        )
     normalized = {
         "question": question,
         "kind": kind,
         "choices": normalized_choices,
-        "meta": sanitize_public_mapping(meta),
+        "meta": normalized_meta,
     }
     return normalized, _canonical_json(route_map)
 
@@ -15894,6 +15994,60 @@ def _apply_backend_pending_observation_conn(
         )
         return True
 
+    if observation.kind == "read_succeeded_unsupported_decision":
+        unsupported_payload = _canonical_json({"unsupported_decision": True})
+        changed = row is None or (
+            str(row[0]),
+            str(row[5]),
+            str(row[6]),
+            stored_binding,
+            stored_target,
+        ) != (
+            unsupported_payload,
+            "invalid",
+            "fresh",
+            effective_binding,
+            effective_target,
+        )
+        conn.execute(
+            """
+            INSERT INTO backend_pending (
+                host_id, worker_id, payload_json, observed_at, revision_digest,
+                choice_routes_json, binding_private_fingerprint,
+                observed_turn_target_value, observation_state, freshness,
+                last_success_at, last_failure_at, grace_deadline, updated_at
+            ) VALUES (?, ?, ?, ?, '', '{}', ?, ?, 'invalid', 'fresh',
+                      ?, NULL, NULL, ?)
+            ON CONFLICT(host_id, worker_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                observed_at = excluded.observed_at,
+                revision_digest = '', choice_routes_json = '{}',
+                binding_private_fingerprint =
+                    excluded.binding_private_fingerprint,
+                observed_turn_target_value =
+                    excluded.observed_turn_target_value,
+                observation_state = 'invalid', freshness = 'fresh',
+                last_success_at = excluded.last_success_at,
+                last_failure_at = NULL, grace_deadline = NULL,
+                updated_at = excluded.updated_at
+            """,
+            (
+                *key,
+                unsupported_payload,
+                current_time,
+                effective_binding,
+                effective_target,
+                current_time,
+                current_time,
+            ),
+        )
+        conn.execute(
+            "DELETE FROM backend_pending_claims "
+            "WHERE host_id = ? AND worker_id = ?",
+            key,
+        )
+        return changed
+
     if observation.kind == "read_succeeded_invalid_prompt":
         changed = row is None or (
             str(row[5]),
@@ -16004,6 +16158,19 @@ def _apply_backend_pending_observation_conn(
         )
         for choice in observation.choices
     )
+    public_meta: dict[str, Any] = {"source": "backend"}
+    if observation.decision_kind is not None:
+        public_meta["decision"] = {
+            "decision_ref": f"decision-{revision_digest}",
+            "kind": observation.decision_kind,
+            "prompt": observation.question,
+            "options": [
+                {"ref": str(ordinal), "label": label}
+                for ordinal, label in enumerate(observation.decision_options, 1)
+            ],
+            "multi_select": observation.decision_multi_select,
+            "question_count": observation.decision_question_count,
+        }
     public_payload = {
         "question": observation.question,
         "kind": observation.pending_kind or "question",
@@ -16011,7 +16178,7 @@ def _apply_backend_pending_observation_conn(
             {"choice_id": choice_id, "label": label}
             for choice_id, label, _ordinal in persisted_choices
         ],
-        "meta": {"source": "backend"},
+        "meta": public_meta,
     }
     routes = tuple(
         (choice_id, ordinal)
@@ -16116,12 +16283,27 @@ def _merge_backend_pending_conn(
             for ordinal, choice in enumerate(normalized_choices, 1)
         )
         question = str(clean.get("question") or clean.get("kind") or "Pending action")
+        decision: dict[str, Any] | None = None
+        clean_meta = clean.get("meta")
+        if isinstance(clean_meta, Mapping) and "decision" in clean_meta:
+            decision = _normalize_pending_decision_meta(clean_meta["decision"])
         observation = PendingObservation(
             "open_prompt",
             question=question,
             pending_kind=str(clean.get("kind") or "question"),
             choices=choices,
             revision_digest=stable_fingerprint({"legacy_pending_revision": clean}),
+            decision_kind=(decision or {}).get("kind"),
+            decision_options=tuple(
+                str(option["label"])
+                for option in (decision or {}).get("options", [])
+            ),
+            decision_multi_select=bool(
+                (decision or {}).get("multi_select", False)
+            ),
+            decision_question_count=int(
+                (decision or {}).get("question_count", 0)
+            ),
         )
     return _apply_backend_pending_observation_conn(
         conn,
@@ -16453,10 +16635,22 @@ def pending_payload_from_store(
         updated_at,
         observation_state,
     ) in backend_rows:
-        if str(observation_state) == "none":
+        state = str(observation_state)
+        if state == "none":
             suppressed_worker_ids.add(str(worker_id))
             continue
-        if str(observation_state) != "open":
+        if state == "invalid":
+            try:
+                invalid_payload = json.loads(payload_json)
+            except (TypeError, ValueError):
+                invalid_payload = None
+            if (
+                isinstance(invalid_payload, Mapping)
+                and invalid_payload.get("unsupported_decision") is True
+            ):
+                suppressed_worker_ids.add(str(worker_id))
+            continue
+        if state != "open":
             continue
         try:
             pending = json.loads(payload_json)
@@ -16714,6 +16908,372 @@ def claim_backend_pending_choice(
             )
             conn.commit()
             return BackendPendingChoiceClaim("claimed", claim_token=token, **fields)
+        except Exception:
+            conn.rollback()
+            raise
+
+
+_DECISION_CLAIM_PREFIX = "decision:"
+
+
+def _decision_from_pending_row(
+    payload_json: Any,
+    routes_json: Any,
+    revision_digest: Any,
+) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(payload_json)
+        routes = json.loads(routes_json)
+        if not isinstance(payload, Mapping) or not isinstance(routes, Mapping):
+            return None
+        normalized, _ = _normalize_backend_pending_payload(
+            payload,
+            tuple((str(key), int(value)) for key, value in routes.items()),
+        )
+        meta = normalized.get("meta")
+        decision = meta.get("decision") if isinstance(meta, Mapping) else None
+        if not isinstance(decision, Mapping):
+            return None
+        normalized_decision = _normalize_pending_decision_meta(decision)
+        if normalized_decision["decision_ref"] != f"decision-{revision_digest}":
+            return None
+        return normalized_decision
+    except (TypeError, ValueError):
+        return None
+
+
+def _validated_decision_selection(
+    decision: Mapping[str, Any],
+    selection: Any,
+) -> tuple[tuple[str, ...], str | None] | None:
+    if not isinstance(selection, Mapping) or len(selection) != 1:
+        return None
+    kind = decision.get("kind")
+    valid_refs = {
+        str(option.get("ref"))
+        for option in decision.get("options", [])
+        if isinstance(option, Mapping)
+    }
+    if set(selection) == {"option_refs"}:
+        raw_refs = selection.get("option_refs")
+        if not isinstance(raw_refs, list) or not raw_refs or any(
+            type(ref) is not str for ref in raw_refs
+        ):
+            return None
+        refs = tuple(raw_refs)
+        if len(refs) != len(set(refs)) or any(ref not in valid_refs for ref in refs):
+            return None
+        if kind in {"single", "plan"} and len(refs) != 1:
+            return None
+        if kind == "multi" and len(refs) < 1:
+            return None
+        return refs, None
+    if set(selection) == {"text"}:
+        text = selection.get("text")
+        if kind != "single" or validate_instruction_text(text) is not None:
+            return None
+        return (), str(text)
+    return None
+
+
+def _encode_decision_claim_selection(
+    option_refs: tuple[str, ...],
+    text: str | None,
+) -> str:
+    selection: dict[str, Any]
+    if text is None:
+        selection = {"option_refs": list(option_refs)}
+    else:
+        selection = {"text": text}
+    return _DECISION_CLAIM_PREFIX + _canonical_json(selection)
+
+
+def _decode_decision_claim_selection(value: Any) -> Mapping[str, Any] | None:
+    if not isinstance(value, str) or not value.startswith(_DECISION_CLAIM_PREFIX):
+        return None
+    try:
+        decoded = json.loads(value[len(_DECISION_CLAIM_PREFIX) :])
+    except (TypeError, ValueError):
+        return None
+    return decoded if isinstance(decoded, Mapping) else None
+
+
+def claim_backend_pending_decision(
+    db_path: Path | str,
+    host_id: str,
+    worker_id: str,
+    decision_ref: str,
+    selection: Mapping[str, Any],
+    *,
+    claim: bool = True,
+    observed_at: str | None = None,
+    claim_lease_seconds: float = BACKEND_PENDING_CLAIM_LEASE_SECONDS,
+) -> BackendPendingDecisionClaim:
+    """Validate and optionally claim one worker's exact current decision."""
+    if not _sqlite_store_exists(db_path):
+        return BackendPendingDecisionClaim("decision_not_pending")
+    current_time, _ = _pending_observed_time(observed_at)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE" if claim else "BEGIN")
+        try:
+            snapshot_row = conn.execute(
+                "SELECT payload FROM snapshots WHERE host_id = ? ORDER BY id DESC LIMIT 1",
+                (str(host_id),),
+            ).fetchone()
+            try:
+                snapshot = (
+                    Snapshot.from_dict(json.loads(snapshot_row[0]))
+                    if snapshot_row is not None
+                    else None
+                )
+            except Exception:
+                snapshot = None
+            worker = next(
+                (
+                    item
+                    for item in (snapshot.workers if snapshot is not None else [])
+                    if item.id == str(worker_id)
+                ),
+                None,
+            )
+            if worker is None or worker.status in {"closed", "failed", "unknown"}:
+                conn.rollback()
+                return BackendPendingDecisionClaim("unknown_worker")
+            row = conn.execute(
+                """
+                SELECT payload_json, choice_routes_json, revision_digest,
+                       freshness, binding_private_fingerprint,
+                       observed_turn_target_value, observation_state
+                FROM backend_pending
+                WHERE host_id = ? AND worker_id = ?
+                """,
+                (str(host_id), str(worker_id)),
+            ).fetchone()
+            if row is not None and str(row[6]) == "invalid":
+                try:
+                    unsupported = json.loads(str(row[0]))
+                except (TypeError, ValueError):
+                    unsupported = None
+                if (
+                    isinstance(unsupported, Mapping)
+                    and unsupported.get("unsupported_decision") is True
+                ):
+                    conn.rollback()
+                    return BackendPendingDecisionClaim("unsupported_decision")
+            if row is None or str(row[6]) != "open" or str(row[3]) != "fresh":
+                conn.rollback()
+                return BackendPendingDecisionClaim("decision_not_pending")
+            context = _backend_pending_claim_context_conn(
+                conn,
+                str(host_id),
+                str(worker_id),
+                str(row[4]),
+                str(row[5]),
+                observed_at=current_time,
+            )
+            decision = _decision_from_pending_row(row[0], row[1], row[2])
+            if (
+                context is None
+                or decision is None
+                or decision.get("decision_ref") != str(decision_ref)
+            ):
+                conn.rollback()
+                return BackendPendingDecisionClaim("decision_not_pending")
+            if int(decision["question_count"]) > 1:
+                conn.rollback()
+                return BackendPendingDecisionClaim("unsupported_decision")
+            validated_selection = _validated_decision_selection(decision, selection)
+            if validated_selection is None:
+                conn.rollback()
+                return BackendPendingDecisionClaim("invalid_selection")
+            option_refs, text = validated_selection
+            existing = conn.execute(
+                """
+                SELECT state, claimed_at
+                FROM backend_pending_claims
+                WHERE host_id = ? AND worker_id = ?
+                """,
+                (str(host_id), str(worker_id)),
+            ).fetchone()
+            if existing is not None:
+                reclaimable = (
+                    str(existing[0]) == "claimed"
+                    and _backend_pending_claim_expired(
+                        existing[1], current_time, claim_lease_seconds
+                    )
+                )
+                if reclaimable and claim:
+                    conn.execute(
+                        """
+                        DELETE FROM backend_pending_claims
+                        WHERE host_id = ? AND worker_id = ? AND state = 'claimed'
+                          AND claimed_at = ?
+                        """,
+                        (str(host_id), str(worker_id), str(existing[1])),
+                    )
+                elif not reclaimable:
+                    conn.rollback()
+                    return BackendPendingDecisionClaim("already_claimed")
+            option_count = len(decision["options"])
+            picker_ordinal = int(option_refs[0]) if option_refs else option_count + 1
+            fields = {
+                "worker_id": str(worker_id),
+                "worker_fingerprint": context[2],
+                "binding_private_fingerprint": context[1],
+                "turn_target_value": context[3],
+                "decision_ref": str(decision_ref),
+                "decision_kind": decision["kind"],
+                "option_count": option_count,
+                "option_refs": option_refs,
+                "text": text,
+            }
+            if not claim:
+                conn.rollback()
+                return BackendPendingDecisionClaim("validated", **fields)
+            token = secrets.token_urlsafe(32)
+            conn.execute(
+                """
+                INSERT INTO backend_pending_claims (
+                    host_id, worker_id, claim_token, revision_digest, choice_id,
+                    picker_ordinal, worker_fingerprint,
+                    binding_private_fingerprint, turn_target_value, state,
+                    claimed_at, send_started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, NULL)
+                """,
+                (
+                    str(host_id), str(worker_id), token, str(row[2]),
+                    _encode_decision_claim_selection(option_refs, text),
+                    picker_ordinal, context[2], context[1], context[3], current_time,
+                ),
+            )
+            conn.commit()
+            return BackendPendingDecisionClaim(
+                "claimed", claim_token=token, **fields
+            )
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def start_backend_pending_decision_send(
+    db_path: Path | str,
+    host_id: str,
+    claim_token: str,
+    *,
+    observed_at: str | None = None,
+    claim_lease_seconds: float = BACKEND_PENDING_CLAIM_LEASE_SECONDS,
+) -> BackendPendingDecisionSend:
+    """CAS a decision claim against its current prompt and private binding."""
+    if not _sqlite_store_exists(db_path):
+        return BackendPendingDecisionSend("not_found")
+    current_time, _ = _pending_observed_time(observed_at)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                """
+                SELECT worker_id, revision_digest, choice_id,
+                       worker_fingerprint, binding_private_fingerprint,
+                       turn_target_value, state, claimed_at
+                FROM backend_pending_claims
+                WHERE host_id = ? AND claim_token = ?
+                """,
+                (str(host_id), str(claim_token)),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return BackendPendingDecisionSend("not_found")
+            if (
+                str(row[6]) == "claimed"
+                and _backend_pending_claim_expired(
+                    row[7], current_time, claim_lease_seconds
+                )
+            ):
+                conn.execute(
+                    """
+                    DELETE FROM backend_pending_claims
+                    WHERE host_id = ? AND claim_token = ? AND state = 'claimed'
+                    """,
+                    (str(host_id), str(claim_token)),
+                )
+                conn.commit()
+                return BackendPendingDecisionSend("not_found")
+            current = conn.execute(
+                """
+                SELECT payload_json, choice_routes_json, revision_digest,
+                       freshness, binding_private_fingerprint,
+                       observed_turn_target_value
+                FROM backend_pending
+                WHERE host_id = ? AND worker_id = ?
+                  AND observation_state = 'open'
+                """,
+                (str(host_id), str(row[0])),
+            ).fetchone()
+            if current is None:
+                conn.rollback()
+                return BackendPendingDecisionSend("changed")
+            if str(current[3]) != "fresh":
+                conn.rollback()
+                return BackendPendingDecisionSend("stale")
+            decision = _decision_from_pending_row(current[0], current[1], current[2])
+            selection = _decode_decision_claim_selection(row[2])
+            validated_selection = (
+                _validated_decision_selection(decision, selection)
+                if decision is not None and selection is not None
+                else None
+            )
+            if (
+                str(current[2]) != str(row[1])
+                or str(current[4]) != str(row[4])
+                or str(current[5]) != str(row[5])
+                or decision is None
+                or validated_selection is None
+            ):
+                conn.rollback()
+                return BackendPendingDecisionSend("changed")
+            option_refs, text = validated_selection
+            fields = {
+                "worker_id": str(row[0]),
+                "worker_fingerprint": str(row[3]),
+                "binding_private_fingerprint": str(row[4]),
+                "turn_target_value": str(row[5]),
+                "decision_ref": str(decision["decision_ref"]),
+                "decision_kind": decision["kind"],
+                "option_count": len(decision["options"]),
+                "option_refs": option_refs,
+                "text": text,
+            }
+            if str(row[6]) == "send_started":
+                conn.rollback()
+                return BackendPendingDecisionSend("already_started", **fields)
+            context = _backend_pending_claim_context_conn(
+                conn,
+                str(host_id),
+                str(row[0]),
+                str(row[4]),
+                str(row[5]),
+                observed_at=current_time,
+            )
+            if context is None or (context[1], context[2], context[3]) != (
+                str(row[4]), str(row[3]), str(row[5])
+            ):
+                conn.rollback()
+                return BackendPendingDecisionSend("binding_changed")
+            cursor = conn.execute(
+                """
+                UPDATE backend_pending_claims
+                SET state = 'send_started', send_started_at = ?
+                WHERE host_id = ? AND claim_token = ? AND state = 'claimed'
+                """,
+                (current_time, str(host_id), str(claim_token)),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return BackendPendingDecisionSend("changed")
+            conn.commit()
+            return BackendPendingDecisionSend("started", **fields)
         except Exception:
             conn.rollback()
             raise
@@ -20703,6 +21263,50 @@ def reserve_command_request(
         conn.close()
 
 
+def abandon_command_request_reservation(
+    db_path: Path,
+    *,
+    host_id: str,
+    request_id: str,
+    canonical_fingerprint: str,
+    owner_token: str,
+    now: str | None = None,
+) -> bool:
+    """Release only the caller's unsent reservation for immediate takeover."""
+    if not _sqlite_store_exists(db_path):
+        return False
+    current = _command_request_now(now)
+    owner_hash = _owner_token_hash(owner_token)
+    if not owner_hash:
+        return False
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            updated = conn.execute(
+                """
+                UPDATE command_receipts
+                SET owner_expires_at = ?, updated_at = ?
+                WHERE host_id = ? AND request_id = ?
+                  AND canonical_fingerprint = ?
+                  AND state = 'reserved' AND owner_token_hash = ?
+                """,
+                (
+                    current,
+                    current,
+                    str(host_id),
+                    str(request_id),
+                    str(canonical_fingerprint),
+                    owner_hash,
+                ),
+            )
+            conn.commit()
+            return int(updated.rowcount or 0) == 1
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def reserve_terminal_command_replay(
     db_path: Path,
     *,
@@ -20952,6 +21556,7 @@ def finish_command_request(
         )
     if terminal == "rejected" and str(status) in {
         "pending",
+        "answer_in_progress",
         "accepted",
         "request_state_uncertain",
     }:

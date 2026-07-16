@@ -491,6 +491,7 @@ def test_pending_observation_models_explicit_outcomes_and_private_picker_routes(
     for kind in (
         "read_succeeded_no_prompt",
         "read_succeeded_invalid_prompt",
+        "read_succeeded_unsupported_decision",
         "read_failed",
         "worker_authoritatively_absent",
     ):

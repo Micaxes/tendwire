@@ -65,7 +65,19 @@ def test_extract_pending_decision():
     assert all("value" not in c for c in pending["choices"])
     # decision_id (internal tool_use_id) is not published in public pending.
     assert "decision_id" not in pending["meta"]
-    assert pending["meta"] == {"source": "backend"}
+    decision = pending["meta"]["decision"]
+    assert decision == {
+        "decision_ref": decision["decision_ref"],
+        "kind": "single",
+        "prompt": "Which database should we use?",
+        "options": [
+            {"ref": "1", "label": "Postgres"},
+            {"ref": "2", "label": "SQLite"},
+        ],
+        "multi_select": False,
+        "question_count": 1,
+    }
+    assert decision["decision_ref"].startswith("decision-")
 
 
 def test_extract_plan_approval_kind():

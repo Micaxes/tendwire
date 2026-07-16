@@ -474,6 +474,7 @@ _PUBLIC_FREE_TEXT_KEYS = frozenset(
         "label",
         "message",
         "name",
+        "prompt",
         "question",
         "raw_status",
         "reason",

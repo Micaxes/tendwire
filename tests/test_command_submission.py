@@ -251,7 +251,9 @@ def _expected_private_clear_calls(pane_id: str = "pane-secret") -> list[dict[str
         {"method": "pane.send_keys", "params": {"pane_id": pane_id, "keys": ["ctrl+a", "backspace"]}},
     ]
 
-@pytest.mark.parametrize("action", ["send_instruction", "answer_pending"])
+@pytest.mark.parametrize(
+    "action", ["send_instruction", "answer_pending", "answer_decision"]
+)
 @pytest.mark.parametrize(
     ("request_id", "include_request_id"),
     [
@@ -310,6 +312,18 @@ def test_submit_command_rejects_invalid_request_id_before_mutation(
                 "pending_id": "pending-public",
                 "pending_fingerprint": "pending-revision",
                 "choice_id": "choice-public",
+            },
+        }
+    elif action == "answer_decision":
+        payload = {
+            "schema_version": 1,
+            "action": "answer_decision",
+            "request_id": request_id,
+            "dry_run": False,
+            "target": {"worker_id": "w-1"},
+            "params": {
+                "decision_ref": "decision-public",
+                "selection": {"option_refs": ["1"]},
             },
         }
     if include_request_id:

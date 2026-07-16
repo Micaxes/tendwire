@@ -1307,6 +1307,10 @@ Tendwire now exposes a minimal, safety-first command interface:
 echo '{"schema_version": 1, "action": "noop"}' | tendwire command --json
 ```
 
+The connector-facing structured Claude decision payload, semantic
+`answer_decision` action, validation, and retry behavior are documented in
+[docs/answer_decision.md](docs/answer_decision.md).
+
 The `command --json` subcommand reads exactly one schema-v1 JSON request from
 stdin. A proven result is exactly one schema-v2 command envelope on JSON-only
 stdout with exit `0`/`1`; unresolved process ambiguity is no stdout envelope

@@ -1577,6 +1577,7 @@ PendingObservationKind = Literal[
     "open_prompt",
     "read_succeeded_no_prompt",
     "read_succeeded_invalid_prompt",
+    "read_succeeded_unsupported_decision",
     "read_failed",
     "worker_authoritatively_absent",
 ]
@@ -1615,12 +1616,17 @@ class PendingObservation:
     pending_kind: str | None = None
     choices: tuple[PendingObservedChoice, ...] = ()
     revision_digest: str | None = None
+    decision_kind: Literal["single", "multi", "plan"] | None = None
+    decision_options: tuple[str, ...] = ()
+    decision_multi_select: bool = False
+    decision_question_count: int = 0
 
     def __post_init__(self) -> None:
         if self.kind not in {
             "open_prompt",
             "read_succeeded_no_prompt",
             "read_succeeded_invalid_prompt",
+            "read_succeeded_unsupported_decision",
             "read_failed",
             "worker_authoritatively_absent",
         }:
@@ -1648,11 +1654,44 @@ class PendingObservation:
                 or not self.pending_kind.strip()
             ):
                 raise ValueError("invalid pending observation prompt kind")
+            if self.decision_kind is None:
+                if (
+                    self.decision_options
+                    or self.decision_multi_select
+                    or self.decision_question_count != 0
+                ):
+                    raise ValueError("non-decision prompt cannot carry decision data")
+            else:
+                if self.decision_kind not in {"single", "multi", "plan"}:
+                    raise ValueError("invalid pending observation decision kind")
+                if (
+                    not isinstance(self.decision_options, tuple)
+                    or not self.decision_options
+                    or not all(
+                        isinstance(label, str) and label.strip()
+                        for label in self.decision_options
+                    )
+                ):
+                    raise ValueError("decision prompt requires options")
+                if self.decision_multi_select is not (
+                    self.decision_kind == "multi"
+                ):
+                    raise ValueError("decision multi-select flag does not match kind")
+                if (
+                    not isinstance(self.decision_question_count, int)
+                    or isinstance(self.decision_question_count, bool)
+                    or self.decision_question_count < 1
+                ):
+                    raise ValueError("invalid decision question count")
         elif (
             self.question is not None
             or self.pending_kind is not None
             or self.choices
             or self.revision_digest is not None
+            or self.decision_kind is not None
+            or self.decision_options
+            or self.decision_multi_select
+            or self.decision_question_count != 0
         ):
             raise ValueError("non-open pending observation cannot carry prompt data")
 
