@@ -1,9 +1,8 @@
 # Install
 
 Tendwire can be run from a checkout or installed as a Python package. The
-`0.1.0rc5` release candidate supports Python 3.13. The deliberately narrow RC
-runtime avoids spending four times the GitHub Actions minutes on a compatibility
-matrix that has not been independently release-qualified.
+`0.1.0rc5` release candidate supports Python 3.13. Other Python runtimes have
+not been release-qualified for this candidate.
 
 ## From A Checkout
 

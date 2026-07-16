@@ -12,10 +12,9 @@ lowercase hexadecimal workspace suffixes. Pane IDs must still contain the exact
 workspace ID and a valid public pane number; private terminal/session values are
 never continuity inputs.
 
-Automatic CI is intentionally one cancellable job. It compiles, runs the full
-hermetic suite and offline Herdr fixture, builds and scans both artifacts, and
-smokes clean wheel and sdist installs. This is the minimum billed gate; it does
-not perform deployment, use secrets, or contact live services.
+Automatic CI compiles, runs the full hermetic suite and offline Herdr fixture,
+builds and scans both artifacts, and smokes clean wheel and sdist installs. It
+does not perform deployment, use secrets, or contact live services.
 The job checks out paired Herdres source once because the existing installed-
 candidate benchmark executes its real source adapter; the benchmark path comes
 from `TENDWIRE_BENCHMARK_HERDRES_ROOT`, never a user-home default.

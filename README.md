@@ -1,17 +1,16 @@
 # Tendwire
 
 Current release candidate: `0.1.0rc5`, paired with Herdres `0.7.0rc4` on
-Python 3.13. Routine CI intentionally uses one Python 3.13 job with
-concurrency cancellation to conserve GitHub Actions minutes. Cross-repository
-and live-provider proofs remain explicit release-owner operations rather than
-automatic workflows.
+Python 3.13. Cross-repository and live-provider proofs remain explicit
+release-owner operations.
 
-Tendwire is a **local-first control plane for Herdr-managed terminal agents**.
-It observes a local Herdr session, stores neutral snapshots and command
-receipts, and exposes a public-safe Tendwire API for local clients. Neutral
-connector jobs, statuses, and aggregates are public-safe operational state;
-concrete-provider delivery bookkeeping, raw terminal controls, socket paths,
-and private Herdr identifiers are not part of public JSON.
+Tendwire is a **local API and durable control plane for Herdr**. It lets apps,
+automations, and connectors observe coding agents, read lossless turns and
+pending questions, and submit commands without depending on terminal internals.
+It stores neutral snapshots and command receipts and exposes a public-safe API
+for local clients. Concrete-provider delivery bookkeeping, raw terminal
+controls, socket paths, and private Herdr identifiers are not part of public
+JSON.
 
 ## Herdr plugin
 

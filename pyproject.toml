@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "tendwire"
 dynamic = ["version"]
-description = "Local-first control plane for terminal-based agents"
+description = "Local API and durable control plane for Herdr coding agents"
 readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "AGPL-3.0-or-later" }
