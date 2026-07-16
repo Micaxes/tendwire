@@ -386,7 +386,10 @@ def _extract_turn_payload(value: Any) -> Mapping[str, Any] | None:
     return value
 
 
-PENDING_DECISION_MAX_OPTIONS = 11
+# Every driven ordinal must stay a single keystroke (digits select/toggle
+# absolutely in the pane, live-verified on Claude Code 2.1.211), so 9 is the
+# hard bound; larger decisions fail closed to the read-only interaction.
+PENDING_DECISION_MAX_OPTIONS = 9
 _PENDING_TEXT_MAX = 2000
 _SINGLE_WRITE_IN_OPTION_IDS = frozenset(
     {"custom", "other", "writein", "write_in", "write-in"}

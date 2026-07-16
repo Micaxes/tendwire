@@ -1,23 +1,25 @@
 """Translate semantic Claude decisions into private Herdr pane input.
 
-Calibration assumptions are deliberately confined to this backend module:
+Calibration assumptions are deliberately confined to this backend module, and
+every mapping below was LIVE-VERIFIED against Claude Code 2.1.211 on a real
+pane (2026-07-16):
 
-* Claude Code displays single-choice and plan rows with 1-based decimal
-  shortcuts; typing the ordinal and then Enter chooses that row.
-* A single-choice write-in row immediately follows the advertised options.
-  Its ordinal opens/focuses the text field without an intermediate Enter, so
-  Tendwire types ``N + 1`` and then submits the write-in text with Enter.
-* Claude Code multi-select digit toggles are not treated as a supported
-  contract. Tendwire therefore assumes the cursor starts on row 1, Down/Up move
-  exactly one option row, Space toggles the current option without moving the
-  cursor, the Submit row immediately follows the final option, and Enter on
-  Submit submits. This provisional Claude Code behavior is isolated in
-  ``MULTI_SELECT_CALIBRATION`` below so live verification can retune it in one
-  place.
+* Single-choice and plan rows carry 1-based decimal shortcuts, and typing the
+  ordinal alone SELECTS AND SUBMITS the row instantly — no Enter follows. A
+  trailing Enter would leak into whatever UI appears next, so none is sent.
+* The single-choice write-in row ("Type something", at position N + 1) does
+  NOT respond to its digit. It is reached by pressing Down exactly N times
+  from the initial cursor on row 1; the focused row is itself a text input,
+  so Tendwire then sends the write-in prose and submits with Enter.
+* Multi-select digits toggle their row ABSOLUTELY without moving the cursor,
+  Right switches to the Submit tab (a review screen whose default focus is
+  "Submit answers"), and Enter there submits the selection set.
+* Every driven ordinal must stay a single keystroke, so decisions expose at
+  most 9 real options (PENDING_DECISION_MAX_OPTIONS in herdr_turns).
 * Herdr's private ``pane.send_keys`` accepts decimal character keys plus
-  ``Down``, ``Up``, and ``Enter``. A literal multi-select Space is sent through
-  private ``pane.send_text``; write-in prose uses ``pane.send_input`` so Herdr
-  owns terminal text encoding and appends the final Enter atomically.
+  ``Down``, ``Up``, ``Right``, and ``Enter``; write-in prose uses
+  ``pane.send_input`` so Herdr owns terminal text encoding and appends the
+  final Enter atomically.
 
 These steps are internal calibration data. They are never accepted from a
 connector and there is intentionally no public raw-key command action.
@@ -30,9 +32,7 @@ from typing import Literal
 
 
 MULTI_SELECT_CALIBRATION = {
-    "down": "Down",
-    "up": "Up",
-    "toggle_text": " ",
+    "submit_tab": "Right",
     "submit": "Enter",
 }
 
@@ -50,8 +50,7 @@ class HerdrDecisionStep:
             if not self.keys or self.text is not None:
                 raise ValueError("key calibration step requires only keys")
         elif self.operation == "text":
-            if self.text != " " or self.keys:
-                raise ValueError("text calibration step requires one literal space")
+            raise ValueError("text calibration steps are no longer produced")
         elif self.operation == "input":
             if not isinstance(self.text, str) or not self.text or self.keys != ("Enter",):
                 raise ValueError("input calibration step requires text plus Enter")
@@ -84,8 +83,10 @@ def calibrate_decision_steps(
     if text is not None:
         if kind != "single" or option_refs or not isinstance(text, str) or not text:
             raise ValueError("invalid decision write-in calibration")
+        # The write-in row ignores digits; reach it with Down x N from row 1,
+        # where the focused row is itself the text input.
         return (
-            HerdrDecisionStep("keys", keys=_digit_keys(option_count + 1)),
+            HerdrDecisionStep("keys", keys=("Down",) * option_count),
             HerdrDecisionStep("input", keys=("Enter",), text=text),
         )
     if not option_refs or len(option_refs) != len(set(option_refs)):
@@ -101,39 +102,21 @@ def calibrate_decision_steps(
     if kind in {"single", "plan"}:
         if len(ordinals) != 1:
             raise ValueError("single and plan decisions require one option")
-        return (
-            HerdrDecisionStep(
-                "keys",
-                keys=(*_digit_keys(ordinals[0]), "Enter"),
-            ),
-        )
+        # The digit alone selects AND submits; a trailing Enter would leak into
+        # the next UI (composer, or worse, a modal).
+        return (HerdrDecisionStep("keys", keys=_digit_keys(ordinals[0])),)
 
-    steps: list[HerdrDecisionStep] = []
-    current_row = 1
-    for ordinal in ordinals:
-        delta = ordinal - current_row
-        if delta:
-            direction = (
-                MULTI_SELECT_CALIBRATION["down"]
-                if delta > 0
-                else MULTI_SELECT_CALIBRATION["up"]
-            )
-            steps.append(HerdrDecisionStep("keys", keys=(direction,) * abs(delta)))
-        steps.append(
-            HerdrDecisionStep(
-                "text",
-                text=MULTI_SELECT_CALIBRATION["toggle_text"],
-            )
-        )
-        current_row = ordinal
-    submit_navigation = (MULTI_SELECT_CALIBRATION["down"],) * (
-        option_count + 1 - current_row
-    )
+    # Digits toggle rows absolutely (cursor-independent); Right reaches the
+    # Submit tab whose default focus is "Submit answers"; Enter submits.
+    steps: list[HerdrDecisionStep] = [
+        HerdrDecisionStep("keys", keys=_digit_keys(ordinal))
+        for ordinal in sorted(ordinals)
+    ]
     steps.append(
         HerdrDecisionStep(
             "keys",
             keys=(
-                *submit_navigation,
+                MULTI_SELECT_CALIBRATION["submit_tab"],
                 MULTI_SELECT_CALIBRATION["submit"],
             ),
         )

@@ -271,21 +271,21 @@ def test_decision_calibration_steps_cover_single_plan_write_in_and_multi() -> No
         kind="single", option_count=4, option_refs=("2",)
     )
     assert [(item.operation, item.keys, item.text) for item in single] == [
-        ("keys", ("2", "Enter"), None)
+        ("keys", ("2",), None)  # digit alone selects AND submits (live-verified)
     ]
 
     plan = calibrate_decision_steps(
         kind="plan", option_count=2, option_refs=("1",)
     )
     assert [(item.operation, item.keys, item.text) for item in plan] == [
-        ("keys", ("1", "Enter"), None)
+        ("keys", ("1",), None)
     ]
 
     write_in = calibrate_decision_steps(
         kind="single", option_count=4, text="Use another database"
     )
     assert [(item.operation, item.keys, item.text) for item in write_in] == [
-        ("keys", ("5",), None),
+        ("keys", ("Down", "Down", "Down", "Down"), None),  # write-in row ignores digits
         ("input", ("Enter",), "Use another database"),
     ]
 
@@ -293,11 +293,9 @@ def test_decision_calibration_steps_cover_single_plan_write_in_and_multi() -> No
         kind="multi", option_count=4, option_refs=("3", "1")
     )
     assert [(item.operation, item.keys, item.text) for item in multi] == [
-        ("keys", ("Down", "Down"), None),
-        ("text", (), " "),
-        ("keys", ("Up", "Up"), None),
-        ("text", (), " "),
-        ("keys", ("Down", "Down", "Down", "Down", "Enter"), None),
+        ("keys", ("1",), None),          # digits toggle rows absolutely
+        ("keys", ("3",), None),
+        ("keys", ("Right", "Enter"), None),  # Submit tab, then submit
     ]
 
 
@@ -381,32 +379,15 @@ def test_production_shaped_multi_decision_end_to_end(tmp_path: Path) -> None:
     assert calls == [
         {
             "method": "pane.send_keys",
-            "params": {
-                "pane_id": "decision-pane-private",
-                "keys": ["Down", "Down"],
-            },
-        },
-        {
-            "method": "pane.send_text",
-            "params": {"pane_id": "decision-pane-private", "text": " "},
+            "params": {"pane_id": "decision-pane-private", "keys": ["1"]},
         },
         {
             "method": "pane.send_keys",
-            "params": {
-                "pane_id": "decision-pane-private",
-                "keys": ["Up", "Up"],
-            },
-        },
-        {
-            "method": "pane.send_text",
-            "params": {"pane_id": "decision-pane-private", "text": " "},
+            "params": {"pane_id": "decision-pane-private", "keys": ["3"]},
         },
         {
             "method": "pane.send_keys",
-            "params": {
-                "pane_id": "decision-pane-private",
-                "keys": ["Down", "Down", "Down", "Down", "Enter"],
-            },
+            "params": {"pane_id": "decision-pane-private", "keys": ["Right", "Enter"]},
         },
     ]
 
@@ -435,7 +416,7 @@ def _unknown_decision_turn() -> dict[str, Any]:
     return turn
 
 
-def test_decision_option_bound_accepts_exactly_eleven(tmp_path: Path) -> None:
+def test_decision_option_bound_accepts_exactly_nine(tmp_path: Path) -> None:
     config, worker, _decision_ref = _seed_pending_decision(
         tmp_path,
         turn=_bounded_decision_turn(PENDING_DECISION_MAX_OPTIONS),
@@ -446,7 +427,7 @@ def test_decision_option_bound_accepts_exactly_eleven(tmp_path: Path) -> None:
         item for item in payload["pending_interactions"]
         if item["worker_id"] == worker.id
     )
-    assert len(row["meta"]["decision"]["options"]) == 11
+    assert len(row["meta"]["decision"]["options"]) == PENDING_DECISION_MAX_OPTIONS
 
 
 @pytest.mark.parametrize(
@@ -518,7 +499,7 @@ def test_answer_decision_request_id_replay_does_not_resend_keys(tmp_path: Path) 
             "method": "pane.send_keys",
             "params": {
                 "pane_id": "decision-pane-private",
-                "keys": ["2", "Enter"],
+                "keys": ["2"],
             },
         }
     ]
@@ -571,7 +552,7 @@ def test_two_requests_race_one_decision_and_only_first_claimant_sends(
             "method": "pane.send_keys",
             "params": {
                 "pane_id": "decision-pane-private",
-                "keys": ["2", "Enter"],
+                "keys": ["2"],
             },
         }
     ]
@@ -627,7 +608,7 @@ def test_winner_safe_presend_failure_releases_claim_for_loser_retry(
             "method": "pane.send_keys",
             "params": {
                 "pane_id": "decision-pane-private",
-                "keys": ["2", "Enter"],
+                "keys": ["2"],
             },
         }
     ]
@@ -805,7 +786,7 @@ def test_process_loss_before_send_started_is_recovered_after_lease_expiry(
             "method": "pane.send_keys",
             "params": {
                 "pane_id": "decision-pane-private",
-                "keys": ["2", "Enter"],
+                "keys": ["2"],
             },
         }
     ]
@@ -850,7 +831,7 @@ def test_send_uncertainty_is_durable_and_never_resends(
             "method": "pane.send_keys",
             "params": {
                 "pane_id": "decision-pane-private",
-                "keys": ["2", "Enter"],
+                "keys": ["2"],
             },
         }
     ]

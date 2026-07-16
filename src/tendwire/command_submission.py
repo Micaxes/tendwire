@@ -1674,13 +1674,6 @@ def _submit_decision_calibration(
                 {"pane_id": pane_id, "keys": list(step.keys)},
                 timeout=timeout,
             )
-        elif step.operation == "text":
-            _socket_request(
-                client,
-                "pane.send_text",
-                {"pane_id": pane_id, "text": step.text},
-                timeout=timeout,
-            )
         else:
             _socket_request(
                 client,

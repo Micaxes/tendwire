@@ -114,5 +114,5 @@ IDs, and no custom row. Older adapters that leave that prompt as an unstructured
 prompts remain unstructured and unsupported.
 
 The Claude Code multi-select key behavior is a private backend assumption, not
-part of this public contract. Its provisional calibration is isolated in
+part of this public contract. Its calibration (live-verified against Claude Code 2.1.211) is isolated in
 `src/tendwire/backends/herdr_decision.py` for live verification and retuning.
