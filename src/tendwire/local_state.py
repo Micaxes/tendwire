@@ -385,20 +385,42 @@ def open_resolved_parent(
     return opened
 
 
-def proc_fd_path(dir_fd: int, name: str) -> str:
-    """Return a validated Linux proc-fd pathname anchored to ``dir_fd``.
+# macOS/BSD F_GETPATH buffer. Kernels write at most MAXPATHLEN (1024) bytes incl. the NUL.
+_FD_PATH_BUFFER = bytes(1024)
 
-    The caller must retain the directory descriptor for the entire lifetime
-    of the API consuming the returned pathname.
+
+def _fd_path_supported() -> bool:
+    """True on platforms that can resolve an open descriptor back to a pathname:
+    Linux via ``/proc/self/fd``, macOS and the BSDs via the ``F_GETPATH`` fcntl."""
+    return sys.platform.startswith("linux") or hasattr(fcntl, "F_GETPATH")
+
+
+def _fd_directory_path(dir_fd: int) -> str:
+    """Return the current absolute pathname of an open directory descriptor.
+
+    Linux reads it from ``/proc/self/fd``; macOS/BSD use the ``F_GETPATH`` fcntl,
+    which returns the descriptor's canonical pathname. Callers re-verify the result
+    against the descriptor's inode, so the recovered name cannot be substituted
+    underneath us on either platform. May raise ``OSError``.
+    """
+    if sys.platform.startswith("linux"):
+        return os.readlink(f"/proc/self/fd/{dir_fd}")
+    raw = fcntl.fcntl(dir_fd, fcntl.F_GETPATH, _FD_PATH_BUFFER)
+    return os.fsdecode(raw.split(b"\x00", 1)[0])
+
+
+def proc_fd_path(dir_fd: int, name: str) -> str:
+    """Return a validated pathname anchored to ``dir_fd``.
+
+    On Linux this is a ``/proc/self/fd`` pathname that follows the descriptor;
+    on macOS/BSD (no procfs) it is the descriptor's ``F_GETPATH`` pathname,
+    re-verified against the descriptor's inode. The caller must retain the
+    directory descriptor for the entire lifetime of the API consuming it.
     """
 
     require_posix_support()
     leaf = _leaf_name(name)
-    if (
-        not sys.platform.startswith("linux")
-        or not isinstance(dir_fd, int)
-        or dir_fd < 0
-    ):
+    if not isinstance(dir_fd, int) or dir_fd < 0 or not _fd_path_supported():
         _raise(LocalStateErrorCode.UNSUPPORTED_PLATFORM)
     try:
         expected = os.fstat(dir_fd)
@@ -406,14 +428,24 @@ def proc_fd_path(dir_fd: int, name: str) -> str:
         _raise(LocalStateErrorCode.OPERATION_FAILED)
     if not stat.S_ISDIR(expected.st_mode):
         _raise(LocalStateErrorCode.WRONG_TYPE)
-    anchor = f"/proc/self/fd/{dir_fd}"
+    if sys.platform.startswith("linux"):
+        anchor = f"/proc/self/fd/{dir_fd}"
+        try:
+            current = os.stat(anchor)
+        except OSError:
+            _raise(LocalStateErrorCode.UNSUPPORTED_PLATFORM)
+        if not same_inode(expected, current):
+            _raise(LocalStateErrorCode.UNSUPPORTED_PLATFORM)
+        return f"{anchor}/{leaf}"
+    # macOS/BSD: no procfs; F_GETPATH yields the descriptor's canonical pathname.
     try:
-        current = os.stat(anchor)
+        parent = _fd_directory_path(dir_fd)
+        current = os.stat(parent, follow_symlinks=False)
     except OSError:
         _raise(LocalStateErrorCode.UNSUPPORTED_PLATFORM)
     if not same_inode(expected, current):
         _raise(LocalStateErrorCode.UNSUPPORTED_PLATFORM)
-    return f"{anchor}/{leaf}"
+    return os.path.join(parent, leaf)
 
 
 def canonical_path_from_fd(dir_fd: int, name: str) -> str:
@@ -427,11 +459,7 @@ def canonical_path_from_fd(dir_fd: int, name: str) -> str:
 
     require_posix_support()
     leaf = _leaf_name(name)
-    if (
-        not sys.platform.startswith("linux")
-        or not isinstance(dir_fd, int)
-        or dir_fd < 0
-    ):
+    if not isinstance(dir_fd, int) or dir_fd < 0 or not _fd_path_supported():
         _raise(LocalStateErrorCode.UNSUPPORTED_PLATFORM)
     try:
         expected = os.fstat(dir_fd)
@@ -440,7 +468,7 @@ def canonical_path_from_fd(dir_fd: int, name: str) -> str:
     if not stat.S_ISDIR(expected.st_mode):
         _raise(LocalStateErrorCode.WRONG_TYPE)
     try:
-        parent = os.readlink(f"/proc/self/fd/{dir_fd}")
+        parent = _fd_directory_path(dir_fd)
     except OSError:
         _raise(LocalStateErrorCode.UNSUPPORTED_PLATFORM)
     if (
